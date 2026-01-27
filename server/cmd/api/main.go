@@ -100,6 +100,7 @@ func main() {
 	}
 
 	apiService, err := api.New(
+		config,
 		recorder.NewFFmpegManager(),
 		recorder.NewFFmpegRecorderFactory(config.PathToFFmpeg, defaultParams, stz),
 		upstreamMgr,

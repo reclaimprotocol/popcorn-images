@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,13 +13,6 @@ import (
 	"github.com/onkernel/kernel-images/server/cmd/api/circuits"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
-)
-
-// Default TEE service URLs
-const (
-	defaultTEEKUrl     = "wss://tk.reclaimprotocol.org/ws"
-	defaultTEETUrl     = "wss://tt.reclaimprotocol.org/ws"
-	defaultAttestorUrl = "wss://attestor.reclaimprotocol.org:444/ws"
 )
 
 // reclaimConfigJSON is the structure for optional config overrides
@@ -41,10 +33,10 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 	// Setup ZK callback (idempotent, only runs once)
 	circuits.SetupZKCallback()
 
-	// Determine TEE URLs: env vars > request config > defaults
-	teekUrl := getEnvOrDefault("TEE_K_URL", defaultTEEKUrl)
-	teetUrl := getEnvOrDefault("TEE_T_URL", defaultTEETUrl)
-	attestorUrl := getEnvOrDefault("ATTESTOR_URL", defaultAttestorUrl)
+	// Get TEE URLs from config (already includes env var overrides via envconfig)
+	teekUrl := s.config.TEEKUrl
+	teetUrl := s.config.TEETUrl
+	attestorUrl := s.config.AttestorUrl
 
 	// Apply request-level config overrides if provided
 	if req.Body.ConfigJson != nil && *req.Body.ConfigJson != "" {
@@ -96,13 +88,12 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 			},
 		}, nil
 	}
-	defer reclaimClient.Close()
 
 	// Create a context with timeout (5 minutes for proof generation)
 	proofCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	// Execute protocol in a goroutine so we can handle context cancellation
+	// Execute protocol in a goroutine so we can handle timeout
 	type result struct {
 		claim *client.ClaimWithSignatures
 		err   error
@@ -110,20 +101,27 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 	resultCh := make(chan result, 1)
 
 	go func() {
+		// Recover from panics in the external library to prevent server crash
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("panic in ExecuteCompleteProtocol", "session_id", sessionID.String(), "panic", r)
+				resultCh <- result{err: fmt.Errorf("internal error: protocol execution panicked")}
+			}
+		}()
 		claim, err := reclaimClient.ExecuteCompleteProtocol(nil)
 		resultCh <- result{claim: claim, err: err}
 	}()
 
-	// Wait for result or context cancellation
+	// Wait for result or timeout
+	var timedOut bool
 	select {
 	case <-proofCtx.Done():
-		log.Error("proof execution timed out", "session_id", sessionID.String())
-		return oapi.ReclaimProve500JSONResponse{
-			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: "proof execution timed out",
-			},
-		}, nil
+		timedOut = true
+		log.Error("proof execution timed out, waiting for goroutine cleanup", "session_id", sessionID.String())
 	case res := <-resultCh:
+		// Close client after goroutine completes
+		reclaimClient.Close()
+
 		if res.err != nil {
 			log.Error("proof execution failed", "session_id", sessionID.String(), "err", res.err)
 			return oapi.ReclaimProve500JSONResponse{
@@ -142,13 +140,32 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 			Signature: mapSignatureToOapi(res.claim.Signature),
 		}, nil
 	}
-}
 
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+	// If we timed out, wait for the goroutine to complete before closing
+	// to avoid racing Close() with an in-flight protocol
+	if timedOut {
+		// Wait for goroutine with a grace period, then close regardless
+		select {
+		case <-resultCh:
+			log.Info("goroutine completed after timeout", "session_id", sessionID.String())
+		case <-time.After(10 * time.Second):
+			log.Warn("goroutine did not complete within grace period, closing anyway", "session_id", sessionID.String())
+		}
+		reclaimClient.Close()
+
+		return oapi.ReclaimProve500JSONResponse{
+			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+				Message: "proof execution timed out",
+			},
+		}, nil
 	}
-	return defaultValue
+
+	// Should not reach here, but satisfy compiler
+	return oapi.ReclaimProve500JSONResponse{
+		InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+			Message: "unexpected error",
+		},
+	}, nil
 }
 
 func mapClaimToOapi(claim interface{}) oapi.ReclaimClaim {
