@@ -150,21 +150,41 @@ The headful image supports configuring an HTTP/SOCKS proxy for the browser using
 - Geo-targeting specific locations
 - Rotating IP addresses
 
-### Usage
+### Quick Start
 
-Configure the proxy when starting the container:
-
+1. **Start the container:**
 ```bash
 cd images/chromium-headful
+IMAGE=kernel-docker ENABLE_WEBRTC=true ./run-docker.sh
+```
 
-PROXY_ENABLED=true \
-PROXY_HOST=brd.superproxy.io \
-PROXY_PORT=22225 \
-PROXY_USERNAME="brd-customer-XXXXX-zone-XXXXX" \
-PROXY_PASSWORD="your-password" \
-IMAGE=kernel-docker \
-ENABLE_WEBRTC=true \
-./run-docker.sh
+2. **Upload the proxy extension:**
+```bash
+# Create zip from the extension folder (files must be at root level, not in a subdirectory)
+cd brightdata-proxy-extension && zip -r ../proxy-extension.zip . && cd ..
+
+# Upload via API
+curl -X POST "http://localhost:444/chromium/upload-extensions-and-restart" \
+  -F "extensions.zip_file=@proxy-extension.zip;filename=ext.zip" \
+  -F "extensions.name=proxy-extension"
+```
+
+3. **Configure the proxy:**
+```bash
+curl -X PUT http://localhost:444/proxy/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "host": "brd.superproxy.io",
+    "port": 33335,
+    "username": "brd-customer-XXXXX-zone-XXXXX",
+    "password": "your-password",
+    "scheme": "http"
+  }'
+```
+
+4. **Restart Chromium to apply:**
+```bash
+docker exec <container-name> supervisorctl restart chromium
 ```
 
 ### Geo-targeting
@@ -179,13 +199,11 @@ Append the country code to the username for geo-targeting:
 | Germany | `-country-de` |
 
 Example:
-```bash
-PROXY_USERNAME="brd-customer-XXXXX-zone-XXXXX-country-in"
+```json
+"username": "brd-customer-XXXXX-zone-XXXXX-country-in"
 ```
 
-### Runtime Configuration (API)
-
-Update the proxy configuration without restarting the container:
+### API Reference
 
 ```bash
 # Set proxy configuration
@@ -193,9 +211,10 @@ curl -X PUT http://localhost:444/proxy/config \
   -H "Content-Type: application/json" \
   -d '{
     "host": "brd.superproxy.io",
-    "port": 22225,
+    "port": 33335,
     "username": "brd-customer-XXXXX-zone-XXXXX",
-    "password": "your-password"
+    "password": "your-password",
+    "scheme": "http"
   }'
 
 # Get current proxy configuration
@@ -206,10 +225,10 @@ curl -X DELETE http://localhost:444/proxy/config
 ```
 
 ### Notes
-- The proxy extension automatically picks up configuration changes within 30 seconds
+- Port `444` maps to the kernel-images API (internal port `10001`)
+- After updating proxy config, restart Chromium for the extension to apply changes
 - Supported schemes: `http`, `https`, `socks4`, `socks5`
-- Whitelist the container's public IP in your proxy provider's dashboard (find it with `docker exec <container> curl -s https://api.ipify.org`)
-- Run without `PROXY_ENABLED=true` to disable the proxy extension
+- Default bypass list: `["localhost", "127.0.0.1"]`
 
 ## Replay Capture
 

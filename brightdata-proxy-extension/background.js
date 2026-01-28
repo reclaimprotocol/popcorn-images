@@ -66,22 +66,13 @@ chrome.webRequest.onAuthRequired.addListener(
   ["asyncBlocking"]
 );
 
-// Initialize and poll for config changes
+// Initialize proxy configuration
 async function init() {
   const config = await fetchProxyConfig();
   if (config) {
     applyProxySettings(config);
   }
 }
-
-// Poll for config changes every 30 seconds
-setInterval(async () => {
-  const config = await fetchProxyConfig();
-  if (config && JSON.stringify(config) !== JSON.stringify(proxyConfig)) {
-    console.log("Proxy config changed, updating...");
-    applyProxySettings(config);
-  }
-}, 30000);
 
 init();
 console.log("Bright Data Proxy Extension loaded (API-configured)");

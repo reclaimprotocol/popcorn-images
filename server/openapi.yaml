@@ -1083,8 +1083,8 @@ paths:
     put:
       summary: Set the proxy configuration
       description: |
-        Set the proxy configuration for the browser. The browser extension will poll this
-        endpoint to get the current configuration and apply it automatically.
+        Set the proxy configuration for the browser. The browser extension fetches this
+        configuration at startup and applies it automatically.
       operationId: setProxyConfig
       requestBody:
         required: true
