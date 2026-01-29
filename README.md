@@ -145,7 +145,7 @@ You can use the embedded live view to monitor and control the browser. The live 
 
 ## Proxy Configuration
 
-The headful image supports configuring an HTTP/SOCKS proxy for the browser using a Chrome extension. This is useful for:
+The headful image includes a bundled proxy extension that supports configuring an HTTP/SOCKS proxy for the browser. This is useful for:
 - Using residential/datacenter proxies (e.g., Bright Data, Oxylabs)
 - Geo-targeting specific locations
 - Rotating IP addresses
@@ -158,18 +158,7 @@ cd images/chromium-headful
 IMAGE=kernel-docker ENABLE_WEBRTC=true ./run-docker.sh
 ```
 
-2. **Upload the proxy extension:**
-```bash
-# Create zip from the extension folder (files must be at root level, not in a subdirectory)
-cd brightdata-proxy-extension && zip -r ../proxy-extension.zip . && cd ..
-
-# Upload via API
-curl -X POST "http://localhost:444/chromium/upload-extensions-and-restart" \
-  -F "extensions.zip_file=@proxy-extension.zip;filename=ext.zip" \
-  -F "extensions.name=proxy-extension"
-```
-
-3. **Configure the proxy:**
+2. **Configure the proxy:**
 ```bash
 curl -X PUT http://localhost:444/proxy/config \
   -H "Content-Type: application/json" \
@@ -182,10 +171,7 @@ curl -X PUT http://localhost:444/proxy/config \
   }'
 ```
 
-4. **Restart Chromium to apply:**
-```bash
-docker exec <container-name> supervisorctl restart chromium
-```
+The proxy extension is bundled at `/opt/extensions/brightdata-proxy-extension` and loaded automatically when Chromium starts.
 
 ### Geo-targeting
 

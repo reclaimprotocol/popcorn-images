@@ -6,7 +6,9 @@
   "permissions": [
     "proxy",
     "webRequest",
-    "webRequestAuthProvider"
+    "webRequestAuthProvider",
+    "alarms",
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
