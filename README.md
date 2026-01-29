@@ -143,6 +143,79 @@ You can use the embedded live view to monitor and control the browser. The live 
 - Audio streaming in the WebRTC implementation is currently non-functional and needs to be fixed.
 - The live view is read/write by default. You can set it to read-only by adding `-e ENABLE_READONLY_VIEW=true \` in `docker run`.
 
+## Proxy Configuration
+
+The headful image includes a bundled proxy extension that supports configuring an HTTP/SOCKS proxy for the browser. This is useful for:
+- Using residential/datacenter proxies (e.g., Bright Data, Oxylabs)
+- Geo-targeting specific locations
+- Rotating IP addresses
+
+### Quick Start
+
+1. **Start the container:**
+```bash
+cd images/chromium-headful
+IMAGE=kernel-docker ENABLE_WEBRTC=true ./run-docker.sh
+```
+
+2. **Configure the proxy:**
+```bash
+curl -X PUT http://localhost:444/proxy/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "host": "brd.superproxy.io",
+    "port": 33335,
+    "username": "brd-customer-XXXXX-zone-XXXXX",
+    "password": "your-password",
+    "scheme": "http"
+  }'
+```
+
+The proxy extension is bundled at `/opt/extensions/brightdata-proxy-extension` and loaded automatically when Chromium starts.
+
+### Geo-targeting
+
+Append the country code to the username for geo-targeting:
+
+| Country | Username Suffix |
+|---------|-----------------|
+| India | `-country-in` |
+| United States | `-country-us` |
+| United Kingdom | `-country-gb` |
+| Germany | `-country-de` |
+
+Example:
+```json
+"username": "brd-customer-XXXXX-zone-XXXXX-country-in"
+```
+
+### API Reference
+
+```bash
+# Set proxy configuration
+curl -X PUT http://localhost:444/proxy/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "host": "brd.superproxy.io",
+    "port": 33335,
+    "username": "brd-customer-XXXXX-zone-XXXXX",
+    "password": "your-password",
+    "scheme": "http"
+  }'
+
+# Get current proxy configuration
+curl http://localhost:444/proxy/config
+
+# Disable proxy
+curl -X DELETE http://localhost:444/proxy/config
+```
+
+### Notes
+- Port `444` maps to the kernel-images API (internal port `10001`)
+- After updating proxy config, restart Chromium for the extension to apply changes
+- Supported schemes: `http`, `https`, `socks4`, `socks5`
+- Default bypass list: `["localhost", "127.0.0.1"]`
+
 ## Replay Capture
 
 You can use the embedded recording server to capture recordings of the entire screen in our headful images. It allows for one recording at a time and can be enabled with `WITH_KERNEL_IMAGES_API=true`
