@@ -131,6 +131,9 @@ start_dynamic_log_aggregator
 
 export DISPLAY=:1
 
+# Set default extension flags for bundled extensions
+export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/kernel/extensions/proxy --load-extension=/home/kernel/extensions/proxy"
+
 # Predefine ports and export for services
 export INTERNAL_PORT="${INTERNAL_PORT:-9223}"
 export CHROME_PORT="${CHROME_PORT:-9222}"
