@@ -303,6 +303,9 @@ COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/service
 COPY --from=server-builder /out/kernel-images-api /usr/local/bin/kernel-images-api
 COPY --from=server-builder /out/chromium-launcher /usr/local/bin/chromium-launcher
 
+# Copy bundled extensions
+COPY extensions/proxy/ /home/kernel/extensions/proxy/
+
 # Copy and compile the Playwright daemon
 COPY server/runtime/playwright-daemon.ts /tmp/playwright-daemon.ts
 RUN esbuild /tmp/playwright-daemon.ts \
