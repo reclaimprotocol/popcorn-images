@@ -1771,8 +1771,8 @@ components:
       properties:
         session_id:
           type: string
-          format: uuid
-          description: Server-generated unique session identifier for this proof execution
+          maxLength: 100
+          description: Unique session/request identifier for this proof execution
         claim:
           $ref: "#/components/schemas/ReclaimClaim"
         signature:

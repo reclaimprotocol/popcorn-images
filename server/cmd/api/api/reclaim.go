@@ -20,15 +20,12 @@ type reclaimConfigJSON struct {
 	TEEKUrl     string `json:"teekUrl,omitempty"`
 	TEETUrl     string `json:"teetUrl,omitempty"`
 	AttestorUrl string `json:"attestorUrl,omitempty"`
+	RequestID   string `json:"requestId,omitempty"`
 }
 
 // ReclaimProve executes the TEE+MPC proof protocol
 func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequestObject) (oapi.ReclaimProveResponseObject, error) {
 	log := logger.FromContext(ctx)
-
-	// Generate session ID
-	sessionID := uuid.New()
-	log.Info("starting reclaim prove", "session_id", sessionID.String())
 
 	// Setup ZK callback (idempotent, only runs once)
 	circuits.SetupZKCallback()
@@ -37,6 +34,7 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 	teekUrl := s.config.TEEKUrl
 	teetUrl := s.config.TEETUrl
 	attestorUrl := s.config.AttestorUrl
+	var requestID string
 
 	// Apply request-level config overrides if provided
 	if req.Body.ConfigJson != nil && *req.Body.ConfigJson != "" {
@@ -51,8 +49,24 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 			if cfg.AttestorUrl != "" {
 				attestorUrl = cfg.AttestorUrl
 			}
+			if cfg.RequestID != "" {
+				requestID = cfg.RequestID
+			}
 		}
 	}
+
+	// Validate requestId length, fall back to generated UUID if not provided
+	if requestID == "" {
+		requestID = uuid.New().String()
+	} else if len(requestID) > 100 {
+		return oapi.ReclaimProve400JSONResponse{
+			BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+				Message: "requestId exceeds maximum length of 100 characters",
+			},
+		}, nil
+	}
+
+	log.Info("starting reclaim prove", "request_id", requestID)
 
 	log.Info("using TEE configuration",
 		"teek_url", teekUrl,
@@ -65,6 +79,7 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		TEEKUrl:     teekUrl,
 		TEETUrl:     teetUrl,
 		AttestorUrl: attestorUrl,
+		RequestID:   requestID,
 	})
 	if err != nil {
 		log.Error("failed to marshal client config", "err", err)
@@ -104,7 +119,7 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		// Recover from panics in the external library to prevent server crash
 		defer func() {
 			if r := recover(); r != nil {
-				log.Error("panic in ExecuteCompleteProtocol", "session_id", sessionID.String(), "panic", r)
+				log.Error("panic in ExecuteCompleteProtocol", "request_id", requestID, "panic", r)
 				resultCh <- result{err: fmt.Errorf("internal error: protocol execution panicked")}
 			}
 		}()
@@ -117,13 +132,13 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 	select {
 	case <-proofCtx.Done():
 		timedOut = true
-		log.Error("proof execution timed out, waiting for goroutine cleanup", "session_id", sessionID.String())
+		log.Error("proof execution timed out, waiting for goroutine cleanup", "request_id", requestID)
 	case res := <-resultCh:
 		// Close client after goroutine completes
 		reclaimClient.Close()
 
 		if res.err != nil {
-			log.Error("proof execution failed", "session_id", sessionID.String(), "err", res.err)
+			log.Error("proof execution failed", "request_id", requestID, "err", res.err)
 			return oapi.ReclaimProve500JSONResponse{
 				InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
 					Message: fmt.Sprintf("proof execution failed: %v", res.err),
@@ -131,11 +146,11 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 			}, nil
 		}
 
-		log.Info("proof execution completed", "session_id", sessionID.String(), "identifier", res.claim.Claim.Identifier)
+		log.Info("proof execution completed", "request_id", requestID, "identifier", res.claim.Claim.Identifier)
 
 		// Map result to response
 		return oapi.ReclaimProve200JSONResponse{
-			SessionId: sessionID,
+			SessionId: requestID,
 			Claim:     mapClaimToOapi(res.claim.Claim),
 			Signature: mapSignatureToOapi(res.claim.Signature),
 		}, nil
@@ -147,9 +162,9 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		// Wait for goroutine with a grace period, then close regardless
 		select {
 		case <-resultCh:
-			log.Info("goroutine completed after timeout", "session_id", sessionID.String())
+			log.Info("goroutine completed after timeout", "request_id", requestID)
 		case <-time.After(10 * time.Second):
-			log.Warn("goroutine did not complete within grace period, closing anyway", "session_id", sessionID.String())
+			log.Warn("goroutine did not complete within grace period, closing anyway", "request_id", requestID)
 		}
 		reclaimClient.Close()
 
