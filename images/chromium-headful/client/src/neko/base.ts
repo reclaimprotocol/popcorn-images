@@ -29,6 +29,16 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
   protected _id = ''
   protected _candidates: RTCIceCandidate[] = []
 
+  // Retry logic properties
+  protected _retryCount = 0
+  protected _maxRetries = 25
+  protected _retryDelay = 5000
+  protected _ignoreRetry = false
+  protected _url?: string
+  protected _password?: string
+  protected _retryTimeout?: number
+  protected _connectionAttemptInProgress = false
+
   get id() {
     return this._id
   }
@@ -50,6 +60,11 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
   }
 
   public connect(url: string, password: string, displayname: string) {
+    if (this._connectionAttemptInProgress) {
+      this.emit('warn', `connection attempt already in progress`)
+      return
+    }
+
     if (this.socketOpen) {
       this.emit('warn', `attempting to create websocket while connection open`)
       return
@@ -60,7 +75,18 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
       return
     }
 
+    // Clear any pending retry timeout to prevent overlapping attempts
+    if (this._retryTimeout) {
+      clearTimeout(this._retryTimeout)
+      this._retryTimeout = undefined
+    }
+
+    this._url = url
+    this._password = password
     this._displayname = displayname
+    this._ignoreRetry = false
+    this._connectionAttemptInProgress = true
+
     this[EVENT.CONNECTING]()
 
     try {
@@ -81,6 +107,13 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
   }
 
   protected disconnect() {
+    if (this._retryTimeout) {
+      clearTimeout(this._retryTimeout)
+      this._retryTimeout = undefined
+    }
+
+    this._connectionAttemptInProgress = false
+
     if (this._timeout) {
       clearTimeout(this._timeout)
       this._timeout = undefined
@@ -93,46 +126,47 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
 
     if (this._ws) {
       // reset all events
-      this._ws.onmessage = () => {}
-      this._ws.onerror = () => {}
-      this._ws.onclose = () => {}
+      this._ws.onmessage = () => { }
+      this._ws.onerror = () => { }
+      this._ws.onclose = () => { }
 
       try {
         this._ws.close()
-      } catch (err) {}
+      } catch (err) { }
 
       this._ws = undefined
     }
 
     if (this._channel) {
       // reset all events
-      this._channel.onmessage = () => {}
-      this._channel.onerror = () => {}
-      this._channel.onclose = () => {}
+      this._channel.onmessage = () => { }
+      this._channel.onerror = () => { }
+      this._channel.onclose = () => { }
 
       try {
         this._channel.close()
-      } catch (err) {}
+      } catch (err) { }
 
       this._channel = undefined
     }
 
     if (this._peer) {
       // reset all events
-      this._peer.onconnectionstatechange = () => {}
-      this._peer.onsignalingstatechange = () => {}
-      this._peer.oniceconnectionstatechange = () => {}
-      this._peer.ontrack = () => {}
+      this._peer.onconnectionstatechange = () => { }
+      this._peer.onsignalingstatechange = () => { }
+      this._peer.oniceconnectionstatechange = () => { }
+      this._peer.ontrack = () => { }
 
       try {
         this._peer.close()
-      } catch (err) {}
+      } catch (err) { }
 
       this._peer = undefined
     }
 
     this._state = 'disconnected'
-    this._displayname = undefined
+    // Do not reset displayname as it might be needed for retry
+    // this._displayname = undefined
     this._id = ''
   }
 
@@ -406,9 +440,17 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
   }
 
   private onConnected() {
+    this._connectionAttemptInProgress = false
+    this._retryCount = 0
+
     if (this._timeout) {
       clearTimeout(this._timeout)
       this._timeout = undefined
+    }
+
+    if (this._retryTimeout) {
+      clearTimeout(this._retryTimeout)
+      this._retryTimeout = undefined
     }
 
     if (!this.connected) {
@@ -431,8 +473,24 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
 
   protected onDisconnected(reason?: Error) {
     this.disconnect()
-    this.emit('debug', `disconnected:`, reason)
-    this[EVENT.DISCONNECTED](reason)
+
+    if (this._ignoreRetry || this._retryCount >= this._maxRetries) {
+      this.emit('debug', `disconnected:`, reason)
+      this[EVENT.DISCONNECTED](reason)
+    } else {
+      this._retryCount++
+      this.emit('debug', `reconnecting attempt ${this._retryCount}/${this._maxRetries}`)
+      this[EVENT.RECONNECTING]()
+
+      this._retryTimeout = window.setTimeout(() => {
+        if (this._url && this._password && this._displayname) {
+          this.connect(this._url, this._password, this._displayname)
+        } else {
+          this.emit('warn', 'cannot reconnect: missing credentials')
+          this[EVENT.DISCONNECTED](new Error('cannot reconnect: missing credentials'))
+        }
+      }, this._retryDelay)
+    }
   }
 
   protected [EVENT.MESSAGE](event: string, payload: any) {

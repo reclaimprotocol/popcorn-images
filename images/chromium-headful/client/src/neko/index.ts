@@ -25,7 +25,7 @@ import {
   FileTransferListPayload,
 } from './messages'
 
-interface NekoEvents extends BaseEvents {}
+interface NekoEvents extends BaseEvents { }
 
 export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
   private $vue!: Vue
@@ -62,6 +62,7 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
   }
 
   logout() {
+    this._ignoreRetry = true
     this.disconnect()
     this.cleanup()
     this.$vue.$swal({
@@ -75,14 +76,15 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
   // Internal Events
   /////////////////////////////
   protected [EVENT.RECONNECTING]() {
-    // KERNEL: Differentiate between temporary network issues and permanent disconnection
-    // If WebSocket is still open, this is likely a temporary ICE disconnection (network glitch)
-    // Allow WebRTC to attempt recovery automatically
-    // If WebSocket is closed, the browser process is likely gone - show disconnected overlay
-    if (!this.socketOpen) {
-      this.cleanup()
-    }
-    // else: WebSocket still open, let WebRTC recover naturally
+    this.$accessor.video.reset()
+    this.$vue.$notify({
+      group: 'neko',
+      type: 'warn',
+      title: this.$vue.$t('connection.reconnecting') as string,
+      text: `Attempt ${this._retryCount}/${this._maxRetries}...`,
+      duration: -1, // persistant
+      speed: 1000,
+    })
   }
 
   protected [EVENT.CONNECTING]() {
@@ -113,6 +115,11 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
 
     this.$vue.$notify({
       group: 'neko',
+      clean: true,
+    })
+
+    this.$vue.$notify({
+      group: 'neko',
       type: 'error',
       title: this.$vue.$t('connection.disconnected') as string,
       text: reason ? reason.message : undefined,
@@ -131,7 +138,7 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
     this.$accessor.video.setStream(0)
   }
 
-  protected [EVENT.DATA]() {}
+  protected [EVENT.DATA]() { }
 
   /////////////////////////////
   // System Events
