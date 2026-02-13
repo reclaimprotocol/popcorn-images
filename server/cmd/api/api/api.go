@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onkernel/kernel-images/server/cmd/config"
 	"github.com/onkernel/kernel-images/server/lib/devtoolsproxy"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	"github.com/onkernel/kernel-images/server/lib/nekoclient"
@@ -21,6 +22,9 @@ import (
 type ApiService struct {
 	// defaultRecorderID is used whenever the caller doesn't specify an explicit ID.
 	defaultRecorderID string
+
+	// config holds the server configuration
+	config *config.Config
 
 	recordManager recorder.RecordManager
 	factory       recorder.FFmpegRecorderFactory
@@ -57,8 +61,10 @@ type ApiService struct {
 
 var _ oapi.StrictServerInterface = (*ApiService)(nil)
 
-func New(recordManager recorder.RecordManager, factory recorder.FFmpegRecorderFactory, upstreamMgr *devtoolsproxy.UpstreamManager, stz scaletozero.Controller, nekoAuthClient *nekoclient.AuthClient) (*ApiService, error) {
+func New(cfg *config.Config, recordManager recorder.RecordManager, factory recorder.FFmpegRecorderFactory, upstreamMgr *devtoolsproxy.UpstreamManager, stz scaletozero.Controller, nekoAuthClient *nekoclient.AuthClient) (*ApiService, error) {
 	switch {
+	case cfg == nil:
+		return nil, fmt.Errorf("config cannot be nil")
 	case recordManager == nil:
 		return nil, fmt.Errorf("recordManager cannot be nil")
 	case factory == nil:
@@ -70,6 +76,7 @@ func New(recordManager recorder.RecordManager, factory recorder.FFmpegRecorderFa
 	}
 
 	return &ApiService{
+		config:            cfg,
 		recordManager:     recordManager,
 		factory:           factory,
 		defaultRecorderID: "default",
