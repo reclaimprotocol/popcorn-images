@@ -8,11 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/reclaimprotocol/reclaim-tee/client"
-
 	"github.com/onkernel/kernel-images/server/cmd/api/circuits"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
+	"github.com/reclaimprotocol/reclaim-tee/client"
 )
 
 // reclaimConfigJSON is the structure for optional config overrides
@@ -74,6 +73,17 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		"attestor_url", attestorUrl,
 	)
 
+	// Parse provider data for ExecuteCompleteProtocol
+	var providerData client.ProviderRequestData
+	if err := json.Unmarshal([]byte(req.Body.ProviderParamsJson), &providerData); err != nil {
+		log.Error("failed to parse provider params", "err", err)
+		return oapi.ReclaimProve400JSONResponse{
+			BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+				Message: fmt.Sprintf("invalid provider parameters JSON: %v", err),
+			},
+		}, nil
+	}
+
 	// Build config JSON for the client library
 	clientConfigJSON, err := json.Marshal(reclaimConfigJSON{
 		TEEKUrl:     teekUrl,
@@ -123,7 +133,7 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 				resultCh <- result{err: fmt.Errorf("internal error: protocol execution panicked")}
 			}
 		}()
-		claim, err := reclaimClient.ExecuteCompleteProtocol(nil)
+		claim, err := reclaimClient.ExecuteCompleteProtocol(&providerData)
 		resultCh <- result{claim: claim, err: err}
 	}()
 
