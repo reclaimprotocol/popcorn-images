@@ -1257,6 +1257,15 @@ components:
           description: Modifier keys to hold during the move
           items:
             type: string
+        smooth:
+          type: boolean
+          description: Use human-like Bezier curve path instead of instant mouse movement.
+          default: true
+        duration_ms:
+          type: integer
+          description: Target total duration in milliseconds for the mouse movement when smooth=true. Omit for automatic timing based on distance.
+          minimum: 50
+          maximum: 5000
       additionalProperties: false
     ScreenshotRegion:
       type: object

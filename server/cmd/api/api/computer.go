@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/onkernel/kernel-images/server/lib/logger"
+	"github.com/onkernel/kernel-images/server/lib/mousetrajectory"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
 )
 
@@ -51,34 +54,32 @@ func (s *ApiService) doMoveMouse(ctx context.Context, body oapi.MoveMouseRequest
 		return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
 	}
 
-	// Build xdotool arguments
-	args := []string{}
+	useSmooth := body.Smooth == nil || *body.Smooth // default true when omitted
+	if useSmooth {
+		return s.doMoveMouseSmooth(ctx, log, body, screenWidth, screenHeight)
+	}
+	return s.doMoveMouseInstant(ctx, log, body)
+}
 
-	// Hold modifier keys (keydown)
+func (s *ApiService) doMoveMouseInstant(ctx context.Context, log *slog.Logger, body oapi.MoveMouseRequest) error {
+	args := []string{}
 	if body.HoldKeys != nil {
 		for _, key := range *body.HoldKeys {
 			args = append(args, "keydown", key)
 		}
 	}
-
-	// Move the cursor to the desired coordinates
 	args = append(args, "mousemove", strconv.Itoa(body.X), strconv.Itoa(body.Y))
-
-	// Release modifier keys (keyup)
 	if body.HoldKeys != nil {
 		for _, key := range *body.HoldKeys {
 			args = append(args, "keyup", key)
 		}
 	}
-
 	log.Info("executing xdotool", "args", args)
-
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool command failed", "err", err, "output", string(output))
 		return &executionError{msg: "failed to move mouse"}
 	}
-
 	return nil
 }
 
@@ -98,6 +99,119 @@ func (s *ApiService) MoveMouse(ctx context.Context, request oapi.MoveMouseReques
 		return oapi.MoveMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
 	}
 	return oapi.MoveMouse200Response{}, nil
+}
+
+func (s *ApiService) doMoveMouseSmooth(ctx context.Context, log *slog.Logger, body oapi.MoveMouseRequest, screenWidth, screenHeight int) error {
+	fromX, fromY, err := s.getMouseLocation(ctx)
+	if err != nil {
+		log.Error("failed to get mouse location for smooth move", "error", err)
+		return &executionError{msg: "failed to get current mouse position: " + err.Error()}
+	}
+
+	if body.DurationMs != nil && (*body.DurationMs < 50 || *body.DurationMs > 5000) {
+		return &validationError{msg: "duration_ms must be between 50 and 5000"}
+	}
+
+	// When duration_ms is specified, compute the number of trajectory points
+	// to achieve that duration at a ~10ms step delay (human-like event frequency).
+	// Otherwise let the library auto-compute from path length.
+	const defaultStepDelayMs = 10
+	var opts *mousetrajectory.Options
+	if body.DurationMs != nil {
+		targetPoints := *body.DurationMs / defaultStepDelayMs
+		if targetPoints < mousetrajectory.MinPoints {
+			targetPoints = mousetrajectory.MinPoints
+		}
+		if targetPoints > mousetrajectory.MaxPoints {
+			targetPoints = mousetrajectory.MaxPoints
+		}
+		opts = &mousetrajectory.Options{MaxPoints: targetPoints}
+	}
+
+	traj := mousetrajectory.NewHumanizeMouseTrajectoryWithOptions(
+		float64(fromX), float64(fromY), float64(body.X), float64(body.Y), opts)
+	points := traj.GetPointsInt()
+	if len(points) < 2 {
+		return s.doMoveMouseInstant(ctx, log, body)
+	}
+
+	// Clamp trajectory points to screen bounds. The Bezier control-point
+	// padding (boundsPadding=80) can place intermediate curve points outside
+	// the screen when the start/end is near an edge. Because we use
+	// mousemove_relative, X11 clamping at screen boundaries would silently
+	// eat deltas, causing the cursor to land at the wrong final position.
+	clampPoints(points, screenWidth, screenHeight)
+
+	// Compute per-step delay to achieve the target duration.
+	numSteps := len(points) - 1
+	stepDelayMs := defaultStepDelayMs
+	if body.DurationMs != nil && numSteps > 0 {
+		stepDelayMs = *body.DurationMs / numSteps
+		if stepDelayMs < 3 {
+			stepDelayMs = 3
+		}
+	}
+
+	// Hold modifiers
+	if body.HoldKeys != nil {
+		args := []string{}
+		for _, key := range *body.HoldKeys {
+			args = append(args, "keydown", key)
+		}
+		if output, err := defaultXdoTool.Run(ctx, args...); err != nil {
+			log.Error("xdotool keydown failed", "err", err, "output", string(output))
+			return &executionError{msg: "failed to hold modifier keys"}
+		}
+		defer func() {
+			args := []string{}
+			for _, key := range *body.HoldKeys {
+				args = append(args, "keyup", key)
+			}
+			// Use background context for cleanup so keys are released even on cancellation.
+			_, _ = defaultXdoTool.Run(context.Background(), args...)
+		}()
+	}
+
+	// Move along Bezier path: mousemove_relative for each step with delay
+	for i := 1; i < len(points); i++ {
+		select {
+		case <-ctx.Done():
+			return &executionError{msg: "mouse movement cancelled"}
+		default:
+		}
+
+		dx := points[i][0] - points[i-1][0]
+		dy := points[i][1] - points[i-1][1]
+		if dx != 0 || dy != 0 {
+			args := []string{"mousemove_relative", "--", strconv.Itoa(dx), strconv.Itoa(dy)}
+			if output, err := defaultXdoTool.Run(ctx, args...); err != nil {
+				log.Error("xdotool mousemove_relative failed", "err", err, "output", string(output), "step", i)
+				return &executionError{msg: "failed during smooth mouse movement"}
+			}
+		}
+		jitter := stepDelayMs
+		if stepDelayMs > 3 {
+			jitter = stepDelayMs + rand.Intn(5) - 2
+			if jitter < 3 {
+				jitter = 3
+			}
+		}
+		if err := sleepWithContext(ctx, time.Duration(jitter)*time.Millisecond); err != nil {
+			return &executionError{msg: "mouse movement cancelled"}
+		}
+	}
+
+	log.Info("executed smooth mouse movement", "points", len(points))
+	return nil
+}
+
+// getMouseLocation returns the current cursor position via xdotool getmouselocation --shell.
+func (s *ApiService) getMouseLocation(ctx context.Context) (x, y int, err error) {
+	output, err := defaultXdoTool.Run(ctx, "getmouselocation", "--shell")
+	if err != nil {
+		return 0, 0, fmt.Errorf("xdotool getmouselocation failed: %w (output: %s)", err, string(output))
+	}
+	return parseMousePosition(string(output))
 }
 
 func (s *ApiService) doClickMouse(ctx context.Context, body oapi.ClickMouseRequest) error {
@@ -1002,6 +1116,24 @@ func (s *ApiService) BatchComputerAction(ctx context.Context, request oapi.Batch
 	}
 
 	return oapi.BatchComputerAction200Response{}, nil
+}
+
+// clampPoints constrains each trajectory point to [0, screenWidth-1] x [0, screenHeight-1].
+func clampPoints(points [][2]int, screenWidth, screenHeight int) {
+	maxX := screenWidth - 1
+	maxY := screenHeight - 1
+	for i := range points {
+		if points[i][0] < 0 {
+			points[i][0] = 0
+		} else if points[i][0] > maxX {
+			points[i][0] = maxX
+		}
+		if points[i][1] < 0 {
+			points[i][1] = 0
+		} else if points[i][1] > maxY {
+			points[i][1] = maxY
+		}
+	}
 }
 
 // generateRelativeSteps produces a sequence of relative steps that approximate a
