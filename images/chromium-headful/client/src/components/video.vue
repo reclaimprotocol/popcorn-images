@@ -427,8 +427,14 @@
       }
     }
 
+    private isVideoSyncing = false;
+
     @Watch('playing')
     async onPlayingChanged(playing: boolean) {
+      // In Safari, native events can fire slightly before the `video.paused` property flips.
+      // This anti-echo guard prevents the watcher from fighting the video element's own state changes.
+      if (this.isVideoSyncing) return;
+
       if (this._video && this._video.paused && playing) {
         // if autoplay is disabled, play() will throw an error
         // and we need to properly save the state otherwise we
@@ -486,19 +492,23 @@
       })
 
       this._video.addEventListener('canplaythrough', () => {
+        console.log('[DEBUG] canplaythrough fired');
         this.$accessor.video.setPlayable(true)
         if (this.autoplay) {
           this.$nextTick(() => {
+            console.log('[DEBUG] canplaythrough calling $accessor.video.play()');
             this.$accessor.video.play()
           })
         }
       })
 
       this._video.addEventListener('ended', () => {
+        console.log('[DEBUG] ended fired');
         this.$accessor.video.setPlayable(false)
       })
 
       this._video.addEventListener('error', (event) => {
+        console.log('[DEBUG] error fired', event.error);
         this.$log.error(event.error)
         this.$accessor.video.setPlayable(false)
       })
@@ -509,12 +519,16 @@
       })
 
       this._video.addEventListener('playing', () => {
+        this.isVideoSyncing = true;
         this.$accessor.video.play()
+        this.$nextTick(() => { this.isVideoSyncing = false; })
       })
 
       this._video.addEventListener('pause', () => {
+        this.isVideoSyncing = true;
         this.$accessor.video.pause()
-      })
+        this.$nextTick(() => { this.isVideoSyncing = false; })
+      });
 
       /* Initialize Guacamole Keyboard */
       this.keyboard.onkeydown = (key: number) => {
