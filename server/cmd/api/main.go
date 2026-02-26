@@ -134,6 +134,15 @@ func main() {
 		fs.ServeHTTP(w, r)
 	})
 
+	// Start the persistent CDP FocusTracker — it polls document.activeElement
+	// every 100ms and caches the result.
+	focusTracker := devtoolsproxy.NewFocusTracker(upstreamMgr, slogger)
+	defer focusTracker.Stop()
+
+	// Expose active-element cache on the primary API router so the gateway
+	// can route to it via the standard `/api/...` path.
+	r.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
 		Handler: r,
@@ -187,10 +196,11 @@ func main() {
 			"webSocketDebuggerUrl": proxyWSURL,
 		})
 	})
-	// Server-side CDP evaluation endpoint: evaluates document.activeElement
-	// directly from Go (no client WebSocket needed) and returns JSON.
-	// The client fetches this on each touch event instead of opening a WebSocket.
-	rDevtools.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(upstreamMgr).ServeHTTP)
+	// Start the persistent CDP FocusTracker — it polls document.activeElement
+	// every 100ms and caches the result. (Already initialized above for the primary API)
+
+	// Cached active-element endpoint: reads atomic pointer (~0 latency).
+	rDevtools.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
 	})

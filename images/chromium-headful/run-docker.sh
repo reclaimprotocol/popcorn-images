@@ -70,6 +70,29 @@ if [[ -n "${PLAYWRIGHT_ENGINE:-}" ]]; then
   RUN_ARGS+=( -e PLAYWRIGHT_ENGINE="$PLAYWRIGHT_ENGINE" )
 fi
 
+
+TURN_KEY_ID="${TURN_KEY_ID:-ebd479e992e9beff26344e214843fef1}"
+TURN_API_TOKEN="${TURN_API_TOKEN:-cac21320baa6b71fb59ec1d9822cfcd4119373e1533621b657916ca1bb58a656}"
+
+if [ ! -z "$TURN_KEY_ID" ] && [ ! -z "$TURN_API_TOKEN" ]; then
+    echo "🔄 Fetching TURN credentials from Cloudflare..."
+    RESPONSE=$(curl -s -X POST \
+        -H "Authorization: Bearer $TURN_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"ttl": 86400}' \
+        "https://rtc.live.cloudflare.com/v1/turn/keys/$TURN_KEY_ID/credentials/generate-ice-servers")
+
+    # Extract iceServers array from response
+    GENERATED_ICE_SERVERS=$(echo "$RESPONSE" | jq -c '.iceServers')
+
+    if [ "$GENERATED_ICE_SERVERS" != "null" ] && [ ! -z "$GENERATED_ICE_SERVERS" ]; then
+        export NEKO_ICESERVERS="$GENERATED_ICE_SERVERS"
+        echo "✅ NEKO_ICESERVERS configured dynamically from Cloudflare."
+    else
+        echo "❌ Failed to fetch TURN credentials. Response: $RESPONSE"
+    fi
+fi
+
 # WebRTC port mapping
 if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
   echo "Running container with WebRTC"

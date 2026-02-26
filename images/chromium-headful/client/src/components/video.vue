@@ -203,6 +203,7 @@
           outline: 0;
           border: 0;
           color: transparent;
+          caret-color: transparent;
           background: transparent;
           resize: none;
         }
@@ -614,30 +615,55 @@
     }
 
     // --- CDP Logic ---
+    // Detect production (behind gateway) vs local dev and return the correct
+    // URL for the active-element endpoint.
+    // Production path: /<browser_pod_id>/<session_id>/<token>/...
+    // Production API:  /api/<session_id>/<token>/cdp/active-element
+    // Local:           http://<hostname>:9222/cdp/active-element
+    getActiveElementUrl(): string {
+      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/);
+      if (match) {
+        const sessionId = match[2];
+        const token = match[3];
+        return `${window.location.origin}/api/${sessionId}/${token}/cdp/active-element`;
+      }
+      // Local dev: hit the kernel-images-api directly
+      return `http://${window.location.hostname}:9222/cdp/active-element`;
+    }
+
     // connectCDP is now a no-op. The actual CDP work happens server-side
     // via GET /cdp/active-element which avoids all WebSocket proxy issues.
     async connectCDP() {
-      const hostname = window.location.hostname;
-      const port = 9222;
-      console.log(`[CDP] Server-side active-element endpoint: http://${hostname}:${port}/cdp/active-element`);
+      console.log(`[CDP] active-element endpoint: ${this.getActiveElementUrl()}`);
     }
 
-    async checkElementHasFocus(): Promise<{ isInput: boolean, tag: string, rawOuterHTML?: string, type?: string, isEditable?: boolean }> {
-      const hostname = window.location.hostname;
-      const port = 9222;
+    /**
+     * Synchronous check using XMLHttpRequest.
+     * Blocks the main thread until the response arrives, which is acceptable
+     * here because: (a) it's hitting localhost (~1-5ms), and (b) we MUST know
+     * the result before deciding to focus (Safari keyboard limitation).
+     */
+    checkElementHasFocusSync(): { isInput: boolean, tag: string, rawOuterHTML?: string, type?: string, isEditable?: boolean } {
+      const url = this.getActiveElementUrl();
       try {
-        const res = await fetch(`http://${hostname}:${port}/cdp/active-element`, { signal: AbortSignal.timeout(2000) });
-        const data = await res.json();
-        console.log('[CDP] active-element result:', data);
-        return {
-          isInput: !!data.isInput,
-          tag: data.tag || 'unknown',
-          type: data.type,
-          isEditable: data.isEditable,
-          rawOuterHTML: data.rawOuterHTML,
-        };
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false); // false = synchronous
+        xhr.send();
+        if (xhr.status === 200) {
+          const data = JSON.parse(xhr.responseText);
+          console.log('[CDP] active-element result (sync):', data);
+          return {
+            isInput: !!data.isInput,
+            tag: data.tag || 'unknown',
+            type: data.type,
+            isEditable: data.isEditable,
+            rawOuterHTML: data.rawOuterHTML,
+          };
+        }
+        console.error('[CDP] active-element sync non-200:', xhr.status);
+        return { isInput: true, tag: 'fetch-error' };
       } catch (e) {
-        console.error('[CDP] active-element fetch error:', e);
+        console.error('[CDP] active-element sync error:', e);
         // Optimistic default: keep keyboard up on error
         return { isInput: true, tag: 'fetch-error' };
       }
@@ -789,7 +815,7 @@
       }
     }
 
-    async onTouchHandler(e: TouchEvent) {
+    onTouchHandler(e: TouchEvent) {
       let first = e.changedTouches[0]
       let type = ''
       switch (e.type) {
@@ -806,14 +832,6 @@
           return
       }
 
-      // Optimistic focus: focus the overlay now so the keyboard CAN appear.
-      // NOTE: We do NOT set readonly before focus — on iOS 15+, focusing a readonly
-      // input does NOT trigger the keyboard, making it appear broken.
-      if (type === 'mouseup' && this.is_touch_device) {
-        console.log('[TOUCHEND] Optimistic focus firing on overlay.');
-        this._overlay.focus();
-      }
-
       const simulatedEvent = new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -825,25 +843,24 @@
       })
       first.target.dispatchEvent(simulatedEvent)
 
-      // Post-click CDP evaluation to either keep keyboard open or blur it
+      // On touchend, use a SYNCHRONOUS XHR to check if the remote browser's
+      // active element is an input. The sync call blocks until the response
+      // arrives (~1-5ms to localhost), so we know the answer BEFORE deciding
+      // to focus. This avoids the iOS Safari "keyboard bounce" entirely:
+      // the keyboard only appears when we KNOW it should.
       if (type === 'mouseup' && this.is_touch_device) {
-        console.log(`[TOUCHEND] Awaiting CDP checkElementHasFocus()...`);
-        
-        // Wait 200ms for the WebRTC click to be processed by the remote browser
-        await new Promise(r => setTimeout(r, 200));
-        const elementResult = await this.checkElementHasFocus()
-        console.log(`[TOUCHEND] CDP Result:`, elementResult);
-        
-        if (!elementResult.isInput) {
-          console.log('[TOUCHEND] Not an input. Blurring overlay to hide keyboard.');
-          this._overlay.blur()
-        } else {
-          console.log('[TOUCHEND] Is an input! Re-focusing overlay to trigger keyboard.');
-          // Re-call focus() now that CDP has confirmed it's an input.
-          // The initial focus attempt may have occurred before the remote browser
-          // registered the click, so this explicit second focus is what reliably
-          // opens the iOS keyboard.
+        const elementResult = this.checkElementHasFocusSync();
+        console.log(`[TOUCHEND] CDP Result (sync):`, elementResult);
+
+        if (elementResult.isInput) {
+          console.log('[TOUCHEND] Is an input! Focusing overlay for keyboard.');
           this._overlay.focus();
+        } else {
+          console.log('[TOUCHEND] Not an input. No keyboard needed.');
+          // Ensure any existing keyboard is dismissed
+          if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+          }
         }
       }
     }
