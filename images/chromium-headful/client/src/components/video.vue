@@ -259,6 +259,12 @@
     private fullscreen = false
     private mutedOverlay = true
 
+    // CDP state
+    private cdpSocket: WebSocket | null = null
+    private pendingCDPCommands: Map<number, { resolve: Function, reject: Function }> = new Map()
+    private cdpCommandId = 1
+    private cdpSessionId: string | null = null
+
     get admin() {
       return this.$accessor.user.admin
     }
@@ -485,6 +491,8 @@
 
       this.observer.observe(this._component)
 
+      this.connectCDP()
+
       onFullscreenChange(this._player, () => {
         this.fullscreen = isFullscreen()
         this.fullscreen ? lockKeyboard() : unlockKeyboard()
@@ -550,7 +558,12 @@
     }
 
     beforeDestroy() {
+      if (this.cdpSocket) {
+        this.cdpSocket.close()
+        this.cdpSocket = null
+      }
       this.observer.disconnect()
+      this.pendingCDPCommands.clear()
       this.$accessor.video.setPlayable(false)
       /* Guacamole Keyboard does not provide destroy functions */
     }
@@ -599,6 +612,37 @@
 
       return key
     }
+
+    // --- CDP Logic ---
+    // connectCDP is now a no-op. The actual CDP work happens server-side
+    // via GET /cdp/active-element which avoids all WebSocket proxy issues.
+    async connectCDP() {
+      const hostname = window.location.hostname;
+      const port = 9222;
+      console.log(`[CDP] Server-side active-element endpoint: http://${hostname}:${port}/cdp/active-element`);
+    }
+
+    async checkElementHasFocus(): Promise<{ isInput: boolean, tag: string, rawOuterHTML?: string, type?: string, isEditable?: boolean }> {
+      const hostname = window.location.hostname;
+      const port = 9222;
+      try {
+        const res = await fetch(`http://${hostname}:${port}/cdp/active-element`, { signal: AbortSignal.timeout(2000) });
+        const data = await res.json();
+        console.log('[CDP] active-element result:', data);
+        return {
+          isInput: !!data.isInput,
+          tag: data.tag || 'unknown',
+          type: data.type,
+          isEditable: data.isEditable,
+          rawOuterHTML: data.rawOuterHTML,
+        };
+      } catch (e) {
+        console.error('[CDP] active-element fetch error:', e);
+        // Optimistic default: keep keyboard up on error
+        return { isInput: true, tag: 'fetch-error' };
+      }
+    }    // --- End CDP Logic ---
+
 
     async play() {
       if (!this._video.paused || !this.playable) {
@@ -745,7 +789,7 @@
       }
     }
 
-    onTouchHandler(e: TouchEvent) {
+    async onTouchHandler(e: TouchEvent) {
       let first = e.changedTouches[0]
       let type = ''
       switch (e.type) {
@@ -762,6 +806,14 @@
           return
       }
 
+      // Optimistic focus: focus the overlay now so the keyboard CAN appear.
+      // NOTE: We do NOT set readonly before focus — on iOS 15+, focusing a readonly
+      // input does NOT trigger the keyboard, making it appear broken.
+      if (type === 'mouseup' && this.is_touch_device) {
+        console.log('[TOUCHEND] Optimistic focus firing on overlay.');
+        this._overlay.focus();
+      }
+
       const simulatedEvent = new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -772,6 +824,28 @@
         clientY: first.clientY,
       })
       first.target.dispatchEvent(simulatedEvent)
+
+      // Post-click CDP evaluation to either keep keyboard open or blur it
+      if (type === 'mouseup' && this.is_touch_device) {
+        console.log(`[TOUCHEND] Awaiting CDP checkElementHasFocus()...`);
+        
+        // Wait 200ms for the WebRTC click to be processed by the remote browser
+        await new Promise(r => setTimeout(r, 200));
+        const elementResult = await this.checkElementHasFocus()
+        console.log(`[TOUCHEND] CDP Result:`, elementResult);
+        
+        if (!elementResult.isInput) {
+          console.log('[TOUCHEND] Not an input. Blurring overlay to hide keyboard.');
+          this._overlay.blur()
+        } else {
+          console.log('[TOUCHEND] Is an input! Re-focusing overlay to trigger keyboard.');
+          // Re-call focus() now that CDP has confirmed it's an input.
+          // The initial focus attempt may have occurred before the remote browser
+          // registered the click, so this explicit second focus is what reliably
+          // opens the iOS keyboard.
+          this._overlay.focus();
+        }
+      }
     }
 
     onMouseDown(e: MouseEvent) {

@@ -155,6 +155,21 @@ func main() {
 				next.ServeHTTP(w, r.WithContext(ctxWithLogger))
 			})
 		},
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Required so the client JS (on localhost:8080) can fetch /json/version
+				// to get the WebSocket debugger URL. WebSocket upgrades don't need this,
+				// but the HTTP fetch() does.
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
 		scaletozero.Middleware(stz),
 	)
 	// Expose a minimal /json/version endpoint so clients that attempt to
@@ -172,6 +187,10 @@ func main() {
 			"webSocketDebuggerUrl": proxyWSURL,
 		})
 	})
+	// Server-side CDP evaluation endpoint: evaluates document.activeElement
+	// directly from Go (no client WebSocket needed) and returns JSON.
+	// The client fetches this on each touch event instead of opening a WebSocket.
+	rDevtools.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(upstreamMgr).ServeHTTP)
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
 	})
