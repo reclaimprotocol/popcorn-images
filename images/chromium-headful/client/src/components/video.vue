@@ -260,6 +260,7 @@
     private focused = false
     private fullscreen = false
     private mutedOverlay = true
+    private isVideoSyncing = false
 
     get admin() {
       return this.$accessor.user.admin
@@ -521,16 +522,16 @@
       })
 
       this._video.addEventListener('playing', () => {
-        this.isVideoSyncing = true;
+        this.isVideoSyncing = true
         this.$accessor.video.play()
-        this.$nextTick(() => { this.isVideoSyncing = false; })
+        this.$nextTick(() => { this.isVideoSyncing = false })
       })
 
       this._video.addEventListener('pause', () => {
-        this.isVideoSyncing = true;
+        this.isVideoSyncing = true
         this.$accessor.video.pause()
-        this.$nextTick(() => { this.isVideoSyncing = false; })
-      });
+        this.$nextTick(() => { this.isVideoSyncing = false })
+      })
 
       /* Initialize Guacamole Keyboard */
       this.keyboard.onkeydown = (key: number) => {
