@@ -6,7 +6,10 @@ import { resourceFromAttributes } from '@opentelemetry/resources'
 // but user asked to minimize deps. 
 // We can just use string literals for resource attributes if we didn't install semantic-conventions.
 
-const collectorUrl = process.env.VUE_APP_OTEL_COLLECTOR_URL || 'https://raven.reclaimprotocol.org:4318/v1/logs'
+// const collectorUrl = process.env.VUE_APP_OTEL_COLLECTOR_URL || 'https://raven.reclaimprotocol.org:4318/v1/logs'
+
+// TEMP: REMOVE IT AFTER 10th APRIL 2026
+const collectorUrl = undefined
 
 let sessionId = 'unknown'
 
