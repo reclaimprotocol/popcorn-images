@@ -15,7 +15,7 @@ const PolicyPath = "/etc/chromium/policies/managed/policy.json"
 const DefaultSearchProviderName = "DuckDuckGo"
 const DefaultSearchProviderSearchURL = "https://duckduckgo.com/?q={searchTerms}"
 const DefaultSearchProviderSuggestURL = "https://duckduckgo.com/ac/?q={searchTerms}"
-const NewTabPageLocation = "https://start.duckduckgo.com/"
+const NewTabPageLocation = "about:blank"
 
 // Chrome extension IDs are 32 lowercase a-p characters
 var extensionIDRegex = regexp.MustCompile(`^[a-p]{32}$`)
