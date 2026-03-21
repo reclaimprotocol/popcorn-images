@@ -27,6 +27,20 @@
           @touchstart.stop.prevent="onTouchHandler"
           @touchend.stop.prevent="onTouchHandler"
         />
+        <!-- Mobile keyboard input: separate from overlay to avoid .prevent conflicts.
+             Focused from the keyboard toggle button (clean click gesture).
+             Text captured via input events and sent through CDP. -->
+        <input
+          v-if="is_touch_device"
+          ref="mobileInput"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          class="mobile-keyboard-input"
+        />
 <!-- KERNEL
         <div v-if="!playing && playable" class="player-overlay" @click.stop.prevent="playAndUnmute">
           <i class="fas fa-play-circle" />
@@ -208,6 +222,19 @@
           resize: none;
         }
 
+        .mobile-keyboard-input {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: 1px;
+          height: 1px;
+          opacity: 0.01;
+          font-size: 16px; /* prevents iOS zoom */
+          border: 0;
+          outline: 0;
+          z-index: 200;
+        }
+
         .player-aspect {
           display: block;
           padding-bottom: 56.25%;
@@ -243,6 +270,7 @@
     @Ref('component') readonly _component!: HTMLElement
     @Ref('container') readonly _container!: HTMLElement
     @Ref('overlay') readonly _overlay!: HTMLTextAreaElement
+    @Ref('mobileInput') readonly _mobileInput!: HTMLInputElement
     @Ref('aspect') readonly _aspect!: HTMLElement
     @Ref('player') readonly _player!: HTMLElement
     @Ref('video') readonly _video!: HTMLVideoElement
@@ -539,7 +567,7 @@
         this.$nextTick(() => { this.isVideoSyncing = false; })
       });
 
-      /* Initialize Guacamole Keyboard */
+      /* Initialize Guacamole Keyboard — desktop only */
       this.keyboard.onkeydown = (key: number) => {
         if (!this.hosting || this.locked) {
           return true
@@ -556,6 +584,91 @@
         this.$client.sendData('keyup', { key: this.keyMap(key) })
       }
       this.keyboard.listenTo(this._overlay)
+
+      /* Mobile keyboard input via CDP (same approach as React portal).
+       * The mobile input is a separate <input> element focused from the
+       * keyboard toggle button. Input events are captured here and sent
+       * to Chrome via CDP Input.insertText / Input.dispatchKeyEvent. */
+      if (this.is_touch_device && this._mobileInput) {
+        const input = this._mobileInput
+        const isAndroid = /android/i.test(navigator.userAgent)
+        let lastValue = ''
+
+        input.addEventListener('beforeinput', (e: Event) => {
+          const ev = e as InputEvent
+          if (!this.hosting || this.locked) return
+
+          if (!isAndroid) {
+            // iOS: send text directly from beforeinput
+            if (ev.inputType === 'insertText' && ev.data) {
+              ev.preventDefault()
+              this.sendCDPToPage('Input.insertText', { text: ev.data })
+              input.value = ''
+              lastValue = ''
+            } else if (ev.inputType === 'deleteContentBackward') {
+              ev.preventDefault()
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+              input.value = ''
+              lastValue = ''
+            } else if (ev.inputType === 'insertLineBreak') {
+              ev.preventDefault()
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              input.value = ''
+              lastValue = ''
+            }
+          } else {
+            // Android: handle backspace on empty input in beforeinput
+            if (ev.inputType === 'deleteContentBackward' && input.value === '') {
+              ev.preventDefault()
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+            } else if (ev.inputType === 'insertLineBreak') {
+              ev.preventDefault()
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              input.value = ''
+              lastValue = ''
+            }
+          }
+        })
+
+        input.addEventListener('input', () => {
+          if (!this.hosting || this.locked) { input.value = ''; lastValue = ''; return; }
+
+          if (isAndroid) {
+            const cur = input.value
+            if (cur.length > lastValue.length) {
+              const newChars = cur.startsWith(lastValue) ? cur.slice(lastValue.length) : cur
+              if (newChars) this.sendCDPToPage('Input.insertText', { text: newChars })
+            } else if (cur.length < lastValue.length) {
+              const deleted = lastValue.length - cur.length
+              for (let i = 0; i < deleted; i++) {
+                this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+                this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+              }
+            }
+            lastValue = cur
+            if (cur.length > 50) { input.value = cur.slice(-5); lastValue = input.value; }
+          }
+        })
+
+        input.addEventListener('keydown', (e: KeyboardEvent) => {
+          if (!this.hosting || this.locked) return
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+            input.value = ''
+            lastValue = ''
+          } else if (e.key === 'Backspace' && input.value === '') {
+            e.preventDefault()
+            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+          }
+        })
+      }
     }
 
     beforeDestroy() {
@@ -631,10 +744,98 @@
       return `http://${window.location.hostname}:9222/cdp/active-element`;
     }
 
-    // connectCDP is now a no-op. The actual CDP work happens server-side
-    // via GET /cdp/active-element which avoids all WebSocket proxy issues.
+    // Connect to CDP via the devtools proxy on port 9222 for mobile keyboard input.
+    // Same two-step approach as FocusTracker in cdpeval.go:
+    //   1. Target.getTargets → find the page target ID
+    //   2. Target.attachToTarget → get a sessionId
+    // Then use Input.insertText / Input.dispatchKeyEvent with that sessionId.
     async connectCDP() {
       console.log(`[CDP] active-element endpoint: ${this.getActiveElementUrl()}`);
+
+      if (!this.is_touch_device) return; // desktop uses Guacamole, no CDP needed
+
+      const wsUrl = `ws://${window.location.hostname}:9222`;
+      console.log(`[CDP] connecting WebSocket: ${wsUrl}`);
+
+      try {
+        const socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+          console.log('[CDP] WebSocket connected');
+          this.cdpSocket = socket;
+
+          // Step 1: find the page target (same as FocusTracker.pollLoop)
+          const getTargetsId = this.cdpCommandId++;
+          let pendingAttachId = -1;
+          socket.send(JSON.stringify({ id: getTargetsId, method: 'Target.getTargets', params: {} }));
+
+          const handleMessage = (event: MessageEvent) => {
+            try {
+              const msg = JSON.parse(event.data);
+
+              // Step 1 response: find page target ID
+              if (msg.id === getTargetsId && msg.result) {
+                const targets = msg.result.targetInfos || [];
+                const page = targets.find((t: any) => t.type === 'page' && !t.url.startsWith('devtools://'));
+                if (page) {
+                  console.log(`[CDP] found page target: ${page.targetId}`);
+                  // Step 2: attach to the page target
+                  pendingAttachId = this.cdpCommandId++;
+                  socket.send(JSON.stringify({
+                    id: pendingAttachId,
+                    method: 'Target.attachToTarget',
+                    params: { targetId: page.targetId, flatten: true }
+                  }));
+                } else {
+                  console.error('[CDP] no page target found, retrying in 2s');
+                  setTimeout(() => {
+                    if (this.cdpSocket) {
+                      const retryId = this.cdpCommandId++;
+                      socket.send(JSON.stringify({ id: retryId, method: 'Target.getTargets', params: {} }));
+                    }
+                  }, 2000);
+                }
+              }
+
+              // Step 2 response: get sessionId
+              if (pendingAttachId > 0 && msg.id === pendingAttachId && msg.result) {
+                pendingAttachId = -1;
+                const sessionId = msg.result.sessionId;
+                if (sessionId) {
+                  console.log(`[CDP] attached to page, sessionId: ${sessionId}`);
+                  this.cdpSessionId = sessionId;
+                  this.sendCDPToPage('Input.enable', {});
+                  console.log('[CDP] Input.enable sent — ready for keyboard input');
+                }
+              }
+            } catch { /* ignore parse errors */ }
+          };
+
+          socket.addEventListener('message', handleMessage);
+        };
+
+        socket.onerror = (e: any) => console.error('[CDP] error:', e);
+        socket.onclose = () => {
+          console.log('[CDP] closed, reconnecting in 2s');
+          this.cdpSocket = null;
+          this.cdpSessionId = null;
+          setTimeout(() => this.connectCDP(), 2000);
+        };
+      } catch (e) {
+        console.error('[CDP] connect failed:', e);
+      }
+    }
+
+    sendCDP(method: string, params: any = {}) {
+      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) return;
+      this.cdpSocket.send(JSON.stringify({ id: this.cdpCommandId++, method, params }));
+    }
+
+    sendCDPToPage(method: string, params: any = {}) {
+      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) return;
+      const msg: any = { id: this.cdpCommandId++, method, params };
+      if (this.cdpSessionId) msg.sessionId = this.cdpSessionId;
+      this.cdpSocket.send(JSON.stringify(msg));
     }
 
     /**
@@ -843,25 +1044,45 @@
       })
       first.target.dispatchEvent(simulatedEvent)
 
-      // On touchend, use a SYNCHRONOUS XHR to check if the remote browser's
-      // active element is an input. The sync call blocks until the response
-      // arrives (~1-5ms to localhost), so we know the answer BEFORE deciding
-      // to focus. This avoids the iOS Safari "keyboard bounce" entirely:
-      // the keyboard only appears when we KNOW it should.
+      // Auto-detect input fields on touchend via sync XHR + async re-check.
+      // The sync XHR may return stale data (FocusTracker polls every 100ms,
+      // and the click may not have been processed yet). So:
+      //   1. Sync check: if isInput → focus (open keyboard)
+      //   2. Async re-check after 300ms: if NOT isInput → blur (close keyboard)
+      // This handles both directions: opening on input taps AND closing on non-input taps.
       if (type === 'mouseup' && this.is_touch_device) {
         const elementResult = this.checkElementHasFocusSync();
-        console.log(`[TOUCHEND] CDP Result (sync):`, elementResult);
+        console.log(`[TOUCHEND] sync check:`, elementResult);
 
-        if (elementResult.isInput) {
-          console.log('[TOUCHEND] Is an input! Focusing overlay for keyboard.');
-          this._overlay.focus();
-        } else {
-          console.log('[TOUCHEND] Not an input. No keyboard needed.');
-          // Ensure any existing keyboard is dismissed
+        if (elementResult.isInput && this._mobileInput) {
+          console.log('[TOUCHEND] Input detected — opening keyboard');
+          this._mobileInput.value = '';
+          this._mobileInput.focus();
+        } else if (!elementResult.isInput) {
+          console.log('[TOUCHEND] Not an input — dismissing keyboard');
+          if (this._mobileInput) this._mobileInput.blur();
           if (document.activeElement instanceof HTMLElement) {
             document.activeElement.blur();
           }
         }
+
+        // Async re-check: catches stale cache (e.g. tapped outside input
+        // but sync XHR still returned isInput:true from old cache)
+        setTimeout(() => {
+          try {
+            const url = this.getActiveElementUrl();
+            fetch(url)
+              .then(res => res.json())
+              .then(data => {
+                console.log('[TOUCHEND] async re-check:', data);
+                if (!data.isInput && this._mobileInput && document.activeElement === this._mobileInput) {
+                  console.log('[TOUCHEND] Stale cache corrected — closing keyboard');
+                  this._mobileInput.blur();
+                }
+              })
+              .catch(() => {});
+          } catch {}
+        }, 300);
       }
     }
 
@@ -947,8 +1168,15 @@
     }
 
     openMobileKeyboard() {
-      // focus opens the keyboard on mobile
-      this._overlay.focus()
+      // Focus the dedicated mobile input (not the overlay which has .prevent on
+      // touch events). This is a click gesture from the keyboard button, so
+      // .focus() opens the keyboard on both iOS and Android.
+      if (this._mobileInput) {
+        this._mobileInput.value = '';
+        this._mobileInput.focus();
+      } else {
+        this._overlay.focus();
+      }
     }
   }
 </script>
