@@ -130,6 +130,14 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(jsonData)
 	})
+	// Browser-events session endpoints (not part of OpenAPI spec)
+	r.Post("/playwright/session/init", apiService.HandleSessionInit)
+	r.Get("/playwright/session/data", apiService.HandleSessionData)
+	r.Post("/playwright/session/close", apiService.HandleSessionClose)
+
+	// Match + extract + build provider params in one call (uses same Go libs as TEE)
+	r.Post("/browser-events/match", apiService.HandleMatch)
+
 	// PTY attach endpoint (WebSocket) - not part of OpenAPI spec
 	// Uses WebSocket for bidirectional streaming, which works well through proxies.
 	r.Get("/process/{process_id}/attach", func(w http.ResponseWriter, r *http.Request) {

@@ -306,6 +306,9 @@ COPY --from=server-builder /out/chromium-launcher /usr/local/bin/chromium-launch
 # Copy bundled extensions
 COPY extensions/proxy/ /home/kernel/extensions/proxy/
 
+# Copy browser-events scripts (hawkeye, login detection, etc.)
+COPY server/runtime/scripts/ /usr/local/lib/browser-events-scripts/
+
 # Copy and compile the Playwright daemon
 COPY server/runtime/playwright-daemon.ts /tmp/playwright-daemon.ts
 RUN esbuild /tmp/playwright-daemon.ts \
