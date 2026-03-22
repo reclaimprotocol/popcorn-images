@@ -92,7 +92,7 @@
           <i class="fas fa-keyboard" />
         </li>
         <li
-          v-if="hosting && is_touch_device"
+          v-if="hosting"
           :class="extraControls || 'extra-control'"
           @click.stop.prevent="toggleMagnify"
         >
@@ -342,7 +342,9 @@
     // Viewport & magnify state (same as keyboard.ts)
     private readonly PHYSICAL_WIDTH = 1920
     private readonly PHYSICAL_HEIGHT = 1080
-    isMagnified = false // true = native resolution (scrollable), false = fit-to-screen (used in template)
+    // true = native 1920x1080 (neko input), false = fit-to-screen emulated (CDP input)
+    // Default to fit-to-screen on all devices
+    isMagnified = false
     private emulatedWidth = 0
     private emulatedHeight = 0
 
@@ -475,11 +477,11 @@
       )
     }
 
-    // Whether mobile viewport mode is active (used for CSS class toggle).
-    // Always true on touch devices (don't wait for CDP emulation).
-    // The CSS crops the 1920x1080 stream to show only what fits the screen.
+    // Whether viewport emulation mode is active (used for CSS class toggle and input routing).
+    // When active: CSS crops the 1920x1080 stream, all input goes through CDP.
+    // When magnified: native 1920x1080, input goes through neko.
     get mobileViewportActive(): boolean {
-      return this.is_touch_device && !this.isMagnified
+      return !this.isMagnified
     }
 
     @Watch('width')
@@ -586,7 +588,7 @@
 
       // Re-apply viewport emulation on resize
       window.addEventListener('resize', () => {
-        if (this.cdpSessionId && !this.isMagnified) {
+        if (!this.isMagnified) {
           this.applyViewportEmulation()
           this.onResize()
         }
@@ -639,23 +641,120 @@
         this.$nextTick(() => { this.isVideoSyncing = false; })
       });
 
-      /* Initialize Guacamole Keyboard — desktop only */
+      /* Initialize Guacamole Keyboard — only active in magnified (neko) mode.
+       * In emulated mode, native keydown/keyup handlers below take over. */
       this.keyboard.onkeydown = (key: number) => {
-        if (!this.hosting || this.locked) {
+        if (!this.hosting || this.locked || this.mobileViewportActive) {
           return true
         }
-
         this.$client.sendData('keydown', { key: this.keyMap(key) })
         return false
       }
       this.keyboard.onkeyup = (key: number) => {
-        if (!this.hosting || this.locked) {
+        if (!this.hosting || this.locked || this.mobileViewportActive) {
           return
         }
-
         this.$client.sendData('keyup', { key: this.keyMap(key) })
       }
       this.keyboard.listenTo(this._overlay)
+
+      /* Emulated mode keyboard: native keydown/keyup + clipboard handlers.
+       * Bypasses Guacamole to preserve modifier state (Ctrl+C/V), handle
+       * clipboard, and send via CDP like keyboard.ts. */
+      this._overlay.addEventListener('keydown', (e: KeyboardEvent) => {
+        if (!this.mobileViewportActive || !this.hosting || this.locked) return
+
+        // Clipboard shortcuts
+        if (e.metaKey || e.ctrlKey) {
+          const key = e.key.toLowerCase()
+
+          // Paste (Cmd/Ctrl+V): read clipboard and send via CDP
+          if (key === 'v') {
+            e.preventDefault()
+            e.stopPropagation()
+            navigator.clipboard.readText().then(text => {
+              if (text) this.sendCDPToPage('Input.insertText', { text })
+            }).catch(() => {
+              // Clipboard API failed, try native paste as fallback
+              document.execCommand('paste')
+            })
+            return
+          }
+
+          // Copy (Cmd/Ctrl+C): send to remote browser, neko clipboard sync picks it up
+          if (key === 'c') {
+            e.preventDefault()
+            e.stopPropagation()
+            this.sendCDPKeyCombo('c', 'KeyC', 67)
+            return
+          }
+
+          // Cut (Cmd/Ctrl+X)
+          if (key === 'x') {
+            e.preventDefault()
+            e.stopPropagation()
+            this.sendCDPKeyCombo('x', 'KeyX', 88)
+            return
+          }
+
+          // Select All (Cmd/Ctrl+A)
+          if (key === 'a') {
+            e.preventDefault()
+            e.stopPropagation()
+            this.sendCDPKeyCombo('a', 'KeyA', 65)
+            return
+          }
+
+          // Let other Cmd shortcuts pass (Cmd+T, Cmd+W, etc.)
+          return
+        }
+
+        e.preventDefault()
+        e.stopPropagation()
+
+        // Printable character
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          if (e.repeat) return
+          this.sendCDPToPage('Input.insertText', { text: e.key })
+          return
+        }
+
+        // Special keys
+        const modifiers = (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
+        this.sendCDPToPage('Input.dispatchKeyEvent', {
+          type: 'keyDown', key: e.key, code: e.code,
+          windowsVirtualKeyCode: e.keyCode, nativeVirtualKeyCode: e.keyCode,
+          modifiers
+        })
+      }, true)
+
+      this._overlay.addEventListener('keyup', (e: KeyboardEvent) => {
+        if (!this.mobileViewportActive || !this.hosting || this.locked) return
+        if (e.metaKey || e.ctrlKey) return
+
+        e.preventDefault()
+        e.stopPropagation()
+
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) return // printable chars handled in keydown
+
+        const modifiers = (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
+        this.sendCDPToPage('Input.dispatchKeyEvent', {
+          type: 'keyUp', key: e.key, code: e.code,
+          windowsVirtualKeyCode: e.keyCode, nativeVirtualKeyCode: e.keyCode,
+          modifiers
+        })
+      }, true)
+
+      // Paste event handler: reads clipboard and sends text via CDP
+      this._overlay.addEventListener('paste', (e: ClipboardEvent) => {
+        if (!this.mobileViewportActive || !this.hosting) return
+        e.preventDefault()
+        e.stopPropagation()
+        const text = e.clipboardData?.getData('text/plain')
+        if (text) {
+          this.sendCDPToPage('Input.insertText', { text })
+        }
+      }, true)
 
       /* Mobile keyboard input via CDP (same approach as keyboard.ts).
        * Sends text via Input.insertText and special keys via Input.dispatchKeyEvent
@@ -865,9 +964,7 @@
       console.log(`[CDP] Using HTTP input endpoint: ${this.getCDPInputUrl()}`);
       // Wait for the server's FocusTracker to establish its CDP connection,
       // then apply viewport emulation. Retry until it succeeds.
-      if (this.is_touch_device) {
-        this.retryViewportEmulation();
-      }
+      this.retryViewportEmulation();
     }
 
     private viewportRetryTimer: any = null;
@@ -969,6 +1066,54 @@
       this.applyViewportEmulation();
     }
 
+    // ─── Keysym → CDP key info (for emulated mode keyboard) ───
+
+    private SPECIAL_KEYS: Record<number, { key: string; code: string; keyCode: number }> = {
+      0xFF08: { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+      0xFF09: { key: 'Tab', code: 'Tab', keyCode: 9 },
+      0xFF0D: { key: 'Enter', code: 'Enter', keyCode: 13 },
+      0xFF1B: { key: 'Escape', code: 'Escape', keyCode: 27 },
+      0xFF50: { key: 'Home', code: 'Home', keyCode: 36 },
+      0xFF51: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+      0xFF52: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+      0xFF53: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+      0xFF54: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+      0xFF55: { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+      0xFF56: { key: 'PageDown', code: 'PageDown', keyCode: 34 },
+      0xFF57: { key: 'End', code: 'End', keyCode: 35 },
+      0xFFFF: { key: 'Delete', code: 'Delete', keyCode: 46 },
+      0xFFE1: { key: 'Shift', code: 'ShiftLeft', keyCode: 16 },
+      0xFFE2: { key: 'Shift', code: 'ShiftRight', keyCode: 16 },
+      0xFFE3: { key: 'Control', code: 'ControlLeft', keyCode: 17 },
+      0xFFE4: { key: 'Control', code: 'ControlRight', keyCode: 17 },
+      0xFFE9: { key: 'Alt', code: 'AltLeft', keyCode: 18 },
+      0xFFEA: { key: 'Alt', code: 'AltRight', keyCode: 18 },
+      0xFFEB: { key: 'Meta', code: 'MetaLeft', keyCode: 91 },
+      0xFFEC: { key: 'Meta', code: 'MetaRight', keyCode: 91 },
+      0x0020: { key: ' ', code: 'Space', keyCode: 32 },
+    }
+
+    keysymToKeyInfo(keysym: number): { key: string; code: string; keyCode: number; text?: string } {
+      // Check special keys
+      const special = this.SPECIAL_KEYS[keysym]
+      if (special) return special
+
+      // Printable character: convert keysym to Unicode
+      let char: string
+      if (keysym >= 0x01000000) {
+        // Unicode keysym: 0x01000000 | codepoint
+        char = String.fromCodePoint(keysym & 0x00FFFFFF)
+      } else if (keysym >= 0x20 && keysym <= 0x7E) {
+        // ASCII printable
+        char = String.fromCharCode(keysym)
+      } else {
+        // Unknown — send as key event
+        char = String.fromCharCode(keysym)
+      }
+
+      return { key: char, code: '', keyCode: char.charCodeAt(0), text: char }
+    }
+
     // ─── Coordinate translation (screen → emulated, same as keyboard.ts) ───
 
     getEmulatedCoords(clientX: number, clientY: number): { x: number; y: number } {
@@ -986,6 +1131,24 @@
         x: Math.max(0, Math.min(targetW - 1, x)),
         y: Math.max(0, Math.min(targetH - 1, y))
       };
+    }
+
+    // ─── CDP clipboard (copy from remote browser to local clipboard) ───
+
+    // Send Ctrl+C / Ctrl+X to remote browser via CDP.
+    // The remote browser copies to its clipboard, neko's clipboard sync picks it up.
+    sendCDPKeyCombo(key: string, code: string, keyCode: number) {
+      // keyDown with Ctrl modifier
+      this.sendCDPToPage('Input.dispatchKeyEvent', {
+        type: 'keyDown', key, code,
+        windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+        modifiers: 2 // Ctrl
+      })
+      this.sendCDPToPage('Input.dispatchKeyEvent', {
+        type: 'keyUp', key, code,
+        windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+        modifiers: 2
+      })
     }
 
     // ─── CDP touch scroll (same as keyboard.ts handleTouchStart/Move/EndKernel) ───
@@ -1297,8 +1460,17 @@
         return
       }
 
-      this.sendMousePos(e)
-      this.$client.sendData('mousedown', { key: e.button + 1 })
+      if (this.mobileViewportActive) {
+        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
+        this.sendCDPToPage('Input.dispatchMouseEvent', {
+          type: 'mousePressed', x, y, button: 'left', clickCount: 1
+        })
+        // Focus overlay so Guacamole keyboard captures keystrokes
+        this._overlay.focus()
+      } else {
+        this.sendMousePos(e)
+        this.$client.sendData('mousedown', { key: e.button + 1 })
+      }
     }
 
     onMouseUp(e: MouseEvent) {
@@ -1306,8 +1478,15 @@
         return
       }
 
-      this.sendMousePos(e)
-      this.$client.sendData('mouseup', { key: e.button + 1 })
+      if (this.mobileViewportActive) {
+        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
+        this.sendCDPToPage('Input.dispatchMouseEvent', {
+          type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+        })
+      } else {
+        this.sendMousePos(e)
+        this.$client.sendData('mouseup', { key: e.button + 1 })
+      }
     }
 
     onMouseMove(e: MouseEvent) {
@@ -1315,7 +1494,14 @@
         return
       }
 
-      this.sendMousePos(e)
+      if (this.mobileViewportActive) {
+        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
+        this.sendCDPToPage('Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x, y
+        })
+      } else {
+        this.sendMousePos(e)
+      }
     }
 
     onMouseEnter(e: MouseEvent) {
