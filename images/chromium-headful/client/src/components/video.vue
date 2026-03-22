@@ -1,7 +1,7 @@
 <template>
   <div ref="component" class="video">
     <div ref="player" class="player">
-      <div ref="container" class="player-container">
+      <div ref="container" :class="['player-container', mobileViewportActive ? 'mobile-viewport' : '']">
         <video ref="video" playsinline />
         <div class="emotes">
           <template v-for="(emote, index) in emotes">
@@ -91,6 +91,13 @@
         >
           <i class="fas fa-keyboard" />
         </li>
+        <li
+          v-if="hosting && is_touch_device"
+          :class="extraControls || 'extra-control'"
+          @click.stop.prevent="toggleMagnify"
+        >
+          <i :class="['fas', isMagnified ? 'fa-compress' : 'fa-search-plus']" />
+        </li>
       </ul>
       <neko-resolution ref="resolution" v-if="admin" />
       <neko-clipboard ref="clipboard" v-if="hosting && (!clipboard_read_available || !clipboard_write_available)" />
@@ -109,6 +116,14 @@
       justify-content: center;
       align-items: center;
       background: #000;
+
+      /* On mobile: fill screen, no centering */
+      @media (pointer: coarse) {
+        justify-content: flex-start;
+        align-items: flex-start;
+        width: 100vw !important;
+        height: 100vh !important;
+      }
 
       .video-menu {
         position: absolute;
@@ -166,20 +181,6 @@
         width: 100%;
         max-width: calc(16 / 9 * 100vh);
 
-        video {
-          position: absolute;
-          top: 0;
-          bottom: 0;
-          width: 100%;
-          height: 100%;
-          display: flex;
-          background: #000;
-
-          &::-webkit-media-controls {
-            display: none !important;
-          }
-        }
-
         .player-overlay,
         .emotes {
           position: absolute;
@@ -207,6 +208,20 @@
           }
         }
 
+        video {
+          position: absolute;
+          top: 0;
+          bottom: 0;
+          width: 100%;
+          height: 100%;
+          display: flex;
+          background: #000;
+
+          &::-webkit-media-controls {
+            display: none !important;
+          }
+        }
+
         .overlay {
           position: absolute;
           top: 0;
@@ -220,6 +235,36 @@
           caret-color: transparent;
           background: transparent;
           resize: none;
+          touch-action: none;
+        }
+
+        /* Mobile viewport: fill screen, crop video to show only the
+           top-left emulated area at 1:1 native pixels.
+           Uses 100dvh (dynamic viewport height) to avoid iOS Safari's
+           100vh bug where it includes the area behind the address bar. */
+        &.mobile-viewport {
+          max-width: 100vw !important;
+          width: 100vw !important;
+          height: 100vh !important; /* fallback for older browsers */
+          height: 100dvh !important; /* iOS Safari: matches visual viewport */
+
+          video {
+            object-fit: none;
+            object-position: 0 0;
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+          }
+
+          .overlay {
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+          }
+
+          .player-aspect {
+            display: none !important;
+          }
         }
 
         .mobile-keyboard-input {
@@ -293,6 +338,18 @@
     private pendingCDPCommands: Map<number, { resolve: Function, reject: Function }> = new Map()
     private cdpCommandId = 1
     private cdpSessionId: string | null = null
+
+    // Viewport & magnify state (same as keyboard.ts)
+    private readonly PHYSICAL_WIDTH = 1920
+    private readonly PHYSICAL_HEIGHT = 1080
+    isMagnified = false // true = native resolution (scrollable), false = fit-to-screen (used in template)
+    private emulatedWidth = 0
+    private emulatedHeight = 0
+
+    // Touch scroll state (for CDP touch events)
+    private touchStart: { x: number; y: number; clientX: number; clientY: number; time: number } | null = null
+    private isScrolling = false
+    private touchEventsSent = false
 
     get admin() {
       return this.$accessor.user.admin
@@ -418,6 +475,13 @@
       )
     }
 
+    // Whether mobile viewport mode is active (used for CSS class toggle).
+    // Always true on touch devices (don't wait for CDP emulation).
+    // The CSS crops the 1920x1080 stream to show only what fits the screen.
+    get mobileViewportActive(): boolean {
+      return this.is_touch_device && !this.isMagnified
+    }
+
     @Watch('width')
     onWidthChanged() {
       this.onResize()
@@ -520,6 +584,14 @@
 
       this.observer.observe(this._component)
 
+      // Re-apply viewport emulation on resize
+      window.addEventListener('resize', () => {
+        if (this.cdpSessionId && !this.isMagnified) {
+          this.applyViewportEmulation()
+          this.onResize()
+        }
+      })
+
       this.connectCDP()
 
       onFullscreenChange(this._player, () => {
@@ -585,72 +657,107 @@
       }
       this.keyboard.listenTo(this._overlay)
 
-      /* Mobile keyboard input via CDP (same approach as React portal).
-       * The mobile input is a separate <input> element focused from the
-       * keyboard toggle button. Input events are captured here and sent
-       * to Chrome via CDP Input.insertText / Input.dispatchKeyEvent. */
+      /* Mobile keyboard input via CDP (same approach as keyboard.ts).
+       * Sends text via Input.insertText and special keys via Input.dispatchKeyEvent
+       * directly to the remote browser's focused element. */
       if (this.is_touch_device && this._mobileInput) {
         const input = this._mobileInput
         const isAndroid = /android/i.test(navigator.userAgent)
         let lastValue = ''
+
+        // Send text via CDP Input.insertText (works for all Unicode)
+        const sendChar = (char: string) => {
+          this.sendCDPToPage('Input.insertText', { text: char })
+        }
+
+        // Send special key via CDP Input.dispatchKeyEvent
+        const sendSpecialKey = (key: string, code: string, keyCode: number) => {
+          this.sendCDPToPage('Input.dispatchKeyEvent', {
+            type: 'keyDown', key, code,
+            windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode
+          })
+          this.sendCDPToPage('Input.dispatchKeyEvent', {
+            type: 'keyUp', key, code,
+            windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode
+          })
+        }
+
+        // Deferred backspace timer for IME keyboards that send key='Unidentified'
+        let pendingBackspaceTimer: ReturnType<typeof setTimeout> | null = null
 
         input.addEventListener('beforeinput', (e: Event) => {
           const ev = e as InputEvent
           if (!this.hosting || this.locked) return
 
           if (!isAndroid) {
-            // iOS: send text directly from beforeinput
+            // iOS: handle in beforeinput (more reliable than input event)
             if (ev.inputType === 'insertText' && ev.data) {
               ev.preventDefault()
-              this.sendCDPToPage('Input.insertText', { text: ev.data })
+              for (const char of ev.data) sendChar(char)
               input.value = ''
               lastValue = ''
             } else if (ev.inputType === 'deleteContentBackward') {
               ev.preventDefault()
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+              sendSpecialKey('Backspace', 'Backspace', 8)
               input.value = ''
               lastValue = ''
             } else if (ev.inputType === 'insertLineBreak') {
               ev.preventDefault()
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              sendSpecialKey('Enter', 'Enter', 13)
               input.value = ''
               lastValue = ''
             }
           } else {
-            // Android: handle backspace on empty input in beforeinput
-            if (ev.inputType === 'deleteContentBackward' && input.value === '') {
+            // Android: handle deletions in beforeinput
+            if (ev.inputType === 'deleteContentBackward' || ev.inputType === 'deleteByCut' ||
+                ev.inputType === 'deleteContent' || ev.inputType === 'deleteContentForward') {
+              if (pendingBackspaceTimer) { clearTimeout(pendingBackspaceTimer); pendingBackspaceTimer = null }
+              if (input.value === '') {
+                ev.preventDefault()
+                sendSpecialKey('Backspace', 'Backspace', 8)
+                return
+              }
+              // Let through to input handler for value-based detection
+              return
+            }
+            if (pendingBackspaceTimer) { clearTimeout(pendingBackspaceTimer); pendingBackspaceTimer = null }
+            if (ev.inputType === 'insertLineBreak') {
               ev.preventDefault()
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-            } else if (ev.inputType === 'insertLineBreak') {
-              ev.preventDefault()
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-              this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
+              sendSpecialKey('Enter', 'Enter', 13)
               input.value = ''
               lastValue = ''
             }
           }
         })
 
-        input.addEventListener('input', () => {
-          if (!this.hosting || this.locked) { input.value = ''; lastValue = ''; return; }
+        input.addEventListener('input', (e: Event) => {
+          if (!this.hosting || this.locked) { input.value = ''; lastValue = ''; return }
 
           if (isAndroid) {
+            const inputEvent = e as InputEvent
             const cur = input.value
+
+            // Cancel deferred backspace
+            if (pendingBackspaceTimer) { clearTimeout(pendingBackspaceTimer); pendingBackspaceTimer = null }
+
+            // Check inputType for deletions
+            if (inputEvent.inputType === 'deleteContentBackward' || inputEvent.inputType === 'deleteByCut' ||
+                inputEvent.inputType === 'deleteContent' || inputEvent.inputType === 'deleteContentForward') {
+              sendSpecialKey('Backspace', 'Backspace', 8)
+              lastValue = cur
+              return
+            }
+
+            // Detect new characters by comparing values
             if (cur.length > lastValue.length) {
               const newChars = cur.startsWith(lastValue) ? cur.slice(lastValue.length) : cur
-              if (newChars) this.sendCDPToPage('Input.insertText', { text: newChars })
+              for (const char of newChars) sendChar(char)
             } else if (cur.length < lastValue.length) {
               const deleted = lastValue.length - cur.length
-              for (let i = 0; i < deleted; i++) {
-                this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-                this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-              }
+              for (let i = 0; i < deleted; i++) sendSpecialKey('Backspace', 'Backspace', 8)
             }
             lastValue = cur
-            if (cur.length > 50) { input.value = cur.slice(-5); lastValue = input.value; }
+            if (cur.length > 50) { input.value = cur.slice(-5); lastValue = input.value }
           }
         })
 
@@ -658,14 +765,21 @@
           if (!this.hosting || this.locked) return
           if (e.key === 'Enter') {
             e.preventDefault()
-            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
-            input.value = ''
-            lastValue = ''
+            sendSpecialKey('Enter', 'Enter', 13)
+            input.value = ''; lastValue = ''
           } else if (e.key === 'Backspace' && input.value === '') {
             e.preventDefault()
-            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
-            this.sendCDPToPage('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 })
+            sendSpecialKey('Backspace', 'Backspace', 8)
+          } else if (e.key === 'Tab') {
+            e.preventDefault()
+            sendSpecialKey('Tab', 'Tab', 9)
+          } else if (e.key === 'Unidentified' && input.value === '') {
+            // IME keyboards: schedule deferred backspace, cancelled if input event fires
+            if (pendingBackspaceTimer) clearTimeout(pendingBackspaceTimer)
+            pendingBackspaceTimer = setTimeout(() => {
+              pendingBackspaceTimer = null
+              sendSpecialKey('Backspace', 'Backspace', 8)
+            }, 50)
           }
         })
       }
@@ -744,98 +858,141 @@
       return `http://${window.location.hostname}:9222/cdp/active-element`;
     }
 
-    // Connect to CDP via the devtools proxy on port 9222 for mobile keyboard input.
-    // Same two-step approach as FocusTracker in cdpeval.go:
-    //   1. Target.getTargets → find the page target ID
-    //   2. Target.attachToTarget → get a sessionId
-    // Then use Input.insertText / Input.dispatchKeyEvent with that sessionId.
+    // CDP input via HTTP POST to /cdp/input — no WebSocket needed.
+    // The server's FocusTracker shares its CDP connection and session ID.
+    // This avoids Chrome's concurrent DevTools connection limit.
     async connectCDP() {
-      console.log(`[CDP] active-element endpoint: ${this.getActiveElementUrl()}`);
-
-      if (!this.is_touch_device) return; // desktop uses Guacamole, no CDP needed
-
-      const wsUrl = `ws://${window.location.hostname}:9222`;
-      console.log(`[CDP] connecting WebSocket: ${wsUrl}`);
-
-      try {
-        const socket = new WebSocket(wsUrl);
-
-        socket.onopen = () => {
-          console.log('[CDP] WebSocket connected');
-          this.cdpSocket = socket;
-
-          // Step 1: find the page target (same as FocusTracker.pollLoop)
-          const getTargetsId = this.cdpCommandId++;
-          let pendingAttachId = -1;
-          socket.send(JSON.stringify({ id: getTargetsId, method: 'Target.getTargets', params: {} }));
-
-          const handleMessage = (event: MessageEvent) => {
-            try {
-              const msg = JSON.parse(event.data);
-
-              // Step 1 response: find page target ID
-              if (msg.id === getTargetsId && msg.result) {
-                const targets = msg.result.targetInfos || [];
-                const page = targets.find((t: any) => t.type === 'page' && !t.url.startsWith('devtools://'));
-                if (page) {
-                  console.log(`[CDP] found page target: ${page.targetId}`);
-                  // Step 2: attach to the page target
-                  pendingAttachId = this.cdpCommandId++;
-                  socket.send(JSON.stringify({
-                    id: pendingAttachId,
-                    method: 'Target.attachToTarget',
-                    params: { targetId: page.targetId, flatten: true }
-                  }));
-                } else {
-                  console.error('[CDP] no page target found, retrying in 2s');
-                  setTimeout(() => {
-                    if (this.cdpSocket) {
-                      const retryId = this.cdpCommandId++;
-                      socket.send(JSON.stringify({ id: retryId, method: 'Target.getTargets', params: {} }));
-                    }
-                  }, 2000);
-                }
-              }
-
-              // Step 2 response: get sessionId
-              if (pendingAttachId > 0 && msg.id === pendingAttachId && msg.result) {
-                pendingAttachId = -1;
-                const sessionId = msg.result.sessionId;
-                if (sessionId) {
-                  console.log(`[CDP] attached to page, sessionId: ${sessionId}`);
-                  this.cdpSessionId = sessionId;
-                  this.sendCDPToPage('Input.enable', {});
-                  console.log('[CDP] Input.enable sent — ready for keyboard input');
-                }
-              }
-            } catch { /* ignore parse errors */ }
-          };
-
-          socket.addEventListener('message', handleMessage);
-        };
-
-        socket.onerror = (e: any) => console.error('[CDP] error:', e);
-        socket.onclose = () => {
-          console.log('[CDP] closed, reconnecting in 2s');
-          this.cdpSocket = null;
-          this.cdpSessionId = null;
-          setTimeout(() => this.connectCDP(), 2000);
-        };
-      } catch (e) {
-        console.error('[CDP] connect failed:', e);
+      console.log(`[CDP] Using HTTP input endpoint: ${this.getCDPInputUrl()}`);
+      // Wait for the server's FocusTracker to establish its CDP connection,
+      // then apply viewport emulation. Retry until it succeeds.
+      if (this.is_touch_device) {
+        this.retryViewportEmulation();
       }
     }
 
-    sendCDP(method: string, params: any = {}) {
-      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) return;
-      this.cdpSocket.send(JSON.stringify({ id: this.cdpCommandId++, method, params }));
+    private viewportRetryTimer: any = null;
+    retryViewportEmulation() {
+      const attempt = async () => {
+        try {
+          const res = await fetch(this.getCDPInputUrl(), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ method: 'Input.enable', params: {} }),
+          });
+          if (res.ok) {
+            console.log('[CDP] Server ready, applying viewport emulation');
+            this.applyViewportEmulation();
+            return;
+          }
+          console.log(`[CDP] Server not ready (${res.status}), retrying in 1s`);
+        } catch (e) {
+          console.log('[CDP] Server not reachable, retrying in 1s');
+        }
+        this.viewportRetryTimer = setTimeout(() => this.retryViewportEmulation(), 1000);
+      };
+      attempt();
     }
 
+    getCDPInputUrl(): string {
+      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/);
+      if (match) {
+        return `${window.location.origin}/api/${match[2]}/${match[3]}/cdp/input`;
+      }
+      return `http://${window.location.hostname}:9222/cdp/input`;
+    }
+
+    // Send CDP command via HTTP POST
     sendCDPToPage(method: string, params: any = {}) {
-      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) return;
-      const msg: any = { id: this.cdpCommandId++, method, params };
-      if (this.cdpSessionId) msg.sessionId = this.cdpSessionId;
-      this.cdpSocket.send(JSON.stringify(msg));
+      const url = this.getCDPInputUrl();
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method, params }),
+      }).then(res => {
+        if (!res.ok) {
+          res.text().then(t => console.error(`[CDP] ${method} failed: ${res.status} ${t}`));
+        }
+      }).catch(err => console.warn(`[CDP] ${method} fetch error:`, err));
+    }
+
+    // ─── Viewport emulation (same as keyboard.ts) ───
+
+    applyViewportEmulation() {
+
+      if (this.isMagnified) {
+        // Magnified = native resolution, user can scroll
+        this.sendCDPToPage('Emulation.clearDeviceMetricsOverride');
+        this.sendCDPToPage('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 });
+        this.sendCDPToPage('Emulation.setUserAgentOverride', { userAgent: navigator.userAgent });
+        this.sendCDPToPage('Emulation.setVisibleSize', {
+          width: window.screen.width,
+          height: window.screen.height
+        });
+        this.emulatedWidth = 0;
+        this.emulatedHeight = 0;
+        console.log('[CDP] Magnified mode — native resolution');
+      } else {
+        // Fit-to-screen: emulate device at screen dimensions.
+        // IMPORTANT: deviceScaleFactor must be 1 so that emulated CSS pixels
+        // map 1:1 to the video stream pixels. With DPR=2, Chrome renders at
+        // 2x the dimensions which overflows the 1920x1080 stream and gets clipped.
+        const screenW = window.innerWidth;
+        const screenH = Math.min(window.innerHeight, this.PHYSICAL_HEIGHT); // cap to stream height
+        const isMobileDevice = this.is_touch_device;
+
+        this.sendCDPToPage('Emulation.setDeviceMetricsOverride', {
+          width: screenW,
+          height: screenH,
+          deviceScaleFactor: 1,
+          mobile: isMobileDevice,
+          screenWidth: screenW,
+          screenHeight: screenH
+        });
+        this.sendCDPToPage('Emulation.setVisibleSize', { width: screenW, height: screenH });
+        this.sendCDPToPage('Emulation.setTouchEmulationEnabled', {
+          enabled: isMobileDevice,
+          maxTouchPoints: isMobileDevice ? 5 : 0
+        });
+        // Pass the real device user agent to remote Chrome — avoids bot detection
+        // since it's the genuine UA from the user's actual phone/browser
+        if (isMobileDevice) {
+          this.sendCDPToPage('Emulation.setUserAgentOverride', { userAgent: navigator.userAgent });
+        }
+        this.emulatedWidth = screenW;
+        this.emulatedHeight = screenH;
+        console.log(`[CDP] Fit-to-screen — emulate ${screenW}x${screenH} DPR=1 UA=${isMobileDevice ? 'mobile' : 'desktop'}`);
+      }
+    }
+
+    toggleMagnify() {
+      this.isMagnified = !this.isMagnified;
+      this.applyViewportEmulation();
+    }
+
+    // ─── Coordinate translation (screen → emulated, same as keyboard.ts) ───
+
+    getEmulatedCoords(clientX: number, clientY: number): { x: number; y: number } {
+      const rect = this._overlay.getBoundingClientRect();
+      const targetW = this.emulatedWidth || window.innerWidth;
+      const targetH = this.emulatedHeight || window.innerHeight;
+
+      const relX = clientX - rect.left;
+      const relY = clientY - rect.top;
+
+      const x = Math.round((relX / rect.width) * targetW);
+      const y = Math.round((relY / rect.height) * targetH);
+
+      return {
+        x: Math.max(0, Math.min(targetW - 1, x)),
+        y: Math.max(0, Math.min(targetH - 1, y))
+      };
+    }
+
+    // ─── CDP touch scroll (same as keyboard.ts handleTouchStart/Move/EndKernel) ───
+
+    sendCDPClick(x: number, y: number) {
+      this.sendCDPToPage('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+      this.sendCDPToPage('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
     }
 
     /**
@@ -968,7 +1125,11 @@
     }
 
     sendMousePos(e: MouseEvent) {
-      const { w, h } = this.$accessor.video.resolution
+      // When CDP viewport emulation is active, map to emulated dimensions
+      // (not 1920x1080). The page content occupies the top-left emulatedW x emulatedH
+      // of the display at 1:1 pixels. Screen coords map directly.
+      const w = this.mobileViewportActive ? (this.emulatedWidth || window.innerWidth) : this.$accessor.video.resolution.w
+      const h = this.mobileViewportActive ? (this.emulatedHeight || window.innerHeight) : this.$accessor.video.resolution.h
       const rect = this._overlay.getBoundingClientRect()
 
       this.$client.sendData('mousemove', {
@@ -986,11 +1147,6 @@
       let x = e.deltaX
       let y = e.deltaY
 
-      // Pixel units unless it's non-zero.
-      // Note that if deltamode is line or page won't matter since we aren't
-      // sending the mouse wheel delta to the server anyway.
-      // The difference between pixel and line can be important however since
-      // we have a threshold that can be smaller than the line height.
       if (e.deltaMode !== 0) {
         x *= WHEEL_LINE_HEIGHT
         y *= WHEEL_LINE_HEIGHT
@@ -1004,85 +1160,131 @@
       x = Math.min(Math.max(x, -this.scroll), this.scroll)
       y = Math.min(Math.max(y, -this.scroll), this.scroll)
 
-      this.sendMousePos(e)
-
-      if (!this.wheelThrottle) {
-        this.wheelThrottle = true
-        this.$client.sendData('wheel', { x, y })
-
-        window.setTimeout(() => {
-          this.wheelThrottle = false
-        }, 100)
+      if (this.mobileViewportActive) {
+        // Mobile: send via CDP with emulated coordinates
+        const { x: emuX, y: emuY } = this.getEmulatedCoords(e.clientX, e.clientY)
+        this.sendCDPToPage('Input.dispatchMouseEvent', {
+          type: 'mouseWheel', x: emuX, y: emuY, deltaX: x, deltaY: y
+        })
+      } else {
+        // Desktop: send via neko
+        this.sendMousePos(e)
+        if (!this.wheelThrottle) {
+          this.wheelThrottle = true
+          this.$client.sendData('wheel', { x, y })
+          window.setTimeout(() => { this.wheelThrottle = false }, 100)
+        }
       }
     }
 
+    // ─── Touch handler ───
+    // On mobile with viewport emulation: ALL input goes through CDP (same as keyboard.ts).
+    // Neko's sendMousePos maps to 1920x1080 which is wrong when CDP emulates at mobile size.
+    // On desktop (or no emulation): fall back to neko simulated mouse events.
     onTouchHandler(e: TouchEvent) {
-      let first = e.changedTouches[0]
-      let type = ''
-      switch (e.type) {
-        case 'touchstart':
-          type = 'mousedown'
-          break
-        case 'touchmove':
-          type = 'mousemove'
-          break
-        case 'touchend':
-          type = 'mouseup'
-          break
-        default:
-          return
+      const first = e.changedTouches[0]
+
+      // If not in mobile viewport mode, use original neko approach
+      if (!this.mobileViewportActive) {
+        let type = ''
+        switch (e.type) {
+          case 'touchstart': type = 'mousedown'; break
+          case 'touchmove': type = 'mousemove'; break
+          case 'touchend': type = 'mouseup'; break
+          default: return
+        }
+        const sim = new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          screenX: first.screenX, screenY: first.screenY,
+          clientX: first.clientX, clientY: first.clientY,
+        })
+        first.target.dispatchEvent(sim)
+        return
       }
 
-      const simulatedEvent = new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        screenX: first.screenX,
-        screenY: first.screenY,
-        clientX: first.clientX,
-        clientY: first.clientY,
-      })
-      first.target.dispatchEvent(simulatedEvent)
+      // ─── Mobile viewport: CDP only (same as keyboard.ts) ───
 
-      // Auto-detect input fields on touchend via sync XHR + async re-check.
-      // The sync XHR may return stale data (FocusTracker polls every 100ms,
-      // and the click may not have been processed yet). So:
-      //   1. Sync check: if isInput → focus (open keyboard)
-      //   2. Async re-check after 300ms: if NOT isInput → blur (close keyboard)
-      // This handles both directions: opening on input taps AND closing on non-input taps.
-      if (type === 'mouseup' && this.is_touch_device) {
-        const elementResult = this.checkElementHasFocusSync();
-        console.log(`[TOUCHEND] sync check:`, elementResult);
+      if (e.type === 'touchstart') {
+        if (!first) return
+        const rect = this._overlay.getBoundingClientRect()
+        const { x, y } = this.getEmulatedCoords(first.clientX, first.clientY)
+        console.log(`[TOUCH] touchstart — client:(${first.clientX},${first.clientY}) emulated:(${x},${y}) overlay:(${Math.round(rect.width)}x${Math.round(rect.height)}) emulatedSize:(${this.emulatedWidth}x${this.emulatedHeight}) innerSize:(${window.innerWidth}x${window.innerHeight})`)
+        this.touchStart = { x, y, clientX: first.clientX, clientY: first.clientY, time: Date.now() }
+        this.isScrolling = false
+        this.touchEventsSent = false
 
-        if (elementResult.isInput && this._mobileInput) {
-          console.log('[TOUCHEND] Input detected — opening keyboard');
-          this._mobileInput.value = '';
-          this._mobileInput.focus();
-        } else if (!elementResult.isInput) {
-          console.log('[TOUCHEND] Not an input — dismissing keyboard');
-          if (this._mobileInput) this._mobileInput.blur();
-          if (document.activeElement instanceof HTMLElement) {
-            document.activeElement.blur();
+        // Send click early via CDP so active element updates before touchend
+        this.sendCDPClick(x, y)
+        return
+      }
+
+      if (e.type === 'touchmove') {
+        if (!this.touchStart || !first) return
+        const { x, y } = this.getEmulatedCoords(first.clientX, first.clientY)
+        const totalDX = Math.abs(this.touchStart.clientX - first.clientX)
+        const totalDY = Math.abs(this.touchStart.clientY - first.clientY)
+
+        if (!this.isScrolling && (totalDX > 15 || totalDY > 15)) {
+          this.isScrolling = true
+          if (!this.touchEventsSent) {
+            this.sendCDPToPage('Input.dispatchTouchEvent', {
+              type: 'touchStart',
+              touchPoints: [{ x: this.touchStart.x, y: this.touchStart.y, id: 1 }]
+            })
+            this.touchEventsSent = true
           }
         }
 
-        // Async re-check: catches stale cache (e.g. tapped outside input
-        // but sync XHR still returned isInput:true from old cache)
-        setTimeout(() => {
-          try {
-            const url = this.getActiveElementUrl();
-            fetch(url)
-              .then(res => res.json())
-              .then(data => {
-                console.log('[TOUCHEND] async re-check:', data);
-                if (!data.isInput && this._mobileInput && document.activeElement === this._mobileInput) {
-                  console.log('[TOUCHEND] Stale cache corrected — closing keyboard');
-                  this._mobileInput.blur();
-                }
-              })
-              .catch(() => {});
-          } catch {}
-        }, 300);
+        if (this.isScrolling && this.touchEventsSent) {
+          this.sendCDPToPage('Input.dispatchTouchEvent', {
+            type: 'touchMove',
+            touchPoints: [{ x, y, id: 1 }]
+          })
+        }
+        return
+      }
+
+      if (e.type === 'touchend') {
+        if (this.touchEventsSent) {
+          this.sendCDPToPage('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+        }
+
+        if (!this.touchStart) return
+        const duration = Date.now() - this.touchStart.time
+        const wasTap = !this.isScrolling && duration < 300
+
+        if (wasTap) {
+          // Auto-detect input fields via sync XHR
+          const elementResult = this.checkElementHasFocusSync();
+
+          if (elementResult.isInput && this._mobileInput) {
+            this._mobileInput.value = '';
+            this._mobileInput.focus();
+          } else if (!elementResult.isInput) {
+            if (this._mobileInput) this._mobileInput.blur();
+            if (document.activeElement instanceof HTMLElement) {
+              document.activeElement.blur();
+            }
+          }
+
+          // Async re-check for stale cache
+          setTimeout(() => {
+            try {
+              fetch(this.getActiveElementUrl())
+                .then(res => res.json())
+                .then(data => {
+                  if (!data.isInput && this._mobileInput && document.activeElement === this._mobileInput) {
+                    this._mobileInput.blur();
+                  }
+                })
+                .catch(() => {});
+            } catch {}
+          }, 300);
+        }
+
+        this.touchStart = null
+        this.isScrolling = false
+        this.touchEventsSent = false
       }
     }
 

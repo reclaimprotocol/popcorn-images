@@ -73,6 +73,13 @@ type FocusTracker struct {
 
 	// pollInterval controls how often we re-evaluate the active element.
 	pollInterval time.Duration
+
+	// Shared CDP connection for input commands (used by CDPInputHandler)
+	mu        sync.RWMutex
+	conn      *websocket.Conn
+	sessionID string
+	connMu    sync.Mutex // serializes writes to conn
+	commandID int32      // atomic counter for command IDs
 }
 
 // NewFocusTracker creates and starts a FocusTracker. Call Stop() to shut it down.
@@ -99,6 +106,10 @@ func (ft *FocusTracker) CurrentState() *ActiveElementResult {
 // Stop terminates the background goroutine and CDP connection.
 func (ft *FocusTracker) Stop() {
 	ft.cancel()
+}
+
+func (ft *FocusTracker) nextCommandID() int {
+	return int(atomic.AddInt32(&ft.commandID, 1))
 }
 
 func (ft *FocusTracker) run(ctx context.Context) {
@@ -128,23 +139,34 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
 
-	conn, _, err := websocket.Dial(connCtx, upstream, &websocket.DialOptions{
+	cdpConn, _, err := websocket.Dial(connCtx, upstream, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
 		ft.logger.Warn("[FocusTracker] dial failed", "err", err)
 		return
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
-	conn.SetReadLimit(10 * 1024 * 1024)
+	defer func() {
+		cdpConn.Close(websocket.StatusNormalClosure, "")
+		ft.mu.Lock()
+		ft.conn = nil
+		ft.sessionID = ""
+		ft.mu.Unlock()
+	}()
+	cdpConn.SetReadLimit(10 * 1024 * 1024)
+
+	// Share the connection for CDPInputHandler
+	ft.mu.Lock()
+	ft.conn = cdpConn
+	ft.mu.Unlock()
 
 	var msgID int
-	var mu sync.Mutex
+	conn := cdpConn
 
 	send := func(msg cdpMsg) error {
 		b, _ := json.Marshal(msg)
-		mu.Lock()
-		defer mu.Unlock()
+		ft.connMu.Lock()
+		defer ft.connMu.Unlock()
 		return conn.Write(connCtx, websocket.MessageText, b)
 	}
 
@@ -233,6 +255,11 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 		ft.logger.Warn("[FocusTracker] no sessionId returned")
 		return
 	}
+
+	// Share session ID for CDPInputHandler
+	ft.mu.Lock()
+	ft.sessionID = sessionID
+	ft.mu.Unlock()
 
 	ft.logger.Info("[FocusTracker] connected, starting poll loop", "targetId", targetID, "sessionId", sessionID)
 
@@ -324,5 +351,67 @@ func ActiveElementHandler(ft *FocusTracker) http.Handler {
 		result := ft.CurrentState()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
+	})
+}
+
+// CDPInputRequest represents a CDP command sent from the client via HTTP.
+type CDPInputRequest struct {
+	Method    string          `json:"method"`
+	Params    json.RawMessage `json:"params"`
+	SessionID string          `json:"sessionId,omitempty"`
+}
+
+// CDPInputHandler returns an http.Handler that accepts CDP commands via POST
+// and sends them through the FocusTracker's CDP connection. This avoids the
+// client needing its own WebSocket (Chrome limits concurrent DevTools connections).
+func CDPInputHandler(ft *FocusTracker) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req CDPInputRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		ft.mu.Lock()
+		conn := ft.conn
+		sessionID := ft.sessionID
+		ft.mu.Unlock()
+
+		if conn == nil {
+			http.Error(w, "CDP not connected", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Use the FocusTracker's session ID if client didn't provide one
+		sid := req.SessionID
+		if sid == "" {
+			sid = sessionID
+		}
+
+		msg := cdpMsg{
+			ID:        ft.nextCommandID(),
+			Method:    req.Method,
+			Params:    req.Params,
+			SessionID: sid,
+		}
+
+		b, _ := json.Marshal(msg)
+		ft.connMu.Lock()
+		err := conn.Write(r.Context(), websocket.MessageText, b)
+		ft.connMu.Unlock()
+
+		if err != nil {
+			http.Error(w, "write failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 }

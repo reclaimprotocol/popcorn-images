@@ -218,7 +218,7 @@ func main() {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "*")
 				if req.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusOK)
@@ -228,6 +228,7 @@ func main() {
 			})
 		})
 		r.Get("/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
+		r.Post("/input", devtoolsproxy.CDPInputHandler(focusTracker).ServeHTTP)
 	})
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
