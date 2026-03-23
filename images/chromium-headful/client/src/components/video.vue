@@ -92,7 +92,7 @@
           <i class="fas fa-keyboard" />
         </li>
         <li
-          v-if="hosting"
+          v-if="hosting && is_touch_device"
           :class="extraControls || 'extra-control'"
           @click.stop.prevent="toggleMagnify"
         >
@@ -342,9 +342,9 @@
     // Viewport & magnify state (same as keyboard.ts)
     private readonly PHYSICAL_WIDTH = 1920
     private readonly PHYSICAL_HEIGHT = 1080
-    // true = native 1920x1080 (neko input), false = fit-to-screen emulated (CDP input)
-    // Default to fit-to-screen on all devices
-    isMagnified = false
+    // Desktop: magnified (native 1920x1080, neko handles everything)
+    // Mobile: fit-to-screen (CDP emulation + stealth patches for bot detection)
+    isMagnified = !(('ontouchstart' in window || navigator.maxTouchPoints > 0) && window.matchMedia('(pointer: coarse)').matches)
     private emulatedWidth = 0
     private emulatedHeight = 0
 
@@ -477,11 +477,10 @@
       )
     }
 
-    // Whether viewport emulation mode is active (used for CSS class toggle and input routing).
-    // When active: CSS crops the 1920x1080 stream, all input goes through CDP.
-    // When magnified: native 1920x1080, input goes through neko.
+    // Mobile viewport emulation: active only on touch devices when not magnified.
+    // Desktop never enters this mode — neko handles everything at native 1920x1080.
     get mobileViewportActive(): boolean {
-      return !this.isMagnified
+      return this.is_touch_device && !this.isMagnified
     }
 
     @Watch('width')
@@ -586,9 +585,9 @@
 
       this.observer.observe(this._component)
 
-      // Re-apply viewport emulation on resize
+      // Re-apply viewport emulation on resize (mobile only)
       window.addEventListener('resize', () => {
-        if (!this.isMagnified) {
+        if (this.is_touch_device && !this.isMagnified) {
           this.applyViewportEmulation()
           this.onResize()
         }
@@ -641,19 +640,17 @@
         this.$nextTick(() => { this.isVideoSyncing = false; })
       });
 
-      /* Initialize Guacamole Keyboard — only active in magnified (neko) mode.
-       * In emulated mode, native keydown/keyup handlers below take over. */
+      /* Guacamole Keyboard — desktop uses this always (neko → X11).
+       * Mobile in emulated mode uses CDP keyboard handlers below instead. */
       this.keyboard.onkeydown = (key: number) => {
-        if (!this.hosting || this.locked || this.mobileViewportActive) {
-          return true
-        }
+        if (!this.hosting || this.locked) return true
+        if (this.mobileViewportActive) return true  // mobile CDP takes over
         this.$client.sendData('keydown', { key: this.keyMap(key) })
         return false
       }
       this.keyboard.onkeyup = (key: number) => {
-        if (!this.hosting || this.locked || this.mobileViewportActive) {
-          return
-        }
+        if (!this.hosting || this.locked) return
+        if (this.mobileViewportActive) return  // mobile CDP takes over
         this.$client.sendData('keyup', { key: this.keyMap(key) })
       }
       this.keyboard.listenTo(this._overlay)
@@ -962,9 +959,9 @@
     // This avoids Chrome's concurrent DevTools connection limit.
     async connectCDP() {
       console.log(`[CDP] Using HTTP input endpoint: ${this.getCDPInputUrl()}`);
-      // Wait for the server's FocusTracker to establish its CDP connection,
-      // then apply viewport emulation. Retry until it succeeds.
-      this.retryViewportEmulation();
+      if (this.is_touch_device) {
+        this.retryViewportEmulation();
+      }
     }
 
     private viewportRetryTimer: any = null;
@@ -977,7 +974,8 @@
             body: JSON.stringify({ method: 'Input.enable', params: {} }),
           });
           if (res.ok) {
-            console.log('[CDP] Server ready, applying viewport emulation');
+            console.log('[CDP] Server ready, injecting stealth patches + viewport emulation');
+            this.injectStealthPatches();
             this.applyViewportEmulation();
             return;
           }
@@ -1012,7 +1010,38 @@
       }).catch(err => console.warn(`[CDP] ${method} fetch error:`, err));
     }
 
-    // ─── Viewport emulation (same as keyboard.ts) ───
+    // ─── Stealth patches (counter Cloudflare/bot detection with CDP emulation) ───
+
+    private stealthInjected = false
+
+    injectStealthPatches() {
+      if (this.stealthInjected) return;
+      this.stealthInjected = true;
+
+      // Inject via Page.addScriptToEvaluateOnNewDocument so it runs
+      // before any page JS, surviving navigations.
+      const stealthScript = [
+        // 1. navigator.webdriver = false
+        `Object.defineProperty(navigator, 'webdriver', { get: () => false });`,
+        // 2. Remove CDP-injected sourceUrl comments from stack traces
+        `Error.prepareStackTrace = (err, stack) => err.toString();`,
+        // 3. Patch chrome.runtime to look like a real extension-less Chrome
+        `window.chrome = window.chrome || {};`,
+        `window.chrome.runtime = window.chrome.runtime || {};`,
+        // 4. Fix permissions query for notifications (headless detection)
+        `const origQuery = window.Notification?.permission ? null : window.navigator.permissions?.query;`,
+        `if (origQuery) { window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : origQuery.call(navigator.permissions, p); }`,
+        // 5. Patch plugins/mimeTypes to look non-empty
+        `Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });`,
+        `Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });`,
+      ].join('\n');
+
+      this.sendCDPToPage('Page.addScriptToEvaluateOnNewDocument', { source: stealthScript });
+      // Also evaluate immediately on the current page
+      this.sendCDPToPage('Runtime.evaluate', { expression: stealthScript });
+    }
+
+    // ─── Viewport emulation ───
 
     applyViewportEmulation() {
 
@@ -1020,7 +1049,6 @@
         // Magnified = native resolution, user can scroll
         this.sendCDPToPage('Emulation.clearDeviceMetricsOverride');
         this.sendCDPToPage('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 });
-        this.sendCDPToPage('Emulation.setUserAgentOverride', { userAgent: navigator.userAgent });
         this.sendCDPToPage('Emulation.setVisibleSize', {
           width: window.screen.width,
           height: window.screen.height
@@ -1050,11 +1078,9 @@
           enabled: isMobileDevice,
           maxTouchPoints: isMobileDevice ? 5 : 0
         });
-        // Pass the real device user agent to remote Chrome — avoids bot detection
-        // since it's the genuine UA from the user's actual phone/browser
-        if (isMobileDevice) {
-          this.sendCDPToPage('Emulation.setUserAgentOverride', { userAgent: navigator.userAgent });
-        }
+        // Don't override user agent — Cloudflare and other bot detectors check
+        // UA vs TLS fingerprint. A mobile UA from a Linux Chromium = instant block.
+        // The viewport emulation + mobile:true is enough for responsive layouts.
         this.emulatedWidth = screenW;
         this.emulatedHeight = screenH;
         console.log(`[CDP] Fit-to-screen — emulate ${screenW}x${screenH} DPR=1 UA=${isMobileDevice ? 'mobile' : 'desktop'}`);
@@ -1288,11 +1314,8 @@
     }
 
     sendMousePos(e: MouseEvent) {
-      // When CDP viewport emulation is active, map to emulated dimensions
-      // (not 1920x1080). The page content occupies the top-left emulatedW x emulatedH
-      // of the display at 1:1 pixels. Screen coords map directly.
-      const w = this.mobileViewportActive ? (this.emulatedWidth || window.innerWidth) : this.$accessor.video.resolution.w
-      const h = this.mobileViewportActive ? (this.emulatedHeight || window.innerHeight) : this.$accessor.video.resolution.h
+      const w = this.$accessor.video.resolution.w
+      const h = this.$accessor.video.resolution.h
       const rect = this._overlay.getBoundingClientRect()
 
       this.$client.sendData('mousemove', {
@@ -1460,17 +1483,8 @@
         return
       }
 
-      if (this.mobileViewportActive) {
-        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
-        this.sendCDPToPage('Input.dispatchMouseEvent', {
-          type: 'mousePressed', x, y, button: 'left', clickCount: 1
-        })
-        // Focus overlay so Guacamole keyboard captures keystrokes
-        this._overlay.focus()
-      } else {
-        this.sendMousePos(e)
-        this.$client.sendData('mousedown', { key: e.button + 1 })
-      }
+      this.sendMousePos(e)
+      this.$client.sendData('mousedown', { key: e.button + 1 })
     }
 
     onMouseUp(e: MouseEvent) {
@@ -1478,15 +1492,8 @@
         return
       }
 
-      if (this.mobileViewportActive) {
-        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
-        this.sendCDPToPage('Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x, y, button: 'left', clickCount: 1
-        })
-      } else {
-        this.sendMousePos(e)
-        this.$client.sendData('mouseup', { key: e.button + 1 })
-      }
+      this.sendMousePos(e)
+      this.$client.sendData('mouseup', { key: e.button + 1 })
     }
 
     onMouseMove(e: MouseEvent) {
@@ -1494,14 +1501,7 @@
         return
       }
 
-      if (this.mobileViewportActive) {
-        const { x, y } = this.getEmulatedCoords(e.clientX, e.clientY)
-        this.sendCDPToPage('Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x, y
-        })
-      } else {
-        this.sendMousePos(e)
-      }
+      this.sendMousePos(e)
     }
 
     onMouseEnter(e: MouseEvent) {
