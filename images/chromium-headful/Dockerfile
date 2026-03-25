@@ -1,11 +1,11 @@
-FROM docker.io/golang:1.25.0 AS server-builder
+FROM docker.io/golang:1.25.3 AS server-builder
 WORKDIR /workspace/server
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-golang1250
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 
 COPY server/go.mod ./
 COPY server/go.sum ./
