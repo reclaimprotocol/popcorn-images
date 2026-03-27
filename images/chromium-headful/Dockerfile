@@ -204,13 +204,42 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     wget \
     xdg-utils \
     libvulkan1 \
-    fonts-liberation \
-    fonts-noto-cjk \
-    fonts-noto-color-emoji \
-    fonts-nanum \
     fontconfig \
     unzip && \
-    fc-cache -f
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
+# A minimal container has only 3 fonts, which is a strong fingerprinting signal
+# used by reCAPTCHA Enterprise and other bot detection vendors.
+RUN apt-get update && \
+    apt-get --no-install-recommends -y install \
+    fonts-liberation \
+    fonts-liberation2 \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    fonts-noto-core \
+    fonts-nanum \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
+    fonts-freefont-ttf \
+    fonts-ubuntu \
+    fonts-opensymbol \
+    fonts-roboto \
+    fonts-croscore \
+    fonts-smc-chilanka \
+    fonts-hosny-amiri \
+    fonts-indic \
+    fonts-kacst \
+    fonts-khmeros-core \
+    fonts-lao \
+    fonts-lklug-sinhala \
+    fonts-sil-abyssinica \
+    fonts-sil-padauk \
+    fonts-thai-tlwg \
+    fonts-tibetan-machine \
+    fonts-droid-fallback && \
+    fc-cache -f && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # install ffmpeg manually since the version available in apt is from the 4.x branch due to #drama.
 COPY --from=ffmpeg-downloader /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
@@ -262,9 +291,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     apt --no-install-recommends -y install sqlite3;
 
 # Install ChromeDriver matching the installed Chromium version
+# Chromedriver and Chromium are not necessarily the same version, but we try to match them.
+# Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
+ARG CHROMEDRIVER_VERSION=
 RUN set -eux; \
-    CHROMIUM_VERSION=$(chromium --version | awk '{print $2}'); \
-    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
+    if [ -z "$CHROMEDRIVER_VERSION" ]; then \
+        CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
+    fi; \
+    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
     unzip /tmp/cd.zip -d /tmp; \
     mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
     chmod +x /usr/local/bin/chromedriver; \

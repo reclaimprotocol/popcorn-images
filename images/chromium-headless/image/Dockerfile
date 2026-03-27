@@ -157,9 +157,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     apt-get --no-install-recommends -y install sqlite3 unzip;
 
 # Install ChromeDriver matching the installed Chromium version
+# Chromedriver and Chromium are not necessarily the same version, but we try to match them.
+# Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
+ARG CHROMEDRIVER_VERSION=
 RUN set -eux; \
-    CHROMIUM_VERSION=$(chromium --version | awk '{print $2}'); \
-    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
+    if [ -z "$CHROMEDRIVER_VERSION" ]; then \
+        CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
+    fi; \
+    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
     unzip /tmp/cd.zip -d /tmp; \
     mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
     chmod +x /usr/local/bin/chromedriver; \
