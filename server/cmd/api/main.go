@@ -202,12 +202,60 @@ func main() {
 	// Cached active-element endpoint: reads atomic pointer (~0 latency).
 	rDevtools.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		// TODO: Enable filtering once whitelist is finalized
+		// devtoolsproxy.WebSocketProxyHandlerFiltered(upstreamMgr, slogger, stz).ServeHTTP(w, r)
 		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
 	})
 
 	srvDevtools := &http.Server{
 		Addr:    "0.0.0.0:9222",
 		Handler: rDevtools,
+	}
+
+	// Internal CDP server with full access (no filtering)
+	rDevtoolsInternal := chi.NewRouter()
+	rDevtoolsInternal.Use(
+		chiMiddleware.Logger,
+		chiMiddleware.Recoverer,
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctxWithLogger := logger.AddToContext(r.Context(), slogger)
+				next.ServeHTTP(w, r.WithContext(ctxWithLogger))
+			})
+		},
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+		scaletozero.Middleware(stz),
+	)
+	rDevtoolsInternal.Get("/json/version", func(w http.ResponseWriter, r *http.Request) {
+		current := upstreamMgr.Current()
+		if current == "" {
+			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
+			return
+		}
+		proxyWSURL := (&url.URL{Scheme: "ws", Host: r.Host}).String()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"webSocketDebuggerUrl": proxyWSURL,
+		})
+	})
+	rDevtoolsInternal.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
+	})
+
+	srvDevtoolsInternal := &http.Server{
+		Addr:    "0.0.0.0:9224",
+		Handler: rDevtoolsInternal,
 	}
 
 	go func() {
@@ -219,9 +267,17 @@ func main() {
 	}()
 
 	go func() {
-		slogger.Info("devtools websocket proxy starting", "addr", srvDevtools.Addr)
+		slogger.Info("devtools websocket proxy (restricted) starting", "addr", srvDevtools.Addr)
 		if err := srvDevtools.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slogger.Error("devtools websocket proxy failed", "err", err)
+			slogger.Error("devtools websocket proxy (restricted) failed", "err", err)
+			stop()
+		}
+	}()
+
+	go func() {
+		slogger.Info("devtools websocket proxy (internal/full) starting", "addr", srvDevtoolsInternal.Addr)
+		if err := srvDevtoolsInternal.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slogger.Error("devtools websocket proxy (internal/full) failed", "err", err)
 			stop()
 		}
 	}()
@@ -243,6 +299,9 @@ func main() {
 	g.Go(func() error {
 		upstreamMgr.Stop()
 		return srvDevtools.Shutdown(shutdownCtx)
+	})
+	g.Go(func() error {
+		return srvDevtoolsInternal.Shutdown(shutdownCtx)
 	})
 
 	if err := g.Wait(); err != nil {

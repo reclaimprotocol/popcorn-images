@@ -3,6 +3,7 @@ package devtoolsproxy
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -193,6 +194,9 @@ func (u *UpstreamManager) runTailOnce(ctx context.Context) {
 	}
 }
 
+// CommandFilter is a function that returns true if a CDP command should be allowed
+type CommandFilter func(method string) bool
+
 // WebSocketProxyHandler returns an http.Handler that upgrades incoming connections and
 // proxies them to the current upstream websocket URL. It expects only websocket requests.
 // If logCDPMessages is true, all CDP messages will be logged with their direction.
@@ -242,7 +246,55 @@ func WebSocketProxyHandler(mgr *UpstreamManager, logger *slog.Logger, logCDPMess
 				_ = clientConn.Close(websocket.StatusNormalClosure, "")
 			})
 		}
-		proxyWebSocket(r.Context(), clientConn, upstreamConn, cleanup, logger, logCDPMessages)
+		proxyWebSocket(r.Context(), clientConn, upstreamConn, cleanup, logger, logCDPMessages, nil)
+	})
+}
+
+// WebSocketProxyHandlerFiltered returns a filtered CDP proxy handler that only allows whitelisted commands
+func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ctrl scaletozero.Controller) http.Handler {
+	filter := createRestrictedFilter()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCurrent := mgr.Current()
+		if upstreamCurrent == "" {
+			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
+			return
+		}
+		parsed, err := url.Parse(upstreamCurrent)
+		if err != nil {
+			http.Error(w, "invalid upstream", http.StatusInternalServerError)
+			return
+		}
+		upstreamURL := (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawQuery: parsed.RawQuery}).String()
+		acceptOptions := &websocket.AcceptOptions{
+			OriginPatterns:  []string{"*"},
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+		clientConn, err := websocket.Accept(w, r, acceptOptions)
+		if err != nil {
+			logger.Error("websocket accept failed", slog.String("err", err.Error()))
+			return
+		}
+		clientConn.SetReadLimit(100 * 1024 * 1024)
+		dialOptions := &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+		upstreamConn, _, err := websocket.Dial(r.Context(), upstreamURL, dialOptions)
+		if err != nil {
+			logger.Error("dial upstream failed", slog.String("err", err.Error()), slog.String("url", upstreamURL))
+			_ = clientConn.Close(websocket.StatusInternalError, "failed to connect to upstream")
+			return
+		}
+		upstreamConn.SetReadLimit(100 * 1024 * 1024)
+		logger.Debug("proxying devtools websocket with filtering", slog.String("url", upstreamURL))
+
+		var once sync.Once
+		cleanup := func() {
+			once.Do(func() {
+				_ = upstreamConn.Close(websocket.StatusNormalClosure, "")
+				_ = clientConn.Close(websocket.StatusNormalClosure, "")
+			})
+		}
+		proxyWebSocket(r.Context(), clientConn, upstreamConn, cleanup, logger, false, filter)
 	})
 }
 
@@ -250,6 +302,41 @@ type wsConn interface {
 	Read(ctx context.Context) (websocket.MessageType, []byte, error)
 	Write(ctx context.Context, typ websocket.MessageType, p []byte) error
 	Close(statusCode websocket.StatusCode, reason string) error
+}
+
+// createRestrictedFilter returns a filter that only allows safe CDP commands
+func createRestrictedFilter() CommandFilter {
+	// Whitelist of allowed CDP command prefixes
+	allowedPrefixes := []string{
+		"Page.",
+		"Runtime.evaluate",
+		"Runtime.callFunctionOn",
+		"Runtime.getProperties",
+		"DOM.",
+		"Input.",
+		"Network.enable",
+		"Network.disable",
+		"Network.getResponseBody",
+		"Network.getCookies",
+		"Network.setCookie",
+		"Network.deleteCookies",
+		"Target.setDiscoverTargets",
+		"Target.getTargets",
+		"Target.attachToTarget",
+		"Target.setAutoAttach",
+		"Emulation.",
+		"Console.",
+		"Log.",
+	}
+
+	return func(method string) bool {
+		for _, prefix := range allowedPrefixes {
+			if strings.HasPrefix(method, prefix) {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // logCDPMessage logs a CDP message with its direction if logging is enabled
@@ -330,7 +417,7 @@ func logCDPMessage(logger *slog.Logger, direction string, mt websocket.MessageTy
 	logger.Info("cdp", args...)
 }
 
-func proxyWebSocket(ctx context.Context, clientConn, upstreamConn wsConn, onClose func(), logger *slog.Logger, logCDPMessages bool) {
+func proxyWebSocket(ctx context.Context, clientConn, upstreamConn wsConn, onClose func(), logger *slog.Logger, logCDPMessages bool, filter CommandFilter) {
 	errChan := make(chan error, 2)
 
 	go func() {
@@ -340,6 +427,29 @@ func proxyWebSocket(ctx context.Context, clientConn, upstreamConn wsConn, onClos
 				logger.Error("client read error", slog.String("err", err.Error()))
 				errChan <- err
 				break
+			}
+
+			// Filter CDP commands if filter is provided
+			if filter != nil && mt == websocket.MessageText {
+				var cdpMsg map[string]interface{}
+				if err := json.Unmarshal(msg, &cdpMsg); err == nil {
+					if method, ok := cdpMsg["method"].(string); ok && method != "" {
+						if !filter(method) {
+							logger.Warn("CDP command blocked by filter", slog.String("method", method))
+							// Send error response back to client
+							if id, hasID := cdpMsg["id"]; hasID {
+								errResp := map[string]interface{}{
+									"id":    id,
+									"error": map[string]interface{}{"code": -32000, "message": "Command not allowed"},
+								}
+								if respBytes, err := json.Marshal(errResp); err == nil {
+									_ = clientConn.Write(ctx, websocket.MessageText, respBytes)
+								}
+							}
+							continue
+						}
+					}
+				}
 			}
 
 			// Log CDP messages if enabled
