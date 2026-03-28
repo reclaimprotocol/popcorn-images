@@ -1,7 +1,7 @@
 <template>
   <div ref="component" class="video">
     <div ref="player" class="player">
-      <div ref="container" :class="['player-container', mobileViewportActive ? 'mobile-viewport' : '']">
+      <div ref="container" class="player-container">
         <video ref="video" playsinline />
         <div class="emotes">
           <template v-for="(emote, index) in emotes">
@@ -238,34 +238,8 @@
           touch-action: none;
         }
 
-        /* Mobile viewport: fill screen, crop video to show only the
-           top-left emulated area at 1:1 native pixels.
-           Uses 100dvh (dynamic viewport height) to avoid iOS Safari's
-           100vh bug where it includes the area behind the address bar. */
-        &.mobile-viewport {
-          max-width: 100vw !important;
-          width: 100vw !important;
-          height: 100vh !important; /* fallback for older browsers */
-          height: 100dvh !important; /* iOS Safari: matches visual viewport */
-
-          video {
-            object-fit: none;
-            object-position: 0 0;
-            width: 100vw !important;
-            height: 100vh !important;
-            height: 100dvh !important;
-          }
-
-          .overlay {
-            width: 100vw !important;
-            height: 100vh !important;
-            height: 100dvh !important;
-          }
-
-          .player-aspect {
-            display: none !important;
-          }
-        }
+        /* Mobile viewport: X11 display is resized to phone dimensions.
+           Video stream matches the screen — default neko CSS handles it. */
 
         .mobile-keyboard-input {
           position: absolute;
@@ -585,12 +559,9 @@
 
       this.observer.observe(this._component)
 
-      // Re-apply viewport emulation on resize (mobile only)
+      // Re-apply layout on resize
       window.addEventListener('resize', () => {
-        if (this.is_touch_device && !this.isMagnified) {
-          this.applyViewportEmulation()
-          this.onResize()
-        }
+        this.onResize()
       })
 
       this.connectCDP()
@@ -959,33 +930,9 @@
     // This avoids Chrome's concurrent DevTools connection limit.
     async connectCDP() {
       console.log(`[CDP] Using HTTP input endpoint: ${this.getCDPInputUrl()}`);
-      if (this.is_touch_device) {
-        this.retryViewportEmulation();
-      }
-    }
-
-    private viewportRetryTimer: any = null;
-    retryViewportEmulation() {
-      const attempt = async () => {
-        try {
-          const res = await fetch(this.getCDPInputUrl(), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ method: 'Input.enable', params: {} }),
-          });
-          if (res.ok) {
-            console.log('[CDP] Server ready, injecting stealth patches + viewport emulation');
-            this.injectStealthPatches();
-            this.applyViewportEmulation();
-            return;
-          }
-          console.log(`[CDP] Server not ready (${res.status}), retrying in 1s`);
-        } catch (e) {
-          console.log('[CDP] Server not reachable, retrying in 1s');
-        }
-        this.viewportRetryTimer = setTimeout(() => this.retryViewportEmulation(), 1000);
-      };
-      attempt();
+      // No viewport emulation — keep native 1920x1080 on all devices.
+      // Mobile users see desktop layout via neko stream. This avoids
+      // Cloudflare detection (small resolutions on Linux Chrome = suspicious).
     }
 
     getCDPInputUrl(): string {
@@ -996,8 +943,9 @@
       return `http://${window.location.hostname}:9222/cdp/input`;
     }
 
-    // Send CDP command via HTTP POST
+    // Send CDP command via HTTP POST (disabled for bot-detection testing)
     sendCDPToPage(method: string, params: any = {}) {
+      return; // DISABLED: CDP calls trigger Cloudflare detection
       const url = this.getCDPInputUrl();
       fetch(url, {
         method: 'POST',
@@ -1010,86 +958,9 @@
       }).catch(err => console.warn(`[CDP] ${method} fetch error:`, err));
     }
 
-    // ─── Stealth patches (counter Cloudflare/bot detection with CDP emulation) ───
-
-    private stealthInjected = false
-
-    injectStealthPatches() {
-      if (this.stealthInjected) return;
-      this.stealthInjected = true;
-
-      // Inject via Page.addScriptToEvaluateOnNewDocument so it runs
-      // before any page JS, surviving navigations.
-      const stealthScript = [
-        // 1. navigator.webdriver = false
-        `Object.defineProperty(navigator, 'webdriver', { get: () => false });`,
-        // 2. Remove CDP-injected sourceUrl comments from stack traces
-        `Error.prepareStackTrace = (err, stack) => err.toString();`,
-        // 3. Patch chrome.runtime to look like a real extension-less Chrome
-        `window.chrome = window.chrome || {};`,
-        `window.chrome.runtime = window.chrome.runtime || {};`,
-        // 4. Fix permissions query for notifications (headless detection)
-        `const origQuery = window.Notification?.permission ? null : window.navigator.permissions?.query;`,
-        `if (origQuery) { window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : origQuery.call(navigator.permissions, p); }`,
-        // 5. Patch plugins/mimeTypes to look non-empty
-        `Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });`,
-        `Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });`,
-      ].join('\n');
-
-      this.sendCDPToPage('Page.addScriptToEvaluateOnNewDocument', { source: stealthScript });
-      // Also evaluate immediately on the current page
-      this.sendCDPToPage('Runtime.evaluate', { expression: stealthScript });
-    }
-
-    // ─── Viewport emulation ───
-
-    applyViewportEmulation() {
-
-      if (this.isMagnified) {
-        // Magnified = native resolution, user can scroll
-        this.sendCDPToPage('Emulation.clearDeviceMetricsOverride');
-        this.sendCDPToPage('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 });
-        this.sendCDPToPage('Emulation.setVisibleSize', {
-          width: window.screen.width,
-          height: window.screen.height
-        });
-        this.emulatedWidth = 0;
-        this.emulatedHeight = 0;
-        console.log('[CDP] Magnified mode — native resolution');
-      } else {
-        // Fit-to-screen: emulate device at screen dimensions.
-        // IMPORTANT: deviceScaleFactor must be 1 so that emulated CSS pixels
-        // map 1:1 to the video stream pixels. With DPR=2, Chrome renders at
-        // 2x the dimensions which overflows the 1920x1080 stream and gets clipped.
-        const screenW = window.innerWidth;
-        const screenH = Math.min(window.innerHeight, this.PHYSICAL_HEIGHT); // cap to stream height
-        const isMobileDevice = this.is_touch_device;
-
-        this.sendCDPToPage('Emulation.setDeviceMetricsOverride', {
-          width: screenW,
-          height: screenH,
-          deviceScaleFactor: 1,
-          mobile: isMobileDevice,
-          screenWidth: screenW,
-          screenHeight: screenH
-        });
-        this.sendCDPToPage('Emulation.setVisibleSize', { width: screenW, height: screenH });
-        this.sendCDPToPage('Emulation.setTouchEmulationEnabled', {
-          enabled: isMobileDevice,
-          maxTouchPoints: isMobileDevice ? 5 : 0
-        });
-        // Don't override user agent — Cloudflare and other bot detectors check
-        // UA vs TLS fingerprint. A mobile UA from a Linux Chromium = instant block.
-        // The viewport emulation + mobile:true is enough for responsive layouts.
-        this.emulatedWidth = screenW;
-        this.emulatedHeight = screenH;
-        console.log(`[CDP] Fit-to-screen — emulate ${screenW}x${screenH} DPR=1 UA=${isMobileDevice ? 'mobile' : 'desktop'}`);
-      }
-    }
-
+    // ─── Mobile viewport: real X11 display resize (no CDP, no bot detection) ───
     toggleMagnify() {
       this.isMagnified = !this.isMagnified;
-      this.applyViewportEmulation();
     }
 
     // ─── Keysym → CDP key info (for emulated mode keyboard) ───
@@ -1364,113 +1235,57 @@
     }
 
     // ─── Touch handler ───
-    // On mobile with viewport emulation: ALL input goes through CDP (same as keyboard.ts).
-    // Neko's sendMousePos maps to 1920x1080 which is wrong when CDP emulates at mobile size.
-    // On desktop (or no emulation): fall back to neko simulated mouse events.
+    // All touch input goes through neko (simulated mouse events at 1920x1080).
+    // On mobile viewport, the CSS-scaled overlay maps touch coords to 1920x1080
+    // automatically via getEmulatedCoords. No CDP — no bot detection.
     onTouchHandler(e: TouchEvent) {
       const first = e.changedTouches[0]
+      if (!first) return
 
-      // If not in mobile viewport mode, use original neko approach
-      if (!this.mobileViewportActive) {
-        let type = ''
-        switch (e.type) {
-          case 'touchstart': type = 'mousedown'; break
-          case 'touchmove': type = 'mousemove'; break
-          case 'touchend': type = 'mouseup'; break
-          default: return
-        }
-        const sim = new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window,
-          screenX: first.screenX, screenY: first.screenY,
-          clientX: first.clientX, clientY: first.clientY,
-        })
-        first.target.dispatchEvent(sim)
-        return
-      }
+      // Convert touch to neko mouse coordinates (works for both scaled and native)
+      const rect = this._overlay.getBoundingClientRect()
+      const w = this.$accessor.video.resolution.w || this.PHYSICAL_WIDTH
+      const h = this.$accessor.video.resolution.h || this.PHYSICAL_HEIGHT
+      const x = Math.round((w / rect.width) * (first.clientX - rect.left))
+      const y = Math.round((h / rect.height) * (first.clientY - rect.top))
 
-      // ─── Mobile viewport: CDP only (same as keyboard.ts) ───
+      switch (e.type) {
+        case 'touchstart':
+          this.touchStart = { x, y, clientX: first.clientX, clientY: first.clientY, time: Date.now() }
+          this.isScrolling = false
+          this.$client.sendData('mousemove', { x, y })
+          this.$client.sendData('mousedown', { key: 1 })
+          break
 
-      if (e.type === 'touchstart') {
-        if (!first) return
-        const rect = this._overlay.getBoundingClientRect()
-        const { x, y } = this.getEmulatedCoords(first.clientX, first.clientY)
-        console.log(`[TOUCH] touchstart — client:(${first.clientX},${first.clientY}) emulated:(${x},${y}) overlay:(${Math.round(rect.width)}x${Math.round(rect.height)}) emulatedSize:(${this.emulatedWidth}x${this.emulatedHeight}) innerSize:(${window.innerWidth}x${window.innerHeight})`)
-        this.touchStart = { x, y, clientX: first.clientX, clientY: first.clientY, time: Date.now() }
-        this.isScrolling = false
-        this.touchEventsSent = false
+        case 'touchmove':
+          if (!this.touchStart) return
+          const dx = Math.abs(this.touchStart.clientX - first.clientX)
+          const dy = Math.abs(this.touchStart.clientY - first.clientY)
+          if (dx > 10 || dy > 10) this.isScrolling = true
+          this.$client.sendData('mousemove', { x, y })
+          break
 
-        // Send click early via CDP so active element updates before touchend
-        this.sendCDPClick(x, y)
-        return
-      }
+        case 'touchend':
+          this.$client.sendData('mouseup', { key: 1 })
 
-      if (e.type === 'touchmove') {
-        if (!this.touchStart || !first) return
-        const { x, y } = this.getEmulatedCoords(first.clientX, first.clientY)
-        const totalDX = Math.abs(this.touchStart.clientX - first.clientX)
-        const totalDY = Math.abs(this.touchStart.clientY - first.clientY)
-
-        if (!this.isScrolling && (totalDX > 15 || totalDY > 15)) {
-          this.isScrolling = true
-          if (!this.touchEventsSent) {
-            this.sendCDPToPage('Input.dispatchTouchEvent', {
-              type: 'touchStart',
-              touchPoints: [{ x: this.touchStart.x, y: this.touchStart.y, id: 1 }]
-            })
-            this.touchEventsSent = true
-          }
-        }
-
-        if (this.isScrolling && this.touchEventsSent) {
-          this.sendCDPToPage('Input.dispatchTouchEvent', {
-            type: 'touchMove',
-            touchPoints: [{ x, y, id: 1 }]
-          })
-        }
-        return
-      }
-
-      if (e.type === 'touchend') {
-        if (this.touchEventsSent) {
-          this.sendCDPToPage('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
-        }
-
-        if (!this.touchStart) return
-        const duration = Date.now() - this.touchStart.time
-        const wasTap = !this.isScrolling && duration < 300
-
-        if (wasTap) {
-          // Auto-detect input fields via sync XHR
-          const elementResult = this.checkElementHasFocusSync();
-
-          if (elementResult.isInput && this._mobileInput) {
-            this._mobileInput.value = '';
-            this._mobileInput.focus();
-          } else if (!elementResult.isInput) {
-            if (this._mobileInput) this._mobileInput.blur();
-            if (document.activeElement instanceof HTMLElement) {
-              document.activeElement.blur();
+          if (this.touchStart && !this.isScrolling) {
+            const duration = Date.now() - this.touchStart.time
+            if (duration < 300) {
+              // Tap — check if input field for keyboard
+              const result = this.checkElementHasFocusSync()
+              if (result.isInput && this._mobileInput) {
+                this._mobileInput.value = ''
+                this._mobileInput.focus()
+              } else if (!result.isInput) {
+                if (this._mobileInput) this._mobileInput.blur()
+                if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+              }
             }
           }
 
-          // Async re-check for stale cache
-          setTimeout(() => {
-            try {
-              fetch(this.getActiveElementUrl())
-                .then(res => res.json())
-                .then(data => {
-                  if (!data.isInput && this._mobileInput && document.activeElement === this._mobileInput) {
-                    this._mobileInput.blur();
-                  }
-                })
-                .catch(() => {});
-            } catch {}
-          }, 300);
-        }
-
-        this.touchStart = null
-        this.isScrolling = false
-        this.touchEventsSent = false
+          this.touchStart = null
+          this.isScrolling = false
+          break
       }
     }
 
