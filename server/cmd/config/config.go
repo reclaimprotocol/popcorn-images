@@ -32,6 +32,9 @@ type Config struct {
 	// If empty, it is derived from DevToolsProxyPort as 127.0.0.1:<port>.
 	DevToolsProxyAddr string `envconfig:"DEVTOOLS_PROXY_ADDR" default:""`
 
+	// Internal CDP proxy (port 9226) - unrestricted, full CDP access for internal services
+	// Note: Port 9222 is restricted CDP (filtered), port 9224 is WebDriver/BiDi, port 9226 is internal/full CDP
+
 	// Reclaim TEE configuration
 	TEEKUrl     string `envconfig:"TEE_K_URL" default:"wss://tk.reclaimprotocol.org/ws"`
 	TEETUrl     string `envconfig:"TEE_T_URL" default:"wss://tt.reclaimprotocol.org/ws"`

@@ -3,6 +3,7 @@ package devtoolsproxy
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -404,6 +405,193 @@ func normalizeUpstreamURL(raw string) string {
 	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawQuery: parsed.RawQuery}).String()
 }
 
+// WebSocketProxyHandlerFiltered returns a filtered CDP proxy handler that only allows whitelisted commands
+func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ctrl scaletozero.Controller) http.Handler {
+	allowedCommands := createAllowedCommandsMap()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptOpts := &websocket.AcceptOptions{
+			OriginPatterns:  []string{"*"},
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+		dialOpts := &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+
+		urlCh, unsub := mgr.Subscribe()
+		defer unsub()
+
+		upstreamCurrent := mgr.Current()
+		if upstreamCurrent == "" {
+			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		maybePauseAfterCurrentRead(r.Context(), logger, r)
+
+		clientConn, err := websocket.Accept(w, r, acceptOpts)
+		if err != nil {
+			logger.Error("websocket accept failed", slog.String("err", err.Error()))
+			return
+		}
+		clientConn.SetReadLimit(100 * 1024 * 1024)
+
+		upstreamConn, upstreamURL, err := dialUpstreamWithRetry(r.Context(), mgr, urlCh, upstreamCurrent, dialOpts, logger)
+		if err != nil {
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(r.Context().Err(), context.Canceled), errors.Is(r.Context().Err(), context.DeadlineExceeded):
+				clientConn.Close(websocket.StatusGoingAway, "request cancelled")
+			default:
+				logger.Error("failed to connect to upstream", slog.String("err", err.Error()))
+				clientConn.Close(websocket.StatusInternalError, "upstream unavailable")
+			}
+			return
+		}
+		upstreamConn.SetReadLimit(100 * 1024 * 1024)
+
+		logger.Debug("proxying websocket with CDP filtering", slog.String("url", upstreamURL))
+
+		pumpCtx, pumpCancel := context.WithCancel(r.Context())
+
+		go func(currentUpstreamURL string) {
+			for {
+				select {
+				case newURL, ok := <-urlCh:
+					if !ok {
+						return
+					}
+					newURL = normalizeUpstreamURL(newURL)
+					if newURL == "" || newURL == currentUpstreamURL {
+						continue
+					}
+					logger.Info("upstream URL changed, closing stale proxy session",
+						slog.String("old_url", currentUpstreamURL),
+						slog.String("new_url", newURL))
+					pumpCancel()
+					return
+				case <-pumpCtx.Done():
+					return
+				}
+			}
+		}(upstreamURL)
+
+		var once sync.Once
+		cleanup := func() {
+			once.Do(func() {
+				pumpCancel()
+				upstreamConn.Close(websocket.StatusNormalClosure, "")
+				clientConn.Close(websocket.StatusNormalClosure, "")
+			})
+		}
+
+		// Use custom pump with CDP filtering
+		pumpWithCDPFilter(pumpCtx, clientConn, upstreamConn, cleanup, logger, allowedCommands)
+	})
+}
+
+// pumpWithCDPFilter bidirectionally copies messages between client and upstream
+// with filtering on client->upstream direction for CDP commands
+func pumpWithCDPFilter(ctx context.Context, client, upstream *websocket.Conn, onClose func(), logger *slog.Logger, allowedCommands map[string]bool) {
+	errChan := make(chan error, 2)
+
+	// Client -> Upstream (with filtering)
+	go func() {
+		for {
+			mt, msg, err := client.Read(ctx)
+			if err != nil {
+				logger.Error("client read error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+
+			// Filter CDP commands
+			if mt == websocket.MessageText {
+				var cdpMsg map[string]interface{}
+				if err := json.Unmarshal(msg, &cdpMsg); err == nil {
+					if method, ok := cdpMsg["method"].(string); ok && method != "" {
+						if !allowedCommands[method] {
+							logger.Warn("CDP command blocked by filter", slog.String("method", method))
+							// Send error response back to client
+							if id, hasID := cdpMsg["id"]; hasID {
+								errResp := map[string]interface{}{
+									"id":    id,
+									"error": map[string]interface{}{"code": -32000, "message": "Command not allowed"},
+								}
+								if respBytes, err := json.Marshal(errResp); err == nil {
+									_ = client.Write(ctx, websocket.MessageText, respBytes)
+								}
+							}
+							continue
+						}
+					}
+				}
+			}
+
+			if err := upstream.Write(ctx, mt, msg); err != nil {
+				logger.Error("upstream write error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	// Upstream -> Client (no filtering)
+	go func() {
+		for {
+			mt, msg, err := upstream.Read(ctx)
+			if err != nil {
+				logger.Error("upstream read error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+
+			if err := client.Write(ctx, mt, msg); err != nil {
+				logger.Error("client write error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-errChan:
+	}
+	onClose()
+}
+
+// createAllowedCommandsMap returns the whitelist of CDP commands allowed on the restricted endpoint
+func createAllowedCommandsMap() map[string]bool {
+	return map[string]bool{
+		// Input - clipboard, scroll and input
+		"Input.insertText":         true,
+		"Input.dispatchKeyEvent":   true,
+		"Input.dispatchMouseEvent": true,
+		"Input.dispatchTouchEvent": true,
+
+		// Emulation - viewport resize and visible area
+		"Emulation.setDeviceMetricsOverride":   true,
+		"Emulation.setVisibleSize":             true,
+		"Emulation.setTouchEmulationEnabled":   true,
+		"Emulation.clearDeviceMetricsOverride": true,
+
+		// DOM - replacement for runtime eval to get coordinates
+		"DOM.enable":             true, // Required to enable DOM domain
+		"DOM.getNodeForLocation": true,
+		"DOM.describeNode":       true,
+
+		// Browser - CDP health ping
+		"Browser.getVersion": true,
+
+		// Target - detect/attach popup and close popup
+		"Target.setAutoAttach":  true,
+		"Target.attachToTarget": true, // Required to bootstrap page-scoped command sessions
+		"Target.closeTarget":    true,
+
+		// Page - enable domain to subscribe to page events
+		"Page.enable": true, // Required to enable Page domain for events
+	}
+}
 
 // logCDPMessage logs a CDP message with its direction if logging is enabled
 func logCDPMessage(logger *slog.Logger, direction string, mt websocket.MessageType, msg []byte) {

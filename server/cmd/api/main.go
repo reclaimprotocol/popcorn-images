@@ -148,6 +148,27 @@ func main() {
 		fs.ServeHTTP(w, r)
 	})
 
+	// Start the persistent CDP FocusTracker — it polls document.activeElement
+	// every 100ms and caches the result.
+	focusTracker := devtoolsproxy.NewFocusTracker(upstreamMgr, slogger)
+	defer focusTracker.Stop()
+
+	// Expose active-element cache on the primary API router so the gateway
+	// can route to it via the standard `/api/...` path.
+	// CORS is needed so the neko client (port 8080) can sync-XHR to this endpoint.
+	r.Get("/cdp/active-element", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/active-element", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
 		Handler: r,
@@ -183,13 +204,74 @@ func main() {
 	rDevtools.Get("/json/", jsonTargetHandler)
 	rDevtools.Get("/json/list", jsonTargetHandler)
 	rDevtools.Get("/json/list/", jsonTargetHandler)
+
+	// Cached active-element endpoint: reads atomic pointer (~0 latency).
+	// Must use Route (not just Get) to ensure chi matches this before the wildcard WebSocket catch-all below.
+	rDevtools.Route("/cdp", func(r chi.Router) {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				if req.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				next.ServeHTTP(w, req)
+			})
+		})
+		r.Get("/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
+	})
+
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
+		devtoolsproxy.WebSocketProxyHandlerFiltered(upstreamMgr, slogger, stz).ServeHTTP(w, r)
 	})
 
 	srvDevtools := &http.Server{
 		Addr:    fmt.Sprintf("0.0.0.0:%d", config.DevToolsProxyPort),
 		Handler: rDevtools,
+	}
+
+	// Internal CDP server with full access (no filtering) on port 9226
+	rDevtoolsInternal := chi.NewRouter()
+	rDevtoolsInternal.Use(
+		chiMiddleware.Logger,
+		chiMiddleware.Recoverer,
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctxWithLogger := logger.AddToContext(r.Context(), slogger)
+				next.ServeHTTP(w, r.WithContext(ctxWithLogger))
+			})
+		},
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+		scaletozero.Middleware(stz),
+	)
+	jsonVersionHandlerInternal := chromeJSONProxyHandler(upstreamMgr, slogger, "/json/version")
+	rDevtoolsInternal.Get("/json/version", jsonVersionHandlerInternal)
+	rDevtoolsInternal.Get("/json/version/", jsonVersionHandlerInternal)
+	jsonTargetHandlerInternal := chromeJSONProxyHandler(upstreamMgr, slogger, "/json")
+	rDevtoolsInternal.Get("/json", jsonTargetHandlerInternal)
+	rDevtoolsInternal.Get("/json/", jsonTargetHandlerInternal)
+	rDevtoolsInternal.Get("/json/list", jsonTargetHandlerInternal)
+	rDevtoolsInternal.Get("/json/list/", jsonTargetHandlerInternal)
+	rDevtoolsInternal.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
+	})
+
+	srvDevtoolsInternal := &http.Server{
+		Addr:    "0.0.0.0:9226",
+		Handler: rDevtoolsInternal,
 	}
 
 	// ChromeDriver proxy: intercepts POST /session to inject the DevTools proxy
@@ -234,6 +316,14 @@ func main() {
 	}()
 
 	go func() {
+		slogger.Info("devtools websocket proxy (internal/full) starting", "addr", srvDevtoolsInternal.Addr)
+		if err := srvDevtoolsInternal.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slogger.Error("devtools websocket proxy (internal/full) failed", "err", err)
+			stop()
+		}
+	}()
+
+	go func() {
 		slogger.Info("chromedriver proxy starting", "addr", srvChromeDriver.Addr)
 		if err := srvChromeDriver.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slogger.Error("chromedriver proxy failed", "err", err)
@@ -258,6 +348,9 @@ func main() {
 	g.Go(func() error {
 		upstreamMgr.Stop()
 		return srvDevtools.Shutdown(shutdownCtx)
+	})
+	g.Go(func() error {
+		return srvDevtoolsInternal.Shutdown(shutdownCtx)
 	})
 	g.Go(func() error {
 		return srvChromeDriver.Shutdown(shutdownCtx)

@@ -205,6 +205,7 @@
           outline: 0;
           border: 0;
           color: transparent;
+          caret-color: transparent;
           background: transparent;
           resize: none;
         }
@@ -261,6 +262,12 @@
     private fullscreen = false
     private mutedOverlay = true
     private isVideoSyncing = false
+
+    // CDP state
+    private cdpSocket: WebSocket | null = null
+    private pendingCDPCommands: Map<number, { resolve: Function, reject: Function }> = new Map()
+    private cdpCommandId = 1
+    private cdpSessionId: string | null = null
 
     get admin() {
       return this.$accessor.user.admin
@@ -430,8 +437,6 @@
       }
     }
 
-    private isVideoSyncing = false;
-
     @Watch('playing')
     async onPlayingChanged(playing: boolean) {
       // In Safari, native events can fire slightly before the `video.paused` property flips.
@@ -487,6 +492,8 @@
       this.onResize()
 
       this.observer.observe(this._component)
+
+      this.connectCDP()
 
       onFullscreenChange(this._player, () => {
         this.fullscreen = isFullscreen()
@@ -558,7 +565,12 @@
     }
 
     beforeDestroy() {
+      if (this.cdpSocket) {
+        this.cdpSocket.close()
+        this.cdpSocket = null
+      }
       this.observer.disconnect()
+      this.pendingCDPCommands.clear()
       this.$accessor.video.setPlayable(false)
       /* Guacamole Keyboard does not provide destroy functions */
     }
@@ -607,6 +619,62 @@
 
       return key
     }
+
+    // --- CDP Logic ---
+    // Detect production (behind gateway) vs local dev and return the correct
+    // URL for the active-element endpoint.
+    // Production path: /<browser_pod_id>/<session_id>/<token>/...
+    // Production API:  /api/<session_id>/<token>/cdp/active-element
+    // Local:           http://<hostname>:9222/cdp/active-element
+    getActiveElementUrl(): string {
+      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/);
+      if (match) {
+        const sessionId = match[2];
+        const token = match[3];
+        return `${window.location.origin}/api/${sessionId}/${token}/cdp/active-element`;
+      }
+      // Local dev: hit the kernel-images-api directly
+      return `http://${window.location.hostname}:9222/cdp/active-element`;
+    }
+
+    // connectCDP is now a no-op. The actual CDP work happens server-side
+    // via GET /cdp/active-element which avoids all WebSocket proxy issues.
+    async connectCDP() {
+      console.log(`[CDP] active-element endpoint: ${this.getActiveElementUrl()}`);
+    }
+
+    /**
+     * Synchronous check using XMLHttpRequest.
+     * Blocks the main thread until the response arrives, which is acceptable
+     * here because: (a) it's hitting localhost (~1-5ms), and (b) we MUST know
+     * the result before deciding to focus (Safari keyboard limitation).
+     */
+    checkElementHasFocusSync(): { isInput: boolean, tag: string, rawOuterHTML?: string, type?: string, isEditable?: boolean } {
+      const url = this.getActiveElementUrl();
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false); // false = synchronous
+        xhr.send();
+        if (xhr.status === 200) {
+          const data = JSON.parse(xhr.responseText);
+          console.log('[CDP] active-element result (sync):', data);
+          return {
+            isInput: !!data.isInput,
+            tag: data.tag || 'unknown',
+            type: data.type,
+            isEditable: data.isEditable,
+            rawOuterHTML: data.rawOuterHTML,
+          };
+        }
+        console.error('[CDP] active-element sync non-200:', xhr.status);
+        return { isInput: true, tag: 'fetch-error' };
+      } catch (e) {
+        console.error('[CDP] active-element sync error:', e);
+        // Optimistic default: keep keyboard up on error
+        return { isInput: true, tag: 'fetch-error' };
+      }
+    }    // --- End CDP Logic ---
+
 
     async play() {
       if (!this._video.paused || !this.playable) {
@@ -784,6 +852,27 @@
         clientY: first.clientY,
       })
       first.target.dispatchEvent(simulatedEvent)
+
+      // On touchend, use a SYNCHRONOUS XHR to check if the remote browser's
+      // active element is an input. The sync call blocks until the response
+      // arrives (~1-5ms to localhost), so we know the answer BEFORE deciding
+      // to focus. This avoids the iOS Safari "keyboard bounce" entirely:
+      // the keyboard only appears when we KNOW it should.
+      if (type === 'mouseup' && this.is_touch_device) {
+        const elementResult = this.checkElementHasFocusSync();
+        console.log(`[TOUCHEND] CDP Result (sync):`, elementResult);
+
+        if (elementResult.isInput) {
+          console.log('[TOUCHEND] Is an input! Focusing overlay for keyboard.');
+          this._overlay.focus();
+        } else {
+          console.log('[TOUCHEND] Not an input. No keyboard needed.');
+          // Ensure any existing keyboard is dismissed
+          if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+          }
+        }
+      }
     }
 
     onMouseDown(e: MouseEvent) {
