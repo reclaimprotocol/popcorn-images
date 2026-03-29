@@ -1,11 +1,11 @@
-FROM docker.io/golang:1.25.0 AS server-builder
+FROM docker.io/golang:1.25.3 AS server-builder
 WORKDIR /workspace/server
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-golang1250
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 
 COPY server/go.mod ./
 COPY server/go.sum ./
@@ -146,7 +146,7 @@ RUN --mount=type=cache,target=/tmp/cache/ffmpeg,sharing=locked,id=$CACHEIDPREFIX
     rm -rf /tmp/ffmpeg*
 EOT
 
-FROM ghcr.io/kernel/neko/base:3.0.8-v1.3.0 AS neko
+FROM ghcr.io/kernel/neko/base:3.0.8-v1.4.0 AS neko
 # ^--- now has event.SYSTEM_PONG with legacy support to keepalive
 FROM node:22-bullseye-slim AS node-22
 FROM docker.io/ubuntu:22.04
@@ -204,13 +204,42 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     wget \
     xdg-utils \
     libvulkan1 \
-    fonts-liberation \
-    fonts-noto-cjk \
-    fonts-noto-color-emoji \
-    fonts-nanum \
     fontconfig \
     unzip && \
-    fc-cache -f
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
+# A minimal container has only 3 fonts, which is a strong fingerprinting signal
+# used by reCAPTCHA Enterprise and other bot detection vendors.
+RUN apt-get update && \
+    apt-get --no-install-recommends -y install \
+    fonts-liberation \
+    fonts-liberation2 \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    fonts-noto-core \
+    fonts-nanum \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
+    fonts-freefont-ttf \
+    fonts-ubuntu \
+    fonts-opensymbol \
+    fonts-roboto \
+    fonts-croscore \
+    fonts-smc-chilanka \
+    fonts-hosny-amiri \
+    fonts-indic \
+    fonts-kacst \
+    fonts-khmeros-core \
+    fonts-lao \
+    fonts-lklug-sinhala \
+    fonts-sil-abyssinica \
+    fonts-sil-padauk \
+    fonts-thai-tlwg \
+    fonts-tibetan-machine \
+    fonts-droid-fallback && \
+    fc-cache -f && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # install ffmpeg manually since the version available in apt is from the 4.x branch due to #drama.
 COPY --from=ffmpeg-downloader /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
@@ -261,6 +290,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     apt -y install chromium && \
     apt --no-install-recommends -y install sqlite3;
 
+# Install ChromeDriver matching the installed Chromium version
+# Chromedriver and Chromium are not necessarily the same version, but we try to match them.
+# Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
+ARG CHROMEDRIVER_VERSION=
+RUN set -eux; \
+    if [ -z "$CHROMEDRIVER_VERSION" ]; then \
+        CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
+    fi; \
+    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
+    unzip /tmp/cd.zip -d /tmp; \
+    mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
+    chmod +x /usr/local/bin/chromedriver; \
+    rm -rf /tmp/cd.zip /tmp/chromedriver-linux64
+
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
 COPY shared/chromium-policies/managed/policy.json /etc/chromium/policies/managed/policy.json
@@ -278,6 +321,22 @@ RUN set -eux; \
 
 # Install TypeScript, Playwright, Patchright, esbuild globally
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g typescript playwright-core patchright esbuild
+
+# Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
+# Only installed, NOT configured: no host keys, no custom config, service not enabled.
+RUN apt-get update && \
+    apt-get --no-install-recommends -y install openssh-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -f /etc/ssh/ssh_host_* && \
+    ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+        amd64) WEBSOCAT_ARCH="x86_64" ;; \
+        arm64) WEBSOCAT_ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.${WEBSOCAT_ARCH}-unknown-linux-musl" \
+        -o /usr/local/bin/websocat && \
+    chmod +x /usr/local/bin/websocat
 
 # setup desktop env & app
 ENV DISPLAY_NUM=1
@@ -298,6 +357,16 @@ RUN chmod +x /images/chromium-headful/start-pulseaudio.sh
 COPY images/chromium-headful/wrapper.sh /wrapper.sh
 COPY images/chromium-headful/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/services/
+COPY shared/envoy/supervisor-envoy.conf /etc/supervisor/conf.d/services/envoy.conf
+
+# Install Envoy proxy
+COPY shared/envoy/install-proxy.sh /usr/local/bin/install-proxy.sh
+RUN chmod +x /usr/local/bin/install-proxy.sh && /usr/local/bin/install-proxy.sh && rm /usr/local/bin/install-proxy.sh
+
+# Copy Envoy configuration files
+COPY shared/envoy/bootstrap.yaml /etc/envoy/templates/bootstrap.yaml
+COPY shared/envoy/init-envoy.sh /usr/local/bin/init-envoy.sh
+RUN chmod +x /usr/local/bin/init-envoy.sh
 
 # copy the kernel-images API binary built in the builder stage
 COPY --from=server-builder /out/kernel-images-api /usr/local/bin/kernel-images-api

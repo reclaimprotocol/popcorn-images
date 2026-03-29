@@ -136,6 +136,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     dbus-x11 \
     xvfb \
     x11-utils \
+    xclip \
     xdotool \
     fontconfig \
     fonts-noto-cjk \
@@ -153,7 +154,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
     apt-get update -y && \
     apt-get -y install chromium && \
-    apt-get --no-install-recommends -y install sqlite3;
+    apt-get --no-install-recommends -y install sqlite3 unzip;
+
+# Install ChromeDriver matching the installed Chromium version
+# Chromedriver and Chromium are not necessarily the same version, but we try to match them.
+# Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
+ARG CHROMEDRIVER_VERSION=
+RUN set -eux; \
+    if [ -z "$CHROMEDRIVER_VERSION" ]; then \
+        CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
+    fi; \
+    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
+    unzip /tmp/cd.zip -d /tmp; \
+    mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
+    chmod +x /usr/local/bin/chromedriver; \
+    rm -rf /tmp/cd.zip /tmp/chromedriver-linux64
 
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
@@ -182,6 +197,22 @@ RUN set -eux; \
 # Install TypeScript, Playwright, Patchright, esbuild globally
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g typescript playwright-core patchright esbuild
 
+# Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
+# Only installed, NOT configured: no host keys, no custom config, service not enabled.
+RUN apt-get update && \
+    apt-get --no-install-recommends -y install openssh-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -f /etc/ssh/ssh_host_* && \
+    ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+        amd64) WEBSOCAT_ARCH="x86_64" ;; \
+        arm64) WEBSOCAT_ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.${WEBSOCAT_ARCH}-unknown-linux-musl" \
+        -o /usr/local/bin/websocat && \
+    chmod +x /usr/local/bin/websocat
+
 ENV WITHDOCKER=true
 
 # Create a non-root user with a home directory
@@ -197,6 +228,16 @@ COPY images/chromium-headless/image/wrapper.sh /usr/bin/wrapper.sh
 # Supervisord configuration
 COPY images/chromium-headless/image/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headless/image/supervisor/services/ /etc/supervisor/conf.d/services/
+COPY shared/envoy/supervisor-envoy.conf /etc/supervisor/conf.d/services/envoy.conf
+
+# Install Envoy proxy
+COPY shared/envoy/install-proxy.sh /usr/local/bin/install-proxy.sh
+RUN chmod +x /usr/local/bin/install-proxy.sh && /usr/local/bin/install-proxy.sh && rm /usr/local/bin/install-proxy.sh
+
+# Copy Envoy configuration files
+COPY shared/envoy/bootstrap.yaml /etc/envoy/templates/bootstrap.yaml
+COPY shared/envoy/init-envoy.sh /usr/local/bin/init-envoy.sh
+RUN chmod +x /usr/local/bin/init-envoy.sh
 
 # Copy the kernel-images API binary built in the builder stage
 COPY --from=server-builder /out/kernel-images-api /usr/local/bin/kernel-images-api

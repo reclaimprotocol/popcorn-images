@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/onkernel/kernel-images/server/lib/scaletozero"
+	"github.com/onkernel/kernel-images/server/lib/wsproxy"
 )
 
 var devtoolsListeningRegexp = regexp.MustCompile(`DevTools listening on (ws://\S+)`)
@@ -194,125 +196,326 @@ func (u *UpstreamManager) runTailOnce(ctx context.Context) {
 	}
 }
 
-// CommandFilter is a function that returns true if a CDP command should be allowed
-type CommandFilter func(method string) bool
+func dialUpstreamWithRetry(ctx context.Context, mgr *UpstreamManager, urlCh <-chan string, initialUpstreamURL string, dialOpts *websocket.DialOptions, logger *slog.Logger) (*websocket.Conn, string, error) {
+	upstreamURL := normalizeUpstreamURL(initialUpstreamURL)
+	if upstreamURL == "" {
+		return nil, "", fmt.Errorf("upstream not ready")
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		upstreamConn, _, err := websocket.Dial(ctx, upstreamURL, dialOpts)
+		if err == nil {
+			return upstreamConn, upstreamURL, nil
+		}
+
+		logger.Warn("dial upstream failed, checking for newer URL",
+			slog.String("err", err.Error()), slog.String("url", upstreamURL))
+
+		latestURL := normalizeUpstreamURL(mgr.Current())
+		if latestURL != "" && latestURL != upstreamURL {
+			upstreamURL = latestURL
+			continue
+		}
+
+		select {
+		case newURL, ok := <-urlCh:
+			if !ok {
+				return nil, "", fmt.Errorf("upstream unavailable")
+			}
+			newURL = normalizeUpstreamURL(newURL)
+			if newURL == "" || newURL == upstreamURL {
+				continue
+			}
+			upstreamURL = newURL
+		case <-deadline.C:
+			return nil, "", fmt.Errorf("timed out waiting for new upstream URL")
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}
+}
+
+func maybePauseAfterCurrentRead(ctx context.Context, logger *slog.Logger, r *http.Request) {
+	if r.URL.Query().Get("devtoolsProxyTestHook") != "1" {
+		return
+	}
+
+	// Test-only hook used by e2e to widen the window between reading Current
+	// and dialing/subscribing so reconnect races can be reproduced reliably.
+	rawDelayMs := os.Getenv("DEVTOOLS_PROXY_TEST_POST_CURRENT_DELAY_MS")
+	if rawDelayMs != "" {
+		delayMs, err := strconv.Atoi(rawDelayMs)
+		if err != nil || delayMs <= 0 {
+			logger.Warn("ignoring invalid devtools proxy test delay", slog.String("value", rawDelayMs))
+		} else {
+			timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+			defer timer.Stop()
+
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	blockPath := os.Getenv("DEVTOOLS_PROXY_TEST_POST_CURRENT_BLOCK_FILE")
+	if blockPath == "" {
+		return
+	}
+
+	readyPath := blockPath + ".ready"
+	releasePath := blockPath + ".release"
+	if err := os.WriteFile(readyPath, []byte("ready\n"), 0o644); err != nil {
+		logger.Warn("failed to write devtools proxy test ready marker",
+			slog.String("path", readyPath),
+			slog.String("err", err.Error()))
+		return
+	}
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if _, err := os.Stat(releasePath); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			logger.Warn("failed to read devtools proxy test release marker",
+				slog.String("path", releasePath),
+				slog.String("err", err.Error()))
+			return
+		}
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
 // WebSocketProxyHandler returns an http.Handler that upgrades incoming connections and
 // proxies them to the current upstream websocket URL. It expects only websocket requests.
 // If logCDPMessages is true, all CDP messages will be logged with their direction.
 func WebSocketProxyHandler(mgr *UpstreamManager, logger *slog.Logger, logCDPMessages bool, ctrl scaletozero.Controller) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var transform wsproxy.MessageTransform
+		if logCDPMessages {
+			transform = func(direction string, mt websocket.MessageType, msg []byte) []byte {
+				logCDPMessage(logger, direction, mt, msg)
+				return msg
+			}
+		}
+
+		acceptOpts := &websocket.AcceptOptions{
+			OriginPatterns:  []string{"*"},
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+		dialOpts := &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+
+		// Subscribe to upstream URL changes so we can tear down stale sessions
+		// when Chromium restarts and retry if the current URL is already dead.
+		urlCh, unsub := mgr.Subscribe()
+		defer unsub()
 
 		upstreamCurrent := mgr.Current()
 		if upstreamCurrent == "" {
 			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
 			return
 		}
-		parsed, err := url.Parse(upstreamCurrent)
-		if err != nil {
-			http.Error(w, "invalid upstream", http.StatusInternalServerError)
-			return
-		}
-		// Always use the full upstream path and query, ignoring the client's request path/query
-		upstreamURL := (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawQuery: parsed.RawQuery}).String()
-		acceptOptions := &websocket.AcceptOptions{
-			OriginPatterns:  []string{"*"},
-			CompressionMode: websocket.CompressionContextTakeover,
-		}
-		logger.Info("accept options", slog.Any("options", acceptOptions))
-		clientConn, err := websocket.Accept(w, r, acceptOptions)
-		if err != nil {
-			logger.Error("websocket accept failed", slog.String("err", err.Error()))
-			return
-		}
-		clientConn.SetReadLimit(100 * 1024 * 1024) // 100 MB. Effectively no maximum size of message from client
-		dialOptions := &websocket.DialOptions{
-			CompressionMode: websocket.CompressionContextTakeover,
-		}
-		logger.Info("dial options", slog.Any("options", dialOptions))
-		upstreamConn, _, err := websocket.Dial(r.Context(), upstreamURL, dialOptions)
-		if err != nil {
-			logger.Error("dial upstream failed", slog.String("err", err.Error()), slog.String("url", upstreamURL))
-			_ = clientConn.Close(websocket.StatusInternalError, "failed to connect to upstream")
-			return
-		}
-		upstreamConn.SetReadLimit(100 * 1024 * 1024) // 100 MB. Effectively no maximum size of message from upstream
-		logger.Debug("proxying devtools websocket", slog.String("url", upstreamURL))
 
-		var once sync.Once
-		cleanup := func() {
-			once.Do(func() {
-				_ = upstreamConn.Close(websocket.StatusNormalClosure, "")
-				_ = clientConn.Close(websocket.StatusNormalClosure, "")
-			})
-		}
-		proxyWebSocket(r.Context(), clientConn, upstreamConn, cleanup, logger, logCDPMessages, nil)
-	})
-}
+		maybePauseAfterCurrentRead(r.Context(), logger, r)
 
-// WebSocketProxyHandlerFiltered returns a filtered CDP proxy handler that only allows whitelisted commands
-func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ctrl scaletozero.Controller) http.Handler {
-	filter := createRestrictedFilter()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCurrent := mgr.Current()
-		if upstreamCurrent == "" {
-			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
-			return
-		}
-		parsed, err := url.Parse(upstreamCurrent)
-		if err != nil {
-			http.Error(w, "invalid upstream", http.StatusInternalServerError)
-			return
-		}
-		upstreamURL := (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawQuery: parsed.RawQuery}).String()
-		acceptOptions := &websocket.AcceptOptions{
-			OriginPatterns:  []string{"*"},
-			CompressionMode: websocket.CompressionContextTakeover,
-		}
-		clientConn, err := websocket.Accept(w, r, acceptOptions)
+		// Accept the client WebSocket connection.
+		clientConn, err := websocket.Accept(w, r, acceptOpts)
 		if err != nil {
 			logger.Error("websocket accept failed", slog.String("err", err.Error()))
 			return
 		}
 		clientConn.SetReadLimit(100 * 1024 * 1024)
-		dialOptions := &websocket.DialOptions{
-			CompressionMode: websocket.CompressionContextTakeover,
-		}
-		upstreamConn, _, err := websocket.Dial(r.Context(), upstreamURL, dialOptions)
+
+		// Dial upstream. If the URL is stale (Chromium just restarted), first
+		// re-check the manager's latest URL in case we missed the notification,
+		// then wait briefly for the next update from Subscribe.
+		upstreamConn, upstreamURL, err := dialUpstreamWithRetry(r.Context(), mgr, urlCh, upstreamCurrent, dialOpts, logger)
 		if err != nil {
-			logger.Error("dial upstream failed", slog.String("err", err.Error()), slog.String("url", upstreamURL))
-			_ = clientConn.Close(websocket.StatusInternalError, "failed to connect to upstream")
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(r.Context().Err(), context.Canceled), errors.Is(r.Context().Err(), context.DeadlineExceeded):
+				clientConn.Close(websocket.StatusGoingAway, "request cancelled")
+			default:
+				logger.Error("failed to connect to upstream", slog.String("err", err.Error()))
+				clientConn.Close(websocket.StatusInternalError, "upstream unavailable")
+			}
 			return
 		}
 		upstreamConn.SetReadLimit(100 * 1024 * 1024)
-		logger.Debug("proxying devtools websocket with filtering", slog.String("url", upstreamURL))
+
+		logger.Debug("proxying websocket", slog.String("url", upstreamURL))
+
+		// Cancel the pump when the upstream URL changes (Chromium restarted),
+		// forcing the client to reconnect with the new upstream.
+		pumpCtx, pumpCancel := context.WithCancel(r.Context())
+
+		go func(currentUpstreamURL string) {
+			for {
+				select {
+				case newURL, ok := <-urlCh:
+					if !ok {
+						return
+					}
+					newURL = normalizeUpstreamURL(newURL)
+					if newURL == "" || newURL == currentUpstreamURL {
+						continue
+					}
+					logger.Info("upstream URL changed, closing stale proxy session",
+						slog.String("old_url", currentUpstreamURL),
+						slog.String("new_url", newURL))
+					pumpCancel()
+					return
+				case <-pumpCtx.Done():
+					return
+				}
+			}
+		}(upstreamURL)
 
 		var once sync.Once
 		cleanup := func() {
 			once.Do(func() {
-				_ = upstreamConn.Close(websocket.StatusNormalClosure, "")
-				_ = clientConn.Close(websocket.StatusNormalClosure, "")
+				pumpCancel()
+				upstreamConn.Close(websocket.StatusNormalClosure, "")
+				clientConn.Close(websocket.StatusNormalClosure, "")
 			})
 		}
-		proxyWebSocket(r.Context(), clientConn, upstreamConn, cleanup, logger, false, filter)
+
+		wsproxy.Pump(pumpCtx, clientConn, upstreamConn, cleanup, logger, transform)
 	})
 }
 
-type wsConn interface {
-	Read(ctx context.Context) (websocket.MessageType, []byte, error)
-	Write(ctx context.Context, typ websocket.MessageType, p []byte) error
-	Close(statusCode websocket.StatusCode, reason string) error
+// normalizeUpstreamURL parses a raw DevTools URL and returns a clean form.
+func normalizeUpstreamURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path, RawQuery: parsed.RawQuery}).String()
 }
 
-// createRestrictedFilter returns a filter that only allows safe CDP commands
-func createRestrictedFilter() CommandFilter {
-	// Whitelist of allowed CDP commands used by the frontend
-	allowedCommands := map[string]bool{
+// WebSocketProxyHandlerFiltered returns a filtered CDP proxy handler that only allows whitelisted commands
+func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ctrl scaletozero.Controller) http.Handler {
+	allowedCommands := createAllowedCommandsMap()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Create a filtering transform that blocks non-whitelisted CDP commands
+		transform := func(direction string, mt websocket.MessageType, msg []byte) []byte {
+			// Only filter client->upstream messages
+			if direction != "->" || mt != websocket.MessageText {
+				return msg
+			}
+
+			var cdpMsg map[string]interface{}
+			if err := json.Unmarshal(msg, &cdpMsg); err == nil {
+				if method, ok := cdpMsg["method"].(string); ok && method != "" {
+					if !allowedCommands[method] {
+						logger.Warn("CDP command blocked by filter", slog.String("method", method))
+						// Return nil to skip forwarding this message
+						return nil
+					}
+				}
+			}
+			return msg
+		}
+
+		acceptOpts := &websocket.AcceptOptions{
+			OriginPatterns:  []string{"*"},
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+		dialOpts := &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		}
+
+		urlCh, unsub := mgr.Subscribe()
+		defer unsub()
+
+		upstreamCurrent := mgr.Current()
+		if upstreamCurrent == "" {
+			http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		maybePauseAfterCurrentRead(r.Context(), logger, r)
+
+		clientConn, err := websocket.Accept(w, r, acceptOpts)
+		if err != nil {
+			logger.Error("websocket accept failed", slog.String("err", err.Error()))
+			return
+		}
+		clientConn.SetReadLimit(100 * 1024 * 1024)
+
+		upstreamConn, upstreamURL, err := dialUpstreamWithRetry(r.Context(), mgr, urlCh, upstreamCurrent, dialOpts, logger)
+		if err != nil {
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(r.Context().Err(), context.Canceled), errors.Is(r.Context().Err(), context.DeadlineExceeded):
+				clientConn.Close(websocket.StatusGoingAway, "request cancelled")
+			default:
+				logger.Error("failed to connect to upstream", slog.String("err", err.Error()))
+				clientConn.Close(websocket.StatusInternalError, "upstream unavailable")
+			}
+			return
+		}
+		upstreamConn.SetReadLimit(100 * 1024 * 1024)
+
+		logger.Debug("proxying websocket with CDP filtering", slog.String("url", upstreamURL))
+
+		pumpCtx, pumpCancel := context.WithCancel(r.Context())
+
+		go func(currentUpstreamURL string) {
+			for {
+				select {
+				case newURL, ok := <-urlCh:
+					if !ok {
+						return
+					}
+					newURL = normalizeUpstreamURL(newURL)
+					if newURL == "" || newURL == currentUpstreamURL {
+						continue
+					}
+					logger.Info("upstream URL changed, closing stale proxy session",
+						slog.String("old_url", currentUpstreamURL),
+						slog.String("new_url", newURL))
+					pumpCancel()
+					return
+				case <-pumpCtx.Done():
+					return
+				}
+			}
+		}(upstreamURL)
+
+		var once sync.Once
+		cleanup := func() {
+			once.Do(func() {
+				pumpCancel()
+				upstreamConn.Close(websocket.StatusNormalClosure, "")
+				clientConn.Close(websocket.StatusNormalClosure, "")
+			})
+		}
+
+		wsproxy.Pump(pumpCtx, clientConn, upstreamConn, cleanup, logger, transform)
+	})
+}
+
+// createAllowedCommandsMap returns the whitelist of CDP commands allowed on the restricted endpoint
+func createAllowedCommandsMap() map[string]bool {
+	return map[string]bool{
 		// Input - clipboard, scroll and input
-		"Input.insertText":          true,
-		"Input.dispatchKeyEvent":    true,
-		"Input.dispatchMouseEvent":  true,
-		"Input.dispatchTouchEvent":  true,
+		"Input.insertText":         true,
+		"Input.dispatchKeyEvent":   true,
+		"Input.dispatchMouseEvent": true,
+		"Input.dispatchTouchEvent": true,
 
 		// Emulation - viewport resize and visible area
 		"Emulation.setDeviceMetricsOverride":   true,
@@ -335,10 +538,6 @@ func createRestrictedFilter() CommandFilter {
 		"Page.frameStartedLoading": true,
 		"Page.loadEventFired":      true,
 		"Page.frameNavigated":      true,
-	}
-
-	return func(method string) bool {
-		return allowedCommands[method]
 	}
 }
 
@@ -418,80 +617,4 @@ func logCDPMessage(logger *slog.Logger, direction string, mt websocket.MessageTy
 	}
 
 	logger.Info("cdp", args...)
-}
-
-func proxyWebSocket(ctx context.Context, clientConn, upstreamConn wsConn, onClose func(), logger *slog.Logger, logCDPMessages bool, filter CommandFilter) {
-	errChan := make(chan error, 2)
-
-	go func() {
-		for {
-			mt, msg, err := clientConn.Read(ctx)
-			if err != nil {
-				logger.Error("client read error", slog.String("err", err.Error()))
-				errChan <- err
-				break
-			}
-
-			// Filter CDP commands if filter is provided
-			if filter != nil && mt == websocket.MessageText {
-				var cdpMsg map[string]interface{}
-				if err := json.Unmarshal(msg, &cdpMsg); err == nil {
-					if method, ok := cdpMsg["method"].(string); ok && method != "" {
-						if !filter(method) {
-							logger.Warn("CDP command blocked by filter", slog.String("method", method))
-							// Send error response back to client
-							if id, hasID := cdpMsg["id"]; hasID {
-								errResp := map[string]interface{}{
-									"id":    id,
-									"error": map[string]interface{}{"code": -32000, "message": "Command not allowed"},
-								}
-								if respBytes, err := json.Marshal(errResp); err == nil {
-									_ = clientConn.Write(ctx, websocket.MessageText, respBytes)
-								}
-							}
-							continue
-						}
-					}
-				}
-			}
-
-			// Log CDP messages if enabled
-			if logCDPMessages {
-				logCDPMessage(logger, "->", mt, msg)
-			}
-
-			if err := upstreamConn.Write(ctx, mt, msg); err != nil {
-				logger.Error("upstream write error", slog.String("err", err.Error()))
-				errChan <- err
-				break
-			}
-		}
-	}()
-	go func() {
-		for {
-			mt, msg, err := upstreamConn.Read(ctx)
-			if err != nil {
-				logger.Error("upstream read error", slog.String("err", err.Error()))
-				errChan <- err
-				break
-			}
-
-			// Log CDP messages if enabled
-			if logCDPMessages {
-				logCDPMessage(logger, "<-", mt, msg)
-			}
-
-			if err := clientConn.Write(ctx, mt, msg); err != nil {
-				logger.Error("client write error", slog.String("err", err.Error()))
-				errChan <- err
-				break
-			}
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-	case <-errChan:
-	}
-	onClose()
 }

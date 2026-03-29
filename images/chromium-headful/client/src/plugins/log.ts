@@ -38,8 +38,6 @@ interface Logger {
 }
 
 declare global {
-  const $log: Logger
-
   interface Window {
     $log: Logger
   }
@@ -51,11 +49,54 @@ declare module 'vue/types/vue' {
   }
 }
 
+const noop = () => {}
+const noopError = (_: Error) => {}
+
+const realLoggers: Logger = {
+  error: (error: Error) => console.error('[%cNEKO%c] %cERR', 'color: #498ad8;', '', 'color: #d84949;', error),
+  warn: (...log: any[]) => console.warn('[%cNEKO%c] %cWRN', 'color: #498ad8;', '', 'color: #eae364;', ...log),
+  info: (...log: any[]) => console.info('[%cNEKO%c] %cINF', 'color: #498ad8;', '', 'color: #4ac94c;', ...log),
+  debug: (...log: any[]) => console.log('[%cNEKO%c] %cDBG', 'color: #498ad8;', '', 'color: #eae364;', ...log),
+}
+
+const offLoggers: Logger = {
+  error: noopError,
+  warn: noop,
+  info: noop,
+  debug: noop,
+}
+
+const LOG_METHODS: (keyof Logger)[] = ['error', 'warn', 'info', 'debug']
+const DISABLED_LEVELS = ['off', 'none', '']
+
+function createLoggerForLevel(level: string): Logger {
+  const normalized = level.toLowerCase()
+  if (DISABLED_LEVELS.includes(normalized)) return offLoggers
+
+  const enabledIndex = LOG_METHODS.indexOf(normalized as keyof Logger)
+  if (enabledIndex === -1) return offLoggers
+
+  const logger: Logger = { ...offLoggers }
+  for (let i = 0; i <= enabledIndex; i++) {
+    const method = LOG_METHODS[i]
+    ;(logger as any)[method] = realLoggers[method]
+  }
+  return logger
+}
+
+function getLogLevel(): string {
+  const params = new URL(location.href).searchParams
+  return params.get('log_level') ?? params.get('logLevel') ?? 'off'
+}
+
 const plugin: PluginObject<undefined> = {
   install(Vue) {
+    const baseLoggers = createLoggerForLevel(getLogLevel())
+
+    // Wrap base loggers with OTel integration (OTel always gets logs regardless of level)
     window.$log = {
       error: (error: Error) => {
-        console.error('[%cNEKO%c] %cERR', 'color: #498ad8;', '', 'color: #d84949;', error)
+        baseLoggers.error(error)
         try {
           logger.emit({
             severityNumber: SeverityNumber.ERROR,
@@ -70,7 +111,7 @@ const plugin: PluginObject<undefined> = {
         }
       },
       warn: (...log: any[]) => {
-        console.warn('[%cNEKO%c] %cWRN', 'color: #498ad8;', '', 'color: #eae364;', ...log)
+        baseLoggers.warn(...log)
         try {
           logger.emit({
             severityNumber: SeverityNumber.WARN,
@@ -82,7 +123,7 @@ const plugin: PluginObject<undefined> = {
         }
       },
       info: (...log: any[]) => {
-        console.info('[%cNEKO%c] %cINF', 'color: #498ad8;', '', 'color: #4ac94c;', ...log)
+        baseLoggers.info(...log)
         try {
           logger.emit({
             severityNumber: SeverityNumber.INFO,
@@ -94,7 +135,7 @@ const plugin: PluginObject<undefined> = {
         }
       },
       debug: (...log: any[]) => {
-        console.log('[%cNEKO%c] %cDBG', 'color: #498ad8;', '', 'color: #eae364;', ...log)
+        baseLoggers.debug(...log)
         try {
           logger.emit({
             severityNumber: SeverityNumber.DEBUG,

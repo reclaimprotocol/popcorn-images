@@ -3,122 +3,239 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/onkernel/kernel-images/server/lib/logger"
+	"github.com/onkernel/kernel-images/server/lib/mousetrajectory"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
 )
 
-func (s *ApiService) MoveMouse(ctx context.Context, request oapi.MoveMouseRequestObject) (oapi.MoveMouseResponseObject, error) {
+// validationError represents a client-side error (400).
+type validationError struct{ msg string }
+
+func (e *validationError) Error() string { return e.msg }
+
+// executionError represents a server-side error (500).
+type executionError struct{ msg string }
+
+func (e *executionError) Error() string { return e.msg }
+
+func isValidationErr(err error) bool {
+	var ve *validationError
+	return errors.As(err, &ve)
+}
+
+func (s *ApiService) doMoveMouse(ctx context.Context, body oapi.MoveMouseRequest) error {
 	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
-	s.inputMu.Lock()
-	defer s.inputMu.Unlock()
-
-	// Validate request body
-	if request.Body == nil {
-		return oapi.MoveMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "request body is required"},
-		}, nil
-	}
-	body := *request.Body
 
 	// Get current resolution for bounds validation
 	screenWidth, screenHeight, _, err := s.getCurrentResolution(ctx)
 	if err != nil {
 		log.Error("failed to get current resolution", "error", err)
-		return oapi.MoveMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to get current display resolution"},
-		}, nil
+		return &executionError{msg: "failed to get current display resolution"}
 	}
 
 	// Ensure non-negative coordinates and within screen bounds
 	if body.X < 0 || body.Y < 0 {
-		return oapi.MoveMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "coordinates must be non-negative"},
-		}, nil
+		return &validationError{msg: "coordinates must be non-negative"}
 	}
 	if body.X >= screenWidth || body.Y >= screenHeight {
-		return oapi.MoveMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)},
-		}, nil
+		return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
 	}
 
-	// Build xdotool arguments
-	args := []string{}
+	useSmooth := body.Smooth == nil || *body.Smooth // default true when omitted
+	if useSmooth {
+		return s.doMoveMouseSmooth(ctx, log, body, screenWidth, screenHeight)
+	}
+	return s.doMoveMouseInstant(ctx, log, body)
+}
 
-	// Hold modifier keys (keydown)
+func (s *ApiService) doMoveMouseInstant(ctx context.Context, log *slog.Logger, body oapi.MoveMouseRequest) error {
+	args := []string{}
 	if body.HoldKeys != nil {
 		for _, key := range *body.HoldKeys {
 			args = append(args, "keydown", key)
 		}
 	}
-
-	// Move the cursor to the desired coordinates
 	args = append(args, "mousemove", strconv.Itoa(body.X), strconv.Itoa(body.Y))
-
-	// Release modifier keys (keyup)
 	if body.HoldKeys != nil {
 		for _, key := range *body.HoldKeys {
 			args = append(args, "keyup", key)
 		}
 	}
-
 	log.Info("executing xdotool", "args", args)
-
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool command failed", "err", err, "output", string(output))
-		return oapi.MoveMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to move mouse"},
-		}, nil
+		return &executionError{msg: "failed to move mouse"}
 	}
-
-	return oapi.MoveMouse200Response{}, nil
+	return nil
 }
 
-func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequestObject) (oapi.ClickMouseResponseObject, error) {
-	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
+func (s *ApiService) MoveMouse(ctx context.Context, request oapi.MoveMouseRequestObject) (oapi.MoveMouseResponseObject, error) {
 	s.inputMu.Lock()
 	defer s.inputMu.Unlock()
 
-	// Validate request body
 	if request.Body == nil {
-		return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+		return oapi.MoveMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
 			Message: "request body is required"},
 		}, nil
 	}
-	body := *request.Body
+	if err := s.doMoveMouse(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.MoveMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.MoveMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+	return oapi.MoveMouse200Response{}, nil
+}
+
+func (s *ApiService) doMoveMouseSmooth(ctx context.Context, log *slog.Logger, body oapi.MoveMouseRequest, screenWidth, screenHeight int) error {
+	fromX, fromY, err := s.getMouseLocation(ctx)
+	if err != nil {
+		log.Error("failed to get mouse location for smooth move", "error", err)
+		return &executionError{msg: "failed to get current mouse position: " + err.Error()}
+	}
+
+	if body.DurationMs != nil && (*body.DurationMs < 50 || *body.DurationMs > 5000) {
+		return &validationError{msg: "duration_ms must be between 50 and 5000"}
+	}
+
+	// When duration_ms is specified, compute the number of trajectory points
+	// to achieve that duration at a ~10ms step delay (human-like event frequency).
+	// Otherwise let the library auto-compute from path length.
+	const defaultStepDelayMs = 10
+	var opts *mousetrajectory.Options
+	if body.DurationMs != nil {
+		targetPoints := *body.DurationMs / defaultStepDelayMs
+		if targetPoints < mousetrajectory.MinPoints {
+			targetPoints = mousetrajectory.MinPoints
+		}
+		if targetPoints > mousetrajectory.MaxPoints {
+			targetPoints = mousetrajectory.MaxPoints
+		}
+		opts = &mousetrajectory.Options{MaxPoints: targetPoints}
+	}
+
+	traj := mousetrajectory.NewHumanizeMouseTrajectoryWithOptions(
+		float64(fromX), float64(fromY), float64(body.X), float64(body.Y), opts)
+	points := traj.GetPointsInt()
+	if len(points) < 2 {
+		return s.doMoveMouseInstant(ctx, log, body)
+	}
+
+	// Clamp trajectory points to screen bounds. The Bezier control-point
+	// padding (boundsPadding=80) can place intermediate curve points outside
+	// the screen when the start/end is near an edge. Because we use
+	// mousemove_relative, X11 clamping at screen boundaries would silently
+	// eat deltas, causing the cursor to land at the wrong final position.
+	clampPoints(points, screenWidth, screenHeight)
+
+	// Compute per-step delay to achieve the target duration.
+	numSteps := len(points) - 1
+	stepDelayMs := defaultStepDelayMs
+	if body.DurationMs != nil && numSteps > 0 {
+		stepDelayMs = *body.DurationMs / numSteps
+		if stepDelayMs < 3 {
+			stepDelayMs = 3
+		}
+	}
+
+	// Hold modifiers
+	if body.HoldKeys != nil {
+		args := []string{}
+		for _, key := range *body.HoldKeys {
+			args = append(args, "keydown", key)
+		}
+		if output, err := defaultXdoTool.Run(ctx, args...); err != nil {
+			log.Error("xdotool keydown failed", "err", err, "output", string(output))
+			return &executionError{msg: "failed to hold modifier keys"}
+		}
+		defer func() {
+			args := []string{}
+			for _, key := range *body.HoldKeys {
+				args = append(args, "keyup", key)
+			}
+			// Use background context for cleanup so keys are released even on cancellation.
+			_, _ = defaultXdoTool.Run(context.Background(), args...)
+		}()
+	}
+
+	// Move along Bezier path: mousemove_relative for each step with delay
+	for i := 1; i < len(points); i++ {
+		select {
+		case <-ctx.Done():
+			return &executionError{msg: "mouse movement cancelled"}
+		default:
+		}
+
+		dx := points[i][0] - points[i-1][0]
+		dy := points[i][1] - points[i-1][1]
+		if dx != 0 || dy != 0 {
+			args := []string{"mousemove_relative", "--", strconv.Itoa(dx), strconv.Itoa(dy)}
+			if output, err := defaultXdoTool.Run(ctx, args...); err != nil {
+				log.Error("xdotool mousemove_relative failed", "err", err, "output", string(output), "step", i)
+				return &executionError{msg: "failed during smooth mouse movement"}
+			}
+		}
+		jitter := stepDelayMs
+		if stepDelayMs > 3 {
+			jitter = stepDelayMs + rand.Intn(5) - 2
+			if jitter < 3 {
+				jitter = 3
+			}
+		}
+		if err := sleepWithContext(ctx, time.Duration(jitter)*time.Millisecond); err != nil {
+			return &executionError{msg: "mouse movement cancelled"}
+		}
+	}
+
+	log.Info("executed smooth mouse movement", "points", len(points))
+	return nil
+}
+
+// getMouseLocation returns the current cursor position via xdotool getmouselocation --shell.
+func (s *ApiService) getMouseLocation(ctx context.Context) (x, y int, err error) {
+	output, err := defaultXdoTool.Run(ctx, "getmouselocation", "--shell")
+	if err != nil {
+		return 0, 0, fmt.Errorf("xdotool getmouselocation failed: %w (output: %s)", err, string(output))
+	}
+	return parseMousePosition(string(output))
+}
+
+func (s *ApiService) doClickMouse(ctx context.Context, body oapi.ClickMouseRequest) error {
+	log := logger.FromContext(ctx)
 
 	// Get current resolution for bounds validation
 	screenWidth, screenHeight, _, err := s.getCurrentResolution(ctx)
 	if err != nil {
 		log.Error("failed to get current resolution", "error", err)
-		return oapi.ClickMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to get current display resolution"},
-		}, nil
+		return &executionError{msg: "failed to get current display resolution"}
 	}
 
 	// Ensure non-negative coordinates and within screen bounds
 	if body.X < 0 || body.Y < 0 {
-		return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "coordinates must be non-negative"},
-		}, nil
+		return &validationError{msg: "coordinates must be non-negative"}
 	}
 	if body.X >= screenWidth || body.Y >= screenHeight {
-		return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)},
-		}, nil
+		return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
+	}
+
+	// Smoothly move to click coordinates (matching moveMouse default behavior).
+	// HoldKeys are intentionally not passed — they apply to the click, not the move.
+	if err := s.doMoveMouse(ctx, oapi.MoveMouseRequest{X: body.X, Y: body.Y}); err != nil {
+		return err
 	}
 
 	// Map button enum to xdotool button code. Default to left button.
@@ -134,9 +251,7 @@ func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequ
 		var ok bool
 		btn, ok = buttonMap[*body.Button]
 		if !ok {
-			return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("unsupported button: %s", *body.Button)},
-			}, nil
+			return &validationError{msg: fmt.Sprintf("unsupported button: %s", *body.Button)}
 		}
 	}
 
@@ -156,7 +271,7 @@ func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequ
 		}
 	}
 
-	// Move the cursor
+	// Snap to exact coordinates before clicking (smooth move may be off by ±1px due to rounding)
 	args = append(args, "mousemove", strconv.Itoa(body.X), strconv.Itoa(body.Y))
 
 	// click type defaults to click
@@ -178,9 +293,7 @@ func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequ
 		}
 		args = append(args, btn)
 	default:
-		return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: fmt.Sprintf("unsupported click type: %s", clickType)},
-		}, nil
+		return &validationError{msg: fmt.Sprintf("unsupported click type: %s", clickType)}
 	}
 
 	// Release modifier keys (keyup)
@@ -195,11 +308,27 @@ func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequ
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool command failed", "err", err, "output", string(output))
-		return oapi.ClickMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to execute mouse action"},
-		}, nil
+		return &executionError{msg: "failed to execute mouse action"}
 	}
 
+	return nil
+}
+
+func (s *ApiService) ClickMouse(ctx context.Context, request oapi.ClickMouseRequestObject) (oapi.ClickMouseResponseObject, error) {
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	if request.Body == nil {
+		return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"},
+		}, nil
+	}
+	if err := s.doClickMouse(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.ClickMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.ClickMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
 	return oapi.ClickMouse200Response{}, nil
 }
 
@@ -320,26 +449,12 @@ func (s *ApiService) TakeScreenshot(ctx context.Context, request oapi.TakeScreen
 	return oapi.TakeScreenshot200ImagepngResponse{Body: pr, ContentLength: 0}, nil
 }
 
-func (s *ApiService) TypeText(ctx context.Context, request oapi.TypeTextRequestObject) (oapi.TypeTextResponseObject, error) {
+func (s *ApiService) doTypeText(ctx context.Context, body oapi.TypeTextRequest) error {
 	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
-	s.inputMu.Lock()
-	defer s.inputMu.Unlock()
-
-	// Validate request body
-	if request.Body == nil {
-		return oapi.TypeText400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "request body is required"},
-		}, nil
-	}
-	body := *request.Body
 
 	// Validate delay if provided
 	if body.Delay != nil && *body.Delay < 0 {
-		return oapi.TypeText400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "delay must be >= 0 milliseconds"},
-		}, nil
+		return &validationError{msg: "delay must be >= 0 milliseconds"}
 	}
 
 	// Build xdotool arguments
@@ -353,11 +468,27 @@ func (s *ApiService) TypeText(ctx context.Context, request oapi.TypeTextRequestO
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool command failed", "err", err, "output", string(output))
-		return oapi.TypeText500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to type text"},
-		}, nil
+		return &executionError{msg: "failed to type text"}
 	}
 
+	return nil
+}
+
+func (s *ApiService) TypeText(ctx context.Context, request oapi.TypeTextRequestObject) (oapi.TypeTextResponseObject, error) {
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	if request.Body == nil {
+		return oapi.TypeText400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"},
+		}, nil
+	}
+	if err := s.doTypeText(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.TypeText400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.TypeText500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
 	return oapi.TypeText200Response{}, nil
 }
 
@@ -373,20 +504,8 @@ const (
 	unclutterJitterPixels = "9000000"
 )
 
-func (s *ApiService) SetCursor(ctx context.Context, request oapi.SetCursorRequestObject) (oapi.SetCursorResponseObject, error) {
+func (s *ApiService) doSetCursor(ctx context.Context, body oapi.SetCursorRequest) error {
 	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping commands
-	s.inputMu.Lock()
-	defer s.inputMu.Unlock()
-
-	// Validate request body
-	if request.Body == nil {
-		return oapi.SetCursor400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "request body is required"},
-		}, nil
-	}
-	body := *request.Body
 
 	// Kill any existing unclutter processes first
 	pkillCmd := exec.CommandContext(ctx, "pkill", "unclutter")
@@ -397,9 +516,7 @@ func (s *ApiService) SetCursor(ctx context.Context, request oapi.SetCursorReques
 	if err := pkillCmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
 			log.Error("failed to kill existing unclutter processes", "err", err)
-			return oapi.SetCursor500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: "failed to kill existing unclutter processes"},
-			}, nil
+			return &executionError{msg: "failed to kill existing unclutter processes"}
 		}
 	}
 
@@ -417,38 +534,118 @@ func (s *ApiService) SetCursor(ctx context.Context, request oapi.SetCursorReques
 
 		if err := unclutterCmd.Start(); err != nil {
 			log.Error("failed to start unclutter", "err", err)
-			return oapi.SetCursor500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: "failed to start unclutter"},
-			}, nil
+			return &executionError{msg: "failed to start unclutter"}
 		}
 	}
 
-	return oapi.SetCursor200JSONResponse{Ok: true}, nil
+	return nil
 }
 
-func (s *ApiService) PressKey(ctx context.Context, request oapi.PressKeyRequestObject) (oapi.PressKeyResponseObject, error) {
-	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
+func (s *ApiService) SetCursor(ctx context.Context, request oapi.SetCursorRequestObject) (oapi.SetCursorResponseObject, error) {
 	s.inputMu.Lock()
 	defer s.inputMu.Unlock()
 
 	if request.Body == nil {
-		return oapi.PressKey400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+		return oapi.SetCursor400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
 			Message: "request body is required"},
 		}, nil
 	}
-	body := *request.Body
+	if err := s.doSetCursor(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.SetCursor400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.SetCursor500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+	return oapi.SetCursor200JSONResponse{Ok: true}, nil
+}
 
-	if len(body.Keys) == 0 {
-		return oapi.PressKey400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "keys must contain at least one key symbol"},
+// parseMousePosition parses xdotool getmouselocation --shell output.
+// Expected format:
+//
+//	X=100
+//	Y=200
+//	SCREEN=0
+//	WINDOW=12345
+//
+// Returns x, y coordinates and an error if parsing fails.
+func parseMousePosition(output string) (x, y int, err error) {
+	outStr := strings.TrimSpace(output)
+	if outStr == "" {
+		return 0, 0, fmt.Errorf("empty output")
+	}
+
+	var xParsed, yParsed bool
+
+	for line := range strings.SplitSeq(outStr, "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := parts[0], parts[1]
+		switch key {
+		case "X":
+			if parsed, parseErr := strconv.Atoi(value); parseErr == nil {
+				x = parsed
+				xParsed = true
+			}
+		case "Y":
+			if parsed, parseErr := strconv.Atoi(value); parseErr == nil {
+				y = parsed
+				yParsed = true
+			}
+		}
+		// Early exit once both coordinates are found
+		if xParsed && yParsed {
+			break
+		}
+	}
+
+	if !xParsed || !yParsed {
+		return 0, 0, fmt.Errorf("failed to parse coordinates from output: %q", outStr)
+	}
+
+	return x, y, nil
+}
+
+func (s *ApiService) GetMousePosition(ctx context.Context, request oapi.GetMousePositionRequestObject) (oapi.GetMousePositionResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	// serialize input operations to avoid race conditions with other xdotool commands
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	// Execute xdotool getmouselocation --shell for parseable output
+	output, err := defaultXdoTool.Run(ctx, "getmouselocation", "--shell")
+	if err != nil {
+		log.Error("xdotool getmouselocation failed", "err", err, "output", string(output))
+		return oapi.GetMousePosition500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+			Message: "failed to get mouse position"},
 		}, nil
 	}
-	if body.Duration != nil && *body.Duration < 0 {
-		return oapi.PressKey400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "duration must be >= 0 milliseconds"},
+
+	x, y, err := parseMousePosition(string(output))
+	if err != nil {
+		log.Error("failed to parse mouse position", "err", err, "output", string(output))
+		return oapi.GetMousePosition500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+			Message: "failed to parse mouse position from xdotool output"},
 		}, nil
+	}
+
+	return oapi.GetMousePosition200JSONResponse{
+		X: x,
+		Y: y,
+	}, nil
+}
+
+func (s *ApiService) doPressKey(ctx context.Context, body oapi.PressKeyRequest) error {
+	log := logger.FromContext(ctx)
+
+	if len(body.Keys) == 0 {
+		return &validationError{msg: "keys must contain at least one key symbol"}
+	}
+	if body.Duration != nil && *body.Duration < 0 {
+		return &validationError{msg: "duration must be >= 0 milliseconds"}
 	}
 
 	// If duration is provided and >0, hold all keys down, sleep, then release.
@@ -476,32 +673,37 @@ func (s *ApiService) PressKey(ctx context.Context, request oapi.PressKeyRequestO
 				}
 			}
 			_, _ = defaultXdoTool.Run(ctx, argsUp...)
-			return oapi.PressKey500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: fmt.Sprintf("failed to press keys (keydown). out=%s", string(output))},
-			}, nil
+			return &executionError{msg: fmt.Sprintf("failed to press keys (keydown). out=%s", string(output))}
 		}
 
 		d := time.Duration(*body.Duration) * time.Millisecond
-		time.Sleep(d)
 
-		argsUp := []string{}
-		for _, key := range body.Keys {
-			argsUp = append(argsUp, "keyup", key)
-		}
-		if body.HoldKeys != nil {
-			for _, key := range *body.HoldKeys {
+		// Best-effort release helper: always attempt to release keys even if sleep was interrupted.
+		releaseKeys := func() error {
+			argsUp := []string{}
+			for _, key := range body.Keys {
 				argsUp = append(argsUp, "keyup", key)
 			}
+			if body.HoldKeys != nil {
+				for _, key := range *body.HoldKeys {
+					argsUp = append(argsUp, "keyup", key)
+				}
+			}
+			// Use background context for cleanup so keys are released even on cancellation.
+			if output, err := defaultXdoTool.Run(context.Background(), argsUp...); err != nil {
+				log.Error("xdotool keyup failed", "err", err, "output", string(output))
+				return &executionError{msg: fmt.Sprintf("failed to release keys. out=%s", string(output))}
+			}
+			return nil
 		}
 
-		if output, err := defaultXdoTool.Run(ctx, argsUp...); err != nil {
-			log.Error("xdotool keyup failed", "err", err, "output", string(output))
-			return oapi.PressKey500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: fmt.Sprintf("failed to release keys. out=%s", string(output))},
-			}, nil
+		if err := sleepWithContext(ctx, d); err != nil {
+			// Context cancelled while holding keys down; release them before returning.
+			_ = releaseKeys()
+			return &executionError{msg: fmt.Sprintf("key hold interrupted: %s", err)}
 		}
 
-		return oapi.PressKey200Response{}, nil
+		return releaseKeys()
 	}
 
 	// Tap behavior: hold modifiers (if any), tap each key, then release modifiers.
@@ -523,51 +725,48 @@ func (s *ApiService) PressKey(ctx context.Context, request oapi.PressKeyRequestO
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool command failed", "err", err, "output", string(output))
-		return oapi.PressKey500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: fmt.Sprintf("failed to press keys. out=%s", string(output))},
-		}, nil
+		return &executionError{msg: fmt.Sprintf("failed to press keys. out=%s", string(output))}
 	}
-	return oapi.PressKey200Response{}, nil
+	return nil
 }
 
-func (s *ApiService) Scroll(ctx context.Context, request oapi.ScrollRequestObject) (oapi.ScrollResponseObject, error) {
-	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
+func (s *ApiService) PressKey(ctx context.Context, request oapi.PressKeyRequestObject) (oapi.PressKeyResponseObject, error) {
 	s.inputMu.Lock()
 	defer s.inputMu.Unlock()
 
 	if request.Body == nil {
-		return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+		return oapi.PressKey400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
 			Message: "request body is required"},
 		}, nil
 	}
-	body := *request.Body
+	if err := s.doPressKey(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.PressKey400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.PressKey500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+	return oapi.PressKey200Response{}, nil
+}
+
+func (s *ApiService) doScroll(ctx context.Context, body oapi.ScrollRequest) error {
+	log := logger.FromContext(ctx)
 
 	// Validate deltas
 	if (body.DeltaX == nil || *body.DeltaX == 0) && (body.DeltaY == nil || *body.DeltaY == 0) {
-		return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "at least one of delta_x or delta_y must be non-zero"},
-		}, nil
+		return &validationError{msg: "at least one of delta_x or delta_y must be non-zero"}
 	}
 
 	// Bounds check
 	screenWidth, screenHeight, _, err := s.getCurrentResolution(ctx)
 	if err != nil {
 		log.Error("failed to get current resolution", "error", err)
-		return oapi.Scroll500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to get current display resolution"},
-		}, nil
+		return &executionError{msg: "failed to get current display resolution"}
 	}
 	if body.X < 0 || body.Y < 0 {
-		return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "coordinates must be non-negative"},
-		}, nil
+		return &validationError{msg: "coordinates must be non-negative"}
 	}
 	if body.X >= screenWidth || body.Y >= screenHeight {
-		return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)},
-		}, nil
+		return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
 	}
 
 	args := []string{}
@@ -609,56 +808,53 @@ func (s *ApiService) Scroll(ctx context.Context, request oapi.ScrollRequestObjec
 	output, err := defaultXdoTool.Run(ctx, args...)
 	if err != nil {
 		log.Error("xdotool scroll failed", "err", err, "output", string(output))
-		return oapi.Scroll500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: fmt.Sprintf("failed to perform scroll: %s", string(output))},
-		}, nil
+		return &executionError{msg: fmt.Sprintf("failed to perform scroll: %s", string(output))}
 	}
-	return oapi.Scroll200Response{}, nil
+	return nil
 }
 
-func (s *ApiService) DragMouse(ctx context.Context, request oapi.DragMouseRequestObject) (oapi.DragMouseResponseObject, error) {
-	log := logger.FromContext(ctx)
-
-	// serialize input operations to avoid overlapping xdotool commands
+func (s *ApiService) Scroll(ctx context.Context, request oapi.ScrollRequestObject) (oapi.ScrollResponseObject, error) {
 	s.inputMu.Lock()
 	defer s.inputMu.Unlock()
 
 	if request.Body == nil {
-		return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "request body is required"}}, nil
+		return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"},
+		}, nil
 	}
-	body := *request.Body
+	if err := s.doScroll(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.Scroll400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.Scroll500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+	return oapi.Scroll200Response{}, nil
+}
+
+func (s *ApiService) doDragMouse(ctx context.Context, body oapi.DragMouseRequest) error {
+	log := logger.FromContext(ctx)
 
 	if len(body.Path) < 2 {
-		return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-			Message: "path must contain at least two points"}}, nil
+		return &validationError{msg: "path must contain at least two points"}
 	}
 
 	// Bounds check for all points
 	screenWidth, screenHeight, _, err := s.getCurrentResolution(ctx)
 	if err != nil {
 		log.Error("failed to get current resolution", "error", err)
-		return oapi.DragMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "failed to get current display resolution"},
-		}, nil
+		return &executionError{msg: "failed to get current display resolution"}
 	}
 	for i, pt := range body.Path {
 		if len(pt) != 2 {
-			return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("path[%d] must be [x,y]", i)},
-			}, nil
+			return &validationError{msg: fmt.Sprintf("path[%d] must be [x,y]", i)}
 		}
 		x := pt[0]
 		y := pt[1]
 		if x < 0 || y < 0 {
-			return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: "coordinates must be non-negative"},
-			}, nil
+			return &validationError{msg: "coordinates must be non-negative"}
 		}
 		if x >= screenWidth || y >= screenHeight {
-			return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)},
-			}, nil
+			return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
 		}
 	}
 
@@ -673,9 +869,7 @@ func (s *ApiService) DragMouse(ctx context.Context, request oapi.DragMouseReques
 		case oapi.DragMouseRequestButtonRight:
 			btn = "3"
 		default:
-			return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("unsupported button: %s", *body.Button)},
-			}, nil
+			return &validationError{msg: fmt.Sprintf("unsupported button: %s", *body.Button)}
 		}
 	}
 
@@ -700,76 +894,40 @@ func (s *ApiService) DragMouse(ctx context.Context, request oapi.DragMouseReques
 			}
 			_, _ = defaultXdoTool.Run(ctx, argsCleanup...)
 		}
-		return oapi.DragMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: fmt.Sprintf("failed to start drag: %s", string(output))},
-		}, nil
+		return &executionError{msg: fmt.Sprintf("failed to start drag: %s", string(output))}
 	}
 
 	// Optional delay between mousedown and movement
 	if body.Delay != nil && *body.Delay > 0 {
-		time.Sleep(time.Duration(*body.Delay) * time.Millisecond)
-	}
-
-	// Phase 2: move along path (excluding first point) using fixed-count relative steps
-	// Insert a small delay between each relative move to smooth the drag
-	args2 := []string{}
-	// Determine per-segment steps and per-step delay from request (with defaults)
-	stepsPerSegment := 10
-	if body.StepsPerSegment != nil && *body.StepsPerSegment >= 1 {
-		stepsPerSegment = *body.StepsPerSegment
-	}
-	stepDelayMs := 50
-	if body.StepDelayMs != nil && *body.StepDelayMs >= 0 {
-		stepDelayMs = *body.StepDelayMs
-	}
-	stepDelaySeconds := fmt.Sprintf("%.3f", float64(stepDelayMs)/1000.0)
-
-	// Precompute total number of relative steps so we can avoid a trailing sleep
-	totalSteps := 0
-	prev := start
-	for _, pt := range body.Path[1:] {
-		x0, y0 := prev[0], prev[1]
-		x1, y1 := pt[0], pt[1]
-		totalSteps += len(generateRelativeSteps(x1-x0, y1-y0, stepsPerSegment))
-		prev = pt
-	}
-
-	prev = start
-	stepIndex := 0
-	for _, pt := range body.Path[1:] {
-		x0, y0 := prev[0], prev[1]
-		x1, y1 := pt[0], pt[1]
-		for _, step := range generateRelativeSteps(x1-x0, y1-y0, stepsPerSegment) {
-			xStr := strconv.Itoa(step[0])
-			yStr := strconv.Itoa(step[1])
-			if step[0] < 0 || step[1] < 0 {
-				args2 = append(args2, "mousemove_relative", "--", xStr, yStr)
-			} else {
-				args2 = append(args2, "mousemove_relative", xStr, yStr)
+		if err := sleepWithContext(ctx, time.Duration(*body.Delay)*time.Millisecond); err != nil {
+			// Best-effort release: mouseup + modifier keyup
+			cleanupArgs := []string{"mouseup", btn}
+			if body.HoldKeys != nil {
+				for _, key := range *body.HoldKeys {
+					cleanupArgs = append(cleanupArgs, "keyup", key)
+				}
 			}
-			// add a tiny delay between moves, but not after the last step
-			if stepIndex < totalSteps-1 && stepDelayMs > 0 {
-				args2 = append(args2, "sleep", stepDelaySeconds)
-			}
-			stepIndex++
+			_, _ = defaultXdoTool.Run(context.Background(), cleanupArgs...)
+			return &executionError{msg: fmt.Sprintf("drag delay interrupted: %s", err)}
 		}
-		prev = pt
 	}
-	if len(args2) > 0 {
-		log.Info("executing xdotool (drag move)", "args", args2)
-		if output, err := defaultXdoTool.Run(ctx, args2...); err != nil {
-			log.Error("xdotool drag move failed", "err", err, "output", string(output))
-			// Try to release button and modifiers
+
+	// Phase 2: move along path
+	useSmooth := body.Smooth == nil || *body.Smooth
+	if useSmooth {
+		if err := s.doDragMouseSmooth(ctx, log, body, btn, screenWidth, screenHeight); err != nil {
 			argsCleanup := []string{"mouseup", btn}
 			if body.HoldKeys != nil {
 				for _, key := range *body.HoldKeys {
 					argsCleanup = append(argsCleanup, "keyup", key)
 				}
 			}
-			_, _ = defaultXdoTool.Run(ctx, argsCleanup...)
-			return oapi.DragMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: fmt.Sprintf("failed during drag movement: %s", string(output))},
-			}, nil
+			_, _ = defaultXdoTool.Run(context.Background(), argsCleanup...)
+			return err
+		}
+	} else {
+		if err := s.doDragMouseLinear(ctx, log, body, btn); err != nil {
+			return err
 		}
 	}
 
@@ -783,12 +941,339 @@ func (s *ApiService) DragMouse(ctx context.Context, request oapi.DragMouseReques
 	log.Info("executing xdotool (drag end)", "args", args3)
 	if output, err := defaultXdoTool.Run(ctx, args3...); err != nil {
 		log.Error("xdotool drag end failed", "err", err, "output", string(output))
-		return oapi.DragMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: fmt.Sprintf("failed to finish drag: %s", string(output))},
+		return &executionError{msg: fmt.Sprintf("failed to finish drag: %s", string(output))}
+	}
+
+	return nil
+}
+
+func (s *ApiService) doDragMouseLinear(ctx context.Context, log *slog.Logger, body oapi.DragMouseRequest, btn string) error {
+	start := body.Path[0]
+	stepsPerSegment := 10
+	if body.StepsPerSegment != nil && *body.StepsPerSegment >= 1 {
+		stepsPerSegment = *body.StepsPerSegment
+	}
+	stepDelayMs := 50
+	if body.StepDelayMs != nil && *body.StepDelayMs >= 0 {
+		stepDelayMs = *body.StepDelayMs
+	}
+	stepDelaySeconds := fmt.Sprintf("%.3f", float64(stepDelayMs)/1000.0)
+
+	totalSteps := 0
+	prev := start
+	for _, pt := range body.Path[1:] {
+		x0, y0 := prev[0], prev[1]
+		x1, y1 := pt[0], pt[1]
+		totalSteps += len(generateRelativeSteps(x1-x0, y1-y0, stepsPerSegment))
+		prev = pt
+	}
+
+	args2 := []string{}
+	prev = start
+	stepIndex := 0
+	for _, pt := range body.Path[1:] {
+		x0, y0 := prev[0], prev[1]
+		x1, y1 := pt[0], pt[1]
+		for _, step := range generateRelativeSteps(x1-x0, y1-y0, stepsPerSegment) {
+			xStr := strconv.Itoa(step[0])
+			yStr := strconv.Itoa(step[1])
+			if step[0] < 0 || step[1] < 0 {
+				args2 = append(args2, "mousemove_relative", "--", xStr, yStr)
+			} else {
+				args2 = append(args2, "mousemove_relative", xStr, yStr)
+			}
+			if stepIndex < totalSteps-1 && stepDelayMs > 0 {
+				args2 = append(args2, "sleep", stepDelaySeconds)
+			}
+			stepIndex++
+		}
+		prev = pt
+	}
+	if len(args2) > 0 {
+		log.Info("executing xdotool (drag move)", "args", args2)
+		if output, err := defaultXdoTool.Run(ctx, args2...); err != nil {
+			log.Error("xdotool drag move failed", "err", err, "output", string(output))
+			argsCleanup := []string{"mouseup", btn}
+			if body.HoldKeys != nil {
+				for _, key := range *body.HoldKeys {
+					argsCleanup = append(argsCleanup, "keyup", key)
+				}
+			}
+			_, _ = defaultXdoTool.Run(ctx, argsCleanup...)
+			return &executionError{msg: fmt.Sprintf("failed during drag movement: %s", string(output))}
+		}
+	}
+	return nil
+}
+
+func (s *ApiService) doDragMouseSmooth(ctx context.Context, log *slog.Logger, body oapi.DragMouseRequest, btn string, screenWidth, screenHeight int) error {
+	if body.DurationMs != nil && (*body.DurationMs < 50 || *body.DurationMs > 10000) {
+		return &validationError{msg: "duration_ms must be between 50 and 10000"}
+	}
+
+	waypoints := make([][2]int, len(body.Path))
+	for i, pt := range body.Path {
+		waypoints[i] = [2]int{pt[0], pt[1]}
+	}
+
+	result := mousetrajectory.GenerateMultiSegmentTrajectory(waypoints, screenWidth, screenHeight, body.DurationMs)
+	points := result.Points
+	baseDelayMs := result.StepDelayMs
+
+	if len(points) < 2 {
+		return nil
+	}
+
+	numSteps := len(points) - 1
+
+	// Build a single xdotool arg slice with inline sleep directives.
+	// Use smoothstep easing: slow at start (pickup) and end (placement),
+	// fast in the middle, matching natural human drag behavior.
+	args := []string{}
+	for i := 1; i <= numSteps; i++ {
+		dx := points[i][0] - points[i-1][0]
+		dy := points[i][1] - points[i-1][1]
+		if dx == 0 && dy == 0 {
+			continue
+		}
+		args = append(args, "mousemove_relative", "--", strconv.Itoa(dx), strconv.Itoa(dy))
+
+		if i < numSteps {
+			delay := smoothStepDelay(i, numSteps, baseDelayMs*2, baseDelayMs/2)
+			jitter := delay + rand.Intn(5) - 2
+			if jitter < 3 {
+				jitter = 3
+			}
+			args = append(args, "sleep", fmt.Sprintf("%.3f", float64(jitter)/1000.0))
+		}
+	}
+
+	if len(args) > 0 {
+		log.Info("executing xdotool (smooth drag move)", "steps", numSteps, "segments", len(body.Path)-1)
+		if output, err := defaultXdoTool.Run(ctx, args...); err != nil {
+			log.Error("xdotool smooth drag move failed", "err", err, "output", string(output))
+			return &executionError{msg: "failed during smooth drag movement"}
+		}
+	}
+
+	log.Info("executed smooth drag movement", "points", len(points), "segments", len(body.Path)-1)
+	return nil
+}
+
+// smoothStepDelay maps position i/n through a smoothstep curve to produce
+// a delay in [fastMs, slowMs]. Slow at start and end, fast in the middle.
+// smoothstep(t) = 3t² - 2t³
+func smoothStepDelay(i, n, slowMs, fastMs int) int {
+	if n <= 1 {
+		return slowMs
+	}
+	t := float64(i) / float64(n)
+	// Remap t so that 0 and 1 map to 1 (slow) and 0.5 maps to 0 (fast).
+	// Use distance from center: d = |2t - 1|, then smoothstep on d.
+	d := math.Abs(2*t - 1)
+	s := d * d * (3 - 2*d) // smoothstep
+	return fastMs + int(float64(slowMs-fastMs)*s)
+}
+
+func (s *ApiService) DragMouse(ctx context.Context, request oapi.DragMouseRequestObject) (oapi.DragMouseResponseObject, error) {
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	if request.Body == nil {
+		return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"}}, nil
+	}
+	if err := s.doDragMouse(ctx, *request.Body); err != nil {
+		if isValidationErr(err) {
+			return oapi.DragMouse400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		return oapi.DragMouse500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+	return oapi.DragMouse200Response{}, nil
+}
+
+const maxSleepDurationMs = 30_000
+
+// sleepWithContext pauses for the given duration, returning early if the context is cancelled.
+// This should be used instead of time.Sleep when holding the inputMu mutex, so that context
+// cancellation can promptly release the lock.
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *ApiService) doSleep(ctx context.Context, body oapi.SleepAction) error {
+	if body.DurationMs < 0 {
+		return &validationError{msg: "duration_ms must be >= 0"}
+	}
+	if body.DurationMs > maxSleepDurationMs {
+		return &validationError{msg: fmt.Sprintf("duration_ms must be <= %d", maxSleepDurationMs)}
+	}
+
+	if err := sleepWithContext(ctx, time.Duration(body.DurationMs)*time.Millisecond); err != nil {
+		return &executionError{msg: fmt.Sprintf("sleep interrupted: %s", err)}
+	}
+	return nil
+}
+
+func (s *ApiService) BatchComputerAction(ctx context.Context, request oapi.BatchComputerActionRequestObject) (oapi.BatchComputerActionResponseObject, error) {
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	if request.Body == nil {
+		return oapi.BatchComputerAction400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"},
 		}, nil
 	}
 
-	return oapi.DragMouse200Response{}, nil
+	actions := request.Body.Actions
+	if len(actions) == 0 {
+		return oapi.BatchComputerAction400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "actions must contain at least one action"},
+		}, nil
+	}
+
+	for i, action := range actions {
+		var err error
+		switch action.Type {
+		case oapi.ClickMouse:
+			if action.ClickMouse == nil {
+				err = &validationError{msg: "click_mouse field is required when type is click_mouse"}
+			} else {
+				err = s.doClickMouse(ctx, *action.ClickMouse)
+			}
+		case oapi.MoveMouse:
+			if action.MoveMouse == nil {
+				err = &validationError{msg: "move_mouse field is required when type is move_mouse"}
+			} else {
+				err = s.doMoveMouse(ctx, *action.MoveMouse)
+			}
+		case oapi.TypeText:
+			if action.TypeText == nil {
+				err = &validationError{msg: "type_text field is required when type is type_text"}
+			} else {
+				err = s.doTypeText(ctx, *action.TypeText)
+			}
+		case oapi.PressKey:
+			if action.PressKey == nil {
+				err = &validationError{msg: "press_key field is required when type is press_key"}
+			} else {
+				err = s.doPressKey(ctx, *action.PressKey)
+			}
+		case oapi.Scroll:
+			if action.Scroll == nil {
+				err = &validationError{msg: "scroll field is required when type is scroll"}
+			} else {
+				err = s.doScroll(ctx, *action.Scroll)
+			}
+		case oapi.DragMouse:
+			if action.DragMouse == nil {
+				err = &validationError{msg: "drag_mouse field is required when type is drag_mouse"}
+			} else {
+				err = s.doDragMouse(ctx, *action.DragMouse)
+			}
+		case oapi.SetCursor:
+			if action.SetCursor == nil {
+				err = &validationError{msg: "set_cursor field is required when type is set_cursor"}
+			} else {
+				err = s.doSetCursor(ctx, *action.SetCursor)
+			}
+		case oapi.Sleep:
+			if action.Sleep == nil {
+				err = &validationError{msg: "sleep field is required when type is sleep"}
+			} else {
+				err = s.doSleep(ctx, *action.Sleep)
+			}
+		default:
+			err = &validationError{msg: fmt.Sprintf("unsupported action type: %s", action.Type)}
+		}
+
+		if err != nil {
+			msg := fmt.Sprintf("actions[%d] (%s): %s", i, action.Type, err.Error())
+			if isValidationErr(err) {
+				return oapi.BatchComputerAction400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: msg}}, nil
+			}
+			return oapi.BatchComputerAction500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: msg}}, nil
+		}
+	}
+
+	return oapi.BatchComputerAction200Response{}, nil
+}
+
+// clampPoints constrains each trajectory point to [0, screenWidth-1] x [0, screenHeight-1].
+func clampPoints(points [][2]int, screenWidth, screenHeight int) {
+	maxX := screenWidth - 1
+	maxY := screenHeight - 1
+	for i := range points {
+		if points[i][0] < 0 {
+			points[i][0] = 0
+		} else if points[i][0] > maxX {
+			points[i][0] = maxX
+		}
+		if points[i][1] < 0 {
+			points[i][1] = 0
+		} else if points[i][1] > maxY {
+			points[i][1] = maxY
+		}
+	}
+}
+
+func (s *ApiService) ReadClipboard(ctx context.Context, request oapi.ReadClipboardRequestObject) (oapi.ReadClipboardResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	display := s.resolveDisplayFromEnv()
+	cmd := exec.CommandContext(ctx, "xclip", "-selection", "clipboard", "-o")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("DISPLAY=%s", display))
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return oapi.ReadClipboard200JSONResponse{Text: ""}, nil
+		}
+		log.Error("xclip read failed", "err", err)
+		return oapi.ReadClipboard500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+			Message: fmt.Sprintf("failed to read clipboard: %v", err)},
+		}, nil
+	}
+	return oapi.ReadClipboard200JSONResponse{Text: string(output)}, nil
+}
+
+func (s *ApiService) WriteClipboard(ctx context.Context, request oapi.WriteClipboardRequestObject) (oapi.WriteClipboardResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+
+	if request.Body == nil {
+		return oapi.WriteClipboard400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
+			Message: "request body is required"},
+		}, nil
+	}
+
+	display := s.resolveDisplayFromEnv()
+	cmd := exec.CommandContext(ctx, "xclip", "-selection", "clipboard")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("DISPLAY=%s", display))
+	cmd.Stdin = strings.NewReader(request.Body.Text)
+	if err := cmd.Run(); err != nil {
+		log.Error("xclip write failed", "err", err)
+		return oapi.WriteClipboard500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
+			Message: fmt.Sprintf("failed to write to clipboard: %v", err)},
+		}, nil
+	}
+	return oapi.WriteClipboard200Response{}, nil
 }
 
 // generateRelativeSteps produces a sequence of relative steps that approximate a

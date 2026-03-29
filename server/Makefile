@@ -19,7 +19,7 @@ $(OAPI_CODEGEN): | $(BIN_DIR)
 # 2. Run oapi-codegen with our config
 # 3. go mod tidy to pull deps
 oapi-generate: $(OAPI_CODEGEN)
-	pnpm i -g @apiture/openapi-down-convert
+	npm i -g @apiture/openapi-down-convert
 	openapi-down-convert --input openapi.yaml --output openapi-3.0.yaml
 	$(OAPI_CODEGEN) -config ./oapi-codegen.yaml ./openapi-3.0.yaml
 	@echo "Fixing oapi-codegen issue https://github.com/oapi-codegen/oapi-codegen/issues/1764..."
@@ -33,11 +33,14 @@ build: | $(BIN_DIR)
 dev: build $(RECORDING_DIR)
 	OUTPUT_DIR=$(RECORDING_DIR) DISPLAY_NUM=$(DISPLAY_NUM) ./bin/api
 
+# we run the e2e tests separately so that we can see the logs from the e2e tests as they run instead of waiting for all tests to complete
 test:
 	go vet ./...
-	# Run tests sequentially (-p 1) to avoid port conflicts in e2e tests
-	# (all e2e tests bind to the same ports: 10001, 9222)
-	go test -v -race -p 1 ./...
+	go test -v -race $$(go list ./... | grep -v /e2e$$)
+	@echo ""
+	@echo "=== Running e2e tests (testcontainers — this may take a few minutes) ==="
+	@echo ""
+	go test -v -race ./e2e/
 
 clean:
 	@rm -rf $(BIN_DIR)

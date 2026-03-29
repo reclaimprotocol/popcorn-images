@@ -385,6 +385,19 @@ paths:
           $ref: "#/components/responses/BadRequestError"
         "500":
           $ref: "#/components/responses/InternalError"
+  /computer/get_mouse_position:
+    post:
+      summary: Get the current mouse cursor position on the host computer
+      operationId: getMousePosition
+      responses:
+        "200":
+          description: Current mouse position
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MousePositionResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /computer/type:
     post:
       summary: Type text on the host computer
@@ -462,6 +475,59 @@ paths:
       responses:
         "200":
           description: Drag performed
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /computer/batch:
+    post:
+      summary: Execute a batch of computer actions sequentially
+      description: |
+        Execute an ordered list of computer actions in a single API call. Actions are performed
+        sequentially while holding an exclusive lock, so no other input operations can interleave.
+        Execution stops on the first error and the response indicates which action failed.
+        This is useful for chaining deterministic sequences of mouse and keyboard actions
+        without paying network round-trip latency for each individual action.
+      operationId: batchComputerAction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchComputerActionRequest"
+      responses:
+        "200":
+          description: Batch executed successfully
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /computer/clipboard/read:
+    post:
+      summary: Read text from the system clipboard
+      operationId: readClipboard
+      responses:
+        "200":
+          description: Clipboard content read successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClipboardContent"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /computer/clipboard/write:
+    post:
+      summary: Write text to the system clipboard
+      operationId: writeClipboard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteClipboardRequest"
+      responses:
+        "200":
+          description: Text written to clipboard successfully
         "400":
           $ref: "#/components/responses/BadRequestError"
         "500":
@@ -1039,6 +1105,43 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /chromium/policies:
+    patch:
+      summary: Update Chromium enterprise policies and restart
+      description: |
+        Merge user-provided Chromium enterprise policy overrides into the base policy.json,
+        restart Chromium via supervisord, and wait until the Chromium DevTools "listening"
+        log line is observed before returning success.
+        Certain policies managed by kernel infrastructure (e.g. ExtensionSettings,
+        proxy-related policies, and policies required for CDP/automation) are blocked
+        from override.
+      operationId: patchChromiumPolicies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: |
+                Chromium enterprise policy overrides. Keys are policy names
+                (e.g. "DefaultCookiesSetting") and values are the policy values.
+                See https://chromeenterprise.google/policies/ for available policies.
+              additionalProperties: true
+              example:
+                DefaultCookiesSetting: 1
+                BasicAuthOverHttpEnabled: true
+                HttpsUpgradesEnabled: false
+                MaxConnectionsPerProxy: 32
+                PopupsAllowedForUrls:
+                  - "https://example.com"
+      responses:
+        "200":
+          description: Policies updated and Chromium restarted successfully
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /chromium/flags:
     patch:
       summary: Update Chromium launch flags and restart
@@ -1087,6 +1190,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExecutePlaywrightResult"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /reclaim/prove:
+    post:
+      summary: Execute TEE+MPC proof protocol to generate a verifiable claim
+      description: |
+        Executes the complete Reclaim TEE+MPC protocol to prove data from an HTTPS endpoint.
+        The protocol connects to TEE_K and TEE_T services, performs a TLS handshake with the target,
+        and generates a cryptographically signed claim that can be verified on-chain.
+      operationId: reclaimProve
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReclaimProveRequest"
+      responses:
+        "200":
+          description: Proof completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReclaimProveResult"
         "400":
           $ref: "#/components/responses/BadRequestError"
         "500":
@@ -1196,6 +1324,15 @@ components:
           description: Modifier keys to hold during the move
           items:
             type: string
+        smooth:
+          type: boolean
+          description: Use human-like Bezier curve path instead of instant mouse movement.
+          default: true
+        duration_ms:
+          type: integer
+          description: Target total duration in milliseconds for the mouse movement when smooth=true. Omit for automatic timing based on distance.
+          minimum: 50
+          maximum: 5000
       additionalProperties: false
     ScreenshotRegion:
       type: object
@@ -1233,6 +1370,18 @@ components:
           type: boolean
           description: Whether the cursor should be hidden
       additionalProperties: false
+    MousePositionResponse:
+      type: object
+      required:
+        - x
+        - y
+      properties:
+        x:
+          type: integer
+          description: X coordinate of the cursor
+        y:
+          type: integer
+          description: Y coordinate of the cursor
     TypeTextRequest:
       type: object
       required:
@@ -1246,6 +1395,24 @@ components:
           description: Delay in milliseconds between keystrokes
           minimum: 0
           default: 0
+      additionalProperties: false
+    ClipboardContent:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: Current clipboard text content
+      additionalProperties: false
+    WriteClipboardRequest:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: Text to write to the system clipboard
       additionalProperties: false
     PressKeyRequest:
       type: object
@@ -1323,14 +1490,23 @@ components:
           default: 0
         steps_per_segment:
           type: integer
-          description: Number of relative move steps per segment in the path. Minimum 1.
+          description: Number of relative move steps per segment in the path. Ignored when smooth=true. Minimum 1.
           minimum: 1
           default: 10
         step_delay_ms:
           type: integer
-          description: Delay in milliseconds between relative steps while dragging (not the initial delay).
+          description: Delay in milliseconds between relative steps while dragging. Ignored when smooth=true.
           minimum: 0
           default: 50
+        smooth:
+          type: boolean
+          description: Use human-like Bezier curves between path waypoints instead of linear interpolation. When true, steps_per_segment and step_delay_ms are ignored.
+          default: true
+        duration_ms:
+          type: integer
+          description: Target total duration in milliseconds for the entire drag movement when smooth=true. Omit for automatic timing based on total path length.
+          minimum: 50
+          maximum: 10000
         hold_keys:
           type: array
           description: Modifier keys to hold during the drag
@@ -1721,6 +1897,129 @@ components:
         stderr:
           type: string
           description: Standard error from the execution
+      additionalProperties: false
+    ReclaimProveRequest:
+      type: object
+      description: Request to execute TEE+MPC proof protocol
+      required: [provider_params_json]
+      properties:
+        provider_params_json:
+          type: string
+          description: |
+            JSON-encoded provider parameters containing the target URL, HTTP method,
+            response matching rules, and redaction specifications.
+            Example: {"name":"http","params":{"url":"https://example.com","method":"GET"}}
+        config_json:
+          type: string
+          description: |
+            Optional JSON config to override default TEE service URLs.
+            Example: {"teekUrl":"wss://custom-tee-k.example.com/ws"}
+      additionalProperties: false
+    ReclaimProveResult:
+      type: object
+      description: Result of TEE+MPC proof protocol execution
+      required: [session_id, claim, signature]
+      properties:
+        session_id:
+          type: string
+          maxLength: 100
+          description: Unique session/request identifier for this proof execution
+        claim:
+          $ref: "#/components/schemas/ReclaimClaim"
+        signature:
+          $ref: "#/components/schemas/ReclaimSignature"
+      additionalProperties: false
+    ReclaimClaim:
+      type: object
+      description: The verified claim data from the attestor
+      properties:
+        provider:
+          type: string
+          description: Name of the provider (e.g., "http")
+        parameters:
+          type: string
+          description: Canonically JSON stringified parameters of the claim
+        owner:
+          type: string
+          description: Owner address/public key of the claim
+        timestamp_s:
+          type: integer
+          description: Unix timestamp in seconds when the claim was made
+        context:
+          type: string
+          description: Additional context data stored with the claim (JSON string)
+        identifier:
+          type: string
+          description: Unique identifier of the claim (hash of provider, parameters, context)
+        epoch:
+          type: integer
+          description: Beacon epoch number (legacy)
+      additionalProperties: false
+    ReclaimSignature:
+      type: object
+      description: Cryptographic signatures from the attestor
+      properties:
+        attestor_address:
+          type: string
+          description: Ethereum address of the attestor that signed the claim
+        claim_signature:
+          type: string
+          description: Base64-encoded signature of the claim data
+        result_signature:
+          type: string
+          description: Base64-encoded signature of the complete response
+      additionalProperties: false
+    SleepAction:
+      type: object
+      description: Pause execution for a specified duration.
+      required: [duration_ms]
+      properties:
+        duration_ms:
+          type: integer
+          description: Duration to sleep in milliseconds.
+          minimum: 0
+          maximum: 30000
+      additionalProperties: false
+    ComputerAction:
+      type: object
+      description: |
+        A single computer action to execute as part of a batch. The `type` field selects which
+        action to perform, and the corresponding field contains the action parameters.
+        Exactly one action field matching the type must be provided.
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: The type of action to perform.
+          enum: [click_mouse, move_mouse, type_text, press_key, scroll, drag_mouse, set_cursor, sleep]
+        click_mouse:
+          $ref: "#/components/schemas/ClickMouseRequest"
+        move_mouse:
+          $ref: "#/components/schemas/MoveMouseRequest"
+        type_text:
+          $ref: "#/components/schemas/TypeTextRequest"
+        press_key:
+          $ref: "#/components/schemas/PressKeyRequest"
+        scroll:
+          $ref: "#/components/schemas/ScrollRequest"
+        drag_mouse:
+          $ref: "#/components/schemas/DragMouseRequest"
+        set_cursor:
+          $ref: "#/components/schemas/SetCursorRequest"
+        sleep:
+          $ref: "#/components/schemas/SleepAction"
+      additionalProperties: false
+    BatchComputerActionRequest:
+      type: object
+      description: A batch of computer actions to execute sequentially.
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          description: Ordered list of actions to execute. Execution stops on the first error.
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ComputerAction"
       additionalProperties: false
   responses:
     BadRequestError:

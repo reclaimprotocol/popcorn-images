@@ -159,6 +159,76 @@ func TestWebSocketProxyHandler_ProxiesEcho(t *testing.T) {
 	}
 }
 
+func TestDialUpstreamWithRetry_RechecksCurrentAfterMissedUpdate(t *testing.T) {
+	// Start a working websocket upstream.
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			OriginPatterns: []string{"*"},
+		})
+		if err != nil {
+			t.Fatalf("accept failed: %v", err)
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "")
+
+		mt, msg, err := c.Read(r.Context())
+		if err != nil {
+			return
+		}
+		if err := c.Write(r.Context(), mt, msg); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+	}))
+	defer upstreamSrv.Close()
+
+	freshURL, err := url.Parse(upstreamSrv.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	freshURL.Scheme = "ws"
+	freshURL.Path = "/devtools/browser/fresh"
+
+	stalePort, err := getFreePort()
+	if err != nil {
+		t.Fatalf("get stale port: %v", err)
+	}
+	staleURL := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/stale", stalePort)
+
+	logger := silentLogger()
+	mgr := NewUpstreamManager("/dev/null", logger)
+	urlCh, cancel := mgr.Subscribe()
+	defer cancel()
+
+	// Simulate the race window by advancing Current without broadcasting to the
+	// subscriber channel. The retry path must re-check Current after the stale
+	// dial fails instead of waiting forever for a missed notification.
+	mgr.currentURL.Store(freshURL.String())
+
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ctxCancel()
+
+	conn, connectedURL, err := dialUpstreamWithRetry(ctx, mgr, urlCh, staleURL, nil, logger)
+	if err != nil {
+		t.Fatalf("dialUpstreamWithRetry failed: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if connectedURL != freshURL.String() {
+		t.Fatalf("expected to connect to %q, got %q", freshURL.String(), connectedURL)
+	}
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte("ping")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	_, msg, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(msg) != "ping" {
+		t.Fatalf("expected echo %q, got %q", "ping", string(msg))
+	}
+}
+
 func TestUpstreamManagerDetectsChromiumAndRestart(t *testing.T) {
 	browser, err := findBrowserBinary()
 	if err != nil {
@@ -189,7 +259,7 @@ func TestUpstreamManagerDetectsChromiumAndRestart(t *testing.T) {
 
 	startChromium := func(port int) (*exec.Cmd, error) {
 		userDir := t.TempDir()
-		args := []string{
+		chromiumArgs := []string{
 			"--headless=new",
 			"--remote-debugging-address=127.0.0.1",
 			fmt.Sprintf("--remote-debugging-port=%d", port),
@@ -203,8 +273,22 @@ func TestUpstreamManagerDetectsChromiumAndRestart(t *testing.T) {
 			fmt.Sprintf("--user-data-dir=%s", userDir),
 			"about:blank",
 		}
-		t.Logf("starting chromium: %s %v", browser, args)
-		cmd := exec.Command(browser, args...)
+
+		// Use stdbuf to force line-buffering on stderr so the "DevTools listening"
+		// line is flushed immediately. Without this, output to a file may be fully
+		// buffered and the line might not appear until the buffer fills or the
+		// process exits, causing the test to flake in CI.
+		var cmd *exec.Cmd
+		if stdbufPath, err := exec.LookPath("stdbuf"); err == nil {
+			// stdbuf -oL -eL: line-buffer stdout (-oL) and stderr (-eL)
+			args := append([]string{"-oL", "-eL", browser}, chromiumArgs...)
+			t.Logf("starting chromium via stdbuf: %s %v", stdbufPath, args)
+			cmd = exec.Command(stdbufPath, args...)
+		} else {
+			t.Logf("stdbuf not found, starting chromium directly: %s %v", browser, chromiumArgs)
+			cmd = exec.Command(browser, chromiumArgs...)
+		}
+
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
 		if err := cmd.Start(); err != nil {

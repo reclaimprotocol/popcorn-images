@@ -21,9 +21,24 @@ type Config struct {
 	PathToFFmpeg string `envconfig:"FFMPEG_PATH" default:"ffmpeg"`
 
 	// DevTools proxy configuration
-	LogCDPMessages bool `envconfig:"LOG_CDP_MESSAGES" default:"false"`
+	DevToolsProxyPort int  `envconfig:"DEVTOOLS_PROXY_PORT" default:"9222"`
+	LogCDPMessages    bool `envconfig:"LOG_CDP_MESSAGES" default:"false"`
 
-	// Note: Port 9222 is restricted CDP (filtered), port 9224 is for WebDriver/BiDi, port 9226 is internal/full CDP
+	// ChromeDriver proxy: external port where the proxy listens.
+	ChromeDriverProxyPort int `envconfig:"CHROMEDRIVER_PROXY_PORT" default:"9224"`
+	// Internal ChromeDriver upstream used by the ChromeDriver proxy.
+	ChromeDriverUpstreamAddr string `envconfig:"CHROMEDRIVER_UPSTREAM_ADDR" default:"127.0.0.1:9225"`
+	// DevTools proxy address passed to ChromeDriver as goog:chromeOptions.debuggerAddress.
+	// If empty, it is derived from DevToolsProxyPort as 127.0.0.1:<port>.
+	DevToolsProxyAddr string `envconfig:"DEVTOOLS_PROXY_ADDR" default:""`
+
+	// Internal CDP proxy (port 9226) - unrestricted, full CDP access for internal services
+	// Note: Port 9222 is restricted CDP (filtered), port 9224 is WebDriver/BiDi, port 9226 is internal/full CDP
+
+	// Reclaim TEE configuration
+	TEEKUrl     string `envconfig:"TEE_K_URL" default:"wss://tk.reclaimprotocol.org/ws"`
+	TEETUrl     string `envconfig:"TEE_T_URL" default:"wss://tt.reclaimprotocol.org/ws"`
+	AttestorUrl string `envconfig:"ATTESTOR_URL" default:"wss://attestor.reclaimprotocol.org:444/ws"`
 }
 
 // Load loads configuration from environment variables
@@ -31,6 +46,9 @@ func Load() (*Config, error) {
 	var config Config
 	if err := envconfig.Process("", &config); err != nil {
 		return nil, err
+	}
+	if config.DevToolsProxyAddr == "" {
+		config.DevToolsProxyAddr = fmt.Sprintf("127.0.0.1:%d", config.DevToolsProxyPort)
 	}
 	if err := validate(&config); err != nil {
 		return nil, err
@@ -54,6 +72,12 @@ func validate(config *Config) error {
 	}
 	if config.PathToFFmpeg == "" {
 		return fmt.Errorf("FFMPEG_PATH is required")
+	}
+	if config.ChromeDriverUpstreamAddr == "" {
+		return fmt.Errorf("CHROMEDRIVER_UPSTREAM_ADDR is required")
+	}
+	if config.DevToolsProxyAddr == "" {
+		return fmt.Errorf("DEVTOOLS_PROXY_ADDR is required")
 	}
 
 	return nil

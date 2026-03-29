@@ -26,8 +26,10 @@
           @touchmove.stop.prevent="onTouchHandler"
           @touchstart.stop.prevent="onTouchHandler"
           @touchend.stop.prevent="onTouchHandler"
+          @paste.stop.prevent="onPaste"
+          @focus="onOverlayFocus"
         />
-<!-- KERNEL
+        <!-- KERNEL
         <div v-if="!playing && playable" class="player-overlay" @click.stop.prevent="playAndUnmute">
           <i class="fas fa-play-circle" />
         </div>
@@ -259,6 +261,7 @@
     private focused = false
     private fullscreen = false
     private mutedOverlay = true
+    private isVideoSyncing = false
 
     // CDP state
     private cdpSocket: WebSocket | null = null
@@ -434,8 +437,6 @@
       }
     }
 
-    private isVideoSyncing = false;
-
     @Watch('playing')
     async onPlayingChanged(playing: boolean) {
       // In Safari, native events can fire slightly before the `video.paused` property flips.
@@ -528,16 +529,16 @@
       })
 
       this._video.addEventListener('playing', () => {
-        this.isVideoSyncing = true;
+        this.isVideoSyncing = true
         this.$accessor.video.play()
-        this.$nextTick(() => { this.isVideoSyncing = false; })
+        this.$nextTick(() => { this.isVideoSyncing = false })
       })
 
       this._video.addEventListener('pause', () => {
-        this.isVideoSyncing = true;
+        this.isVideoSyncing = true
         this.$accessor.video.pause()
-        this.$nextTick(() => { this.isVideoSyncing = false; })
-      });
+        this.$nextTick(() => { this.isVideoSyncing = false })
+      })
 
       /* Initialize Guacamole Keyboard */
       this.keyboard.onkeydown = (key: number) => {
@@ -546,7 +547,12 @@
         }
 
         this.$client.sendData('keydown', { key: this.keyMap(key) })
-        return false
+
+        // Allow Ctrl/Cmd+V through so the browser fires a paste event,
+        // which triggers onPaste -> syncClipboard (required for Safari
+        // clipboard access since it only permits reads in user-initiated events)
+        const { ctrl, meta } = this.keyboard.modifiers
+        return key === 0x0076 && !!(ctrl || meta)
       }
       this.keyboard.onkeyup = (key: number) => {
         if (!this.hosting || this.locked) {
@@ -785,11 +791,8 @@
       let x = e.deltaX
       let y = e.deltaY
 
-      // Pixel units unless it's non-zero.
-      // Note that if deltamode is line or page won't matter since we aren't
-      // sending the mouse wheel delta to the server anyway.
-      // The difference between pixel and line can be important however since
-      // we have a threshold that can be smaller than the line height.
+      // Normalize to pixel units. deltaMode 1 = lines, 2 = pages; convert
+      // both to approximate pixel values so the divisor below works uniformly.
       if (e.deltaMode !== 0) {
         x *= WHEEL_LINE_HEIGHT
         y *= WHEEL_LINE_HEIGHT
@@ -800,8 +803,15 @@
         y = y * -1
       }
 
-      x = Math.min(Math.max(x, -this.scroll), this.scroll)
-      y = Math.min(Math.max(y, -this.scroll), this.scroll)
+      // The server sends one XTestFakeButtonEvent per unit we pass here,
+      // and each event scrolls Chromium by ~120 px. Raw pixel deltas from
+      // trackpads are already in pixels (~120 per notch), so dividing by
+      // PIXELS_PER_TICK converts them to discrete scroll "ticks". The
+      // result is clamped to [-scroll, scroll] (the user-facing sensitivity
+      // setting) so fast swipes don't over-scroll.
+      const PIXELS_PER_TICK = 120
+      x = x === 0 ? 0 : Math.min(Math.max(Math.round(x / PIXELS_PER_TICK) || Math.sign(x), -this.scroll), this.scroll)
+      y = y === 0 ? 0 : Math.min(Math.max(Math.round(y / PIXELS_PER_TICK) || Math.sign(y), -this.scroll), this.scroll)
 
       this.sendMousePos(e)
 
@@ -922,12 +932,26 @@
       this.focused = false
     }
 
+    onPaste() {
+      if (this.hosting) {
+        this.syncClipboard()
+      }
+    }
+
+    onOverlayFocus() {
+      if (this.hosting) {
+        this.syncClipboard()
+      }
+    }
+
     onResize() {
       const { offsetWidth, offsetHeight } = !this.fullscreen ? this._component : document.body
       this._player.style.width = `${offsetWidth}px`
       this._player.style.height = `${offsetHeight}px`
       const aspectPreservingMaxWidth = (this.horizontal / this.vertical) * offsetHeight
-      this._container.style.maxWidth = `${!this.fullscreen ? Math.min(this.width, aspectPreservingMaxWidth) : aspectPreservingMaxWidth}px`
+      this._container.style.maxWidth = `${
+        !this.fullscreen ? Math.min(this.width, aspectPreservingMaxWidth) : aspectPreservingMaxWidth
+      }px`
       this._aspect.style.paddingBottom = `${(this.vertical / this.horizontal) * 100}%`
     }
 

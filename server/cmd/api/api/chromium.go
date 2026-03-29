@@ -21,6 +21,9 @@ import (
 
 var nameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,255}$`)
 
+// chromiumFlagsPath is the runtime flags file read by the chromium-launcher at startup.
+const chromiumFlagsPath = "/chromium/flags"
+
 // UploadExtensionsAndRestart handles multipart upload of one or more extension zips, extracts
 // them under /home/kernel/extensions/<name>, writes /chromium/flags to enable them, restarts
 // Chromium via supervisord, and waits (via UpstreamManager) until DevTools is ready.
@@ -260,10 +263,14 @@ func (s *ApiService) UploadExtensionsAndRestart(ctx context.Context, request oap
 
 	// Build flags overlay file in /chromium/flags, merging with existing flags
 	// Only add --load-extension flags for extensions that don't use policy installation
+	// NOTE: We intentionally do NOT use --disable-extensions-except here because it causes
+	// Chrome to disable external providers (including the policy loader), which prevents
+	// enterprise policy extensions (ExtensionInstallForcelist) from being fetched and installed.
+	// See Chromium source: extension_service.cc - external providers are only created when
+	// extensions_enabled() returns true, which is false when --disable-extensions-except is used.
 	var newTokens []string
 	if len(pathsNeedingFlags) > 0 {
 		newTokens = []string{
-			fmt.Sprintf("--disable-extensions-except=%s", strings.Join(pathsNeedingFlags, ",")),
 			fmt.Sprintf("--load-extension=%s", strings.Join(pathsNeedingFlags, ",")),
 		}
 	}
@@ -287,14 +294,12 @@ func (s *ApiService) UploadExtensionsAndRestart(ctx context.Context, request oap
 }
 
 // mergeAndWriteChromiumFlags reads existing flags, merges them with new flags,
-// and writes the result back to /chromium/flags. Returns the merged tokens or an error.
+// and writes the result back to chromiumFlagsPath. Returns the merged tokens or an error.
 func (s *ApiService) mergeAndWriteChromiumFlags(ctx context.Context, newTokens []string) ([]string, error) {
 	log := logger.FromContext(ctx)
 
-	const flagsPath = "/chromium/flags"
-
-	// Read existing runtime flags from /chromium/flags (if any)
-	existingTokens, err := chromiumflags.ReadOptionalFlagFile(flagsPath)
+	// Read existing runtime flags (if any)
+	existingTokens, err := chromiumflags.ReadOptionalFlagFile(chromiumFlagsPath)
 	if err != nil {
 		log.Error("failed to read existing flags", "error", err)
 		return nil, fmt.Errorf("failed to read existing flags: %w", err)
@@ -305,20 +310,25 @@ func (s *ApiService) mergeAndWriteChromiumFlags(ctx context.Context, newTokens [
 	// Merge existing flags with new flags using token-aware API
 	mergedTokens := chromiumflags.MergeFlags(existingTokens, newTokens)
 
-	// Ensure the chromium directory exists
-	if err := os.MkdirAll("/chromium", 0o755); err != nil {
-		log.Error("failed to create chromium dir", "error", err)
-		return nil, fmt.Errorf("failed to create chromium dir: %w", err)
-	}
-
-	// Write flags file with merged flags
-	if err := chromiumflags.WriteFlagFile(flagsPath, mergedTokens); err != nil {
+	if err := writeChromiumFlags(mergedTokens); err != nil {
 		log.Error("failed to write flags", "error", err)
-		return nil, fmt.Errorf("failed to write flags: %w", err)
+		return nil, err
 	}
 
 	log.Info("flags written", "merged", mergedTokens)
 	return mergedTokens, nil
+}
+
+// writeChromiumFlags ensures the /chromium directory exists and writes tokens
+// to chromiumFlagsPath. Shared by mergeAndWriteChromiumFlags and ensureAppMode.
+func writeChromiumFlags(tokens []string) error {
+	if err := os.MkdirAll("/chromium", 0o755); err != nil {
+		return fmt.Errorf("failed to create chromium dir: %w", err)
+	}
+	if err := chromiumflags.WriteFlagFile(chromiumFlagsPath, tokens); err != nil {
+		return fmt.Errorf("failed to write flags file: %w", err)
+	}
+	return nil
 }
 
 // restartChromiumAndWait restarts Chromium via supervisorctl and waits for DevTools to be ready.
@@ -358,6 +368,40 @@ func (s *ApiService) restartChromiumAndWait(ctx context.Context, operation strin
 		log.Info("devtools not ready in time", "operation", operation, "elapsed", time.Since(start).String())
 		return fmt.Errorf("devtools not ready in time")
 	}
+}
+
+// PatchChromiumPolicies applies user-provided Chromium enterprise policy overrides
+// to policy.json, restarts Chromium, and waits for DevTools to be ready.
+func (s *ApiService) PatchChromiumPolicies(ctx context.Context, request oapi.PatchChromiumPoliciesRequestObject) (oapi.PatchChromiumPoliciesResponseObject, error) {
+	log := logger.FromContext(ctx)
+	start := time.Now()
+	log.Info("patch chromium policies: begin")
+
+	if request.Body == nil || len(*request.Body) == 0 {
+		return oapi.PatchChromiumPolicies400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: "request body required with at least one policy"}}, nil
+	}
+
+	overrides, err := policy.NewChromiumPolicyOverrides(map[string]interface{}(*request.Body))
+	if err != nil {
+		return oapi.PatchChromiumPolicies400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+	}
+
+	if err := s.policy.ApplyOverrides(overrides); err != nil {
+		if strings.Contains(err.Error(), "invalid chromium policy overrides") || strings.Contains(err.Error(), "cannot be overridden") {
+			return oapi.PatchChromiumPolicies400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
+		}
+		log.Error("failed to apply policy overrides", "error", err)
+		return oapi.PatchChromiumPolicies500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+
+	log.Info("policy overrides applied, restarting chromium")
+
+	if err := s.restartChromiumAndWait(ctx, "policy update"); err != nil {
+		return oapi.PatchChromiumPolicies500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: err.Error()}}, nil
+	}
+
+	log.Info("devtools ready after policy update", "elapsed", time.Since(start).String())
+	return oapi.PatchChromiumPolicies200Response{}, nil
 }
 
 // PatchChromiumFlags handles updating Chromium launch flags at runtime.

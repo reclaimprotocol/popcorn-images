@@ -1,8 +1,11 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,5 +50,161 @@ func TestGenerateRelativeSteps_DiagonalsAndSlopes(t *testing.T) {
 		require.Equal(t, c.dx, sx, "sum mismatch dx")
 		require.Equal(t, c.dy, sy, "sum mismatch dy")
 		require.Equal(t, 5, countSteps(steps), "count mismatch")
+	}
+}
+
+// TestParseMousePosition tests the parseMousePosition helper function
+func TestParseMousePosition(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		expectX     int
+		expectY     int
+		expectError bool
+	}{
+		{
+			name:        "valid output",
+			output:      "X=100\nY=200\nSCREEN=0\nWINDOW=12345\n",
+			expectX:     100,
+			expectY:     200,
+			expectError: false,
+		},
+		{
+			name:        "valid output with extra whitespace",
+			output:      "  X=512  \n  Y=384  \n  SCREEN=0  \n  WINDOW=67890  \n",
+			expectX:     512,
+			expectY:     384,
+			expectError: false,
+		},
+		{
+			name:        "missing Y coordinate",
+			output:      "X=100\nSCREEN=0\nWINDOW=12345\n",
+			expectError: true,
+		},
+		{
+			name:        "missing X coordinate",
+			output:      "Y=200\nSCREEN=0\nWINDOW=12345\n",
+			expectError: true,
+		},
+		{
+			name:        "empty output",
+			output:      "",
+			expectError: true,
+		},
+		{
+			name:        "whitespace only",
+			output:      "   \n  \t  \n",
+			expectError: true,
+		},
+		{
+			name:        "non-numeric X value",
+			output:      "X=abc\nY=200\nSCREEN=0\nWINDOW=12345\n",
+			expectError: true,
+		},
+		{
+			name:        "non-numeric Y value",
+			output:      "X=100\nY=xyz\nSCREEN=0\nWINDOW=12345\n",
+			expectError: true,
+		},
+		{
+			name:        "zero coordinates",
+			output:      "X=0\nY=0\nSCREEN=0\nWINDOW=12345\n",
+			expectX:     0,
+			expectY:     0,
+			expectError: false,
+		},
+		{
+			name:        "negative coordinates",
+			output:      "X=-50\nY=-100\nSCREEN=0\nWINDOW=12345\n",
+			expectX:     -50,
+			expectY:     -100,
+			expectError: false,
+		},
+		{
+			name:        "large coordinates",
+			output:      "X=3840\nY=2160\nSCREEN=0\nWINDOW=12345\n",
+			expectX:     3840,
+			expectY:     2160,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			x, y, err := parseMousePosition(tt.output)
+
+			if tt.expectError {
+				require.Error(t, err, "expected parsing to fail")
+			} else {
+				require.NoError(t, err, "expected successful parsing")
+				require.Equal(t, tt.expectX, x, "X coordinate mismatch")
+				require.Equal(t, tt.expectY, y, "Y coordinate mismatch")
+			}
+		})
+	}
+}
+
+func TestValidationError(t *testing.T) {
+	ve := &validationError{msg: "bad input"}
+	assert.Equal(t, "bad input", ve.Error())
+	assert.True(t, isValidationErr(ve))
+
+	// Wrapped validation error should still be detected
+	wrapped := fmt.Errorf("context: %w", ve)
+	assert.True(t, isValidationErr(wrapped))
+}
+
+func TestExecutionError(t *testing.T) {
+	ee := &executionError{msg: "xdotool failed"}
+	assert.Equal(t, "xdotool failed", ee.Error())
+	assert.False(t, isValidationErr(ee))
+
+	// A plain error is not a validation error
+	plain := errors.New("something went wrong")
+	assert.False(t, isValidationErr(plain))
+}
+
+func TestIsValidationErr_Nil(t *testing.T) {
+	assert.False(t, isValidationErr(nil))
+}
+
+func TestClampPoints(t *testing.T) {
+	tests := []struct {
+		name     string
+		points   [][2]int
+		w, h     int
+		expected [][2]int
+	}{
+		{
+			name:     "no clamping needed",
+			points:   [][2]int{{10, 20}, {50, 50}, {100, 80}},
+			w:        200, h: 200,
+			expected: [][2]int{{10, 20}, {50, 50}, {100, 80}},
+		},
+		{
+			name:     "clamp negative x and y",
+			points:   [][2]int{{-10, -20}, {50, 50}},
+			w:        200, h: 200,
+			expected: [][2]int{{0, 0}, {50, 50}},
+		},
+		{
+			name:     "clamp exceeding screen bounds",
+			points:   [][2]int{{50, 50}, {250, 300}},
+			w:        200, h: 200,
+			expected: [][2]int{{50, 50}, {199, 199}},
+		},
+		{
+			name:     "clamp both directions",
+			points:   [][2]int{{-5, 250}, {300, -10}, {100, 100}},
+			w:        200, h: 200,
+			expected: [][2]int{{0, 199}, {199, 0}, {100, 100}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clampPoints(tt.points, tt.w, tt.h)
+			require.Equal(t, tt.expected, tt.points)
+		})
 	}
 }
