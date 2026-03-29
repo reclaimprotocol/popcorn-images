@@ -306,36 +306,39 @@ type wsConn interface {
 
 // createRestrictedFilter returns a filter that only allows safe CDP commands
 func createRestrictedFilter() CommandFilter {
-	// Whitelist of allowed CDP command prefixes
-	allowedPrefixes := []string{
-		"Page.",
-		"Runtime.evaluate",
-		"Runtime.callFunctionOn",
-		"Runtime.getProperties",
-		"DOM.",
-		"Input.",
-		"Network.enable",
-		"Network.disable",
-		"Network.getResponseBody",
-		"Network.getCookies",
-		"Network.setCookie",
-		"Network.deleteCookies",
-		"Target.setDiscoverTargets",
-		"Target.getTargets",
-		"Target.attachToTarget",
-		"Target.setAutoAttach",
-		"Emulation.",
-		"Console.",
-		"Log.",
+	// Whitelist of allowed CDP commands used by the frontend
+	allowedCommands := map[string]bool{
+		// Input - clipboard, scroll and input
+		"Input.insertText":          true,
+		"Input.dispatchKeyEvent":    true,
+		"Input.dispatchMouseEvent":  true,
+		"Input.dispatchTouchEvent":  true,
+
+		// Emulation - viewport resize and visible area
+		"Emulation.setDeviceMetricsOverride":   true,
+		"Emulation.setVisibleSize":             true,
+		"Emulation.setTouchEmulationEnabled":   true,
+		"Emulation.clearDeviceMetricsOverride": true,
+
+		// DOM - replacement for runtime eval to get coordinates
+		"DOM.getNodeForLocation": true,
+		"DOM.describeNode":       true,
+
+		// Browser - CDP health ping
+		"Browser.getVersion": true,
+
+		// Target - detect/attach popup and close popup
+		"Target.setAutoAttach": true,
+		"Target.closeTarget":   true,
+
+		// Page - page spinner events
+		"Page.frameStartedLoading": true,
+		"Page.loadEventFired":      true,
+		"Page.frameNavigated":      true,
 	}
 
 	return func(method string) bool {
-		for _, prefix := range allowedPrefixes {
-			if strings.HasPrefix(method, prefix) {
-				return true
-			}
-		}
-		return false
+		return allowedCommands[method]
 	}
 }
 

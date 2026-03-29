@@ -202,9 +202,7 @@ func main() {
 	// Cached active-element endpoint: reads atomic pointer (~0 latency).
 	rDevtools.Get("/cdp/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: Enable filtering once whitelist is finalized
-		// devtoolsproxy.WebSocketProxyHandlerFiltered(upstreamMgr, slogger, stz).ServeHTTP(w, r)
-		devtoolsproxy.WebSocketProxyHandler(upstreamMgr, slogger, config.LogCDPMessages, stz).ServeHTTP(w, r)
+		devtoolsproxy.WebSocketProxyHandlerFiltered(upstreamMgr, slogger, stz).ServeHTTP(w, r)
 	})
 
 	srvDevtools := &http.Server{
