@@ -584,14 +584,12 @@ func createAllowedCommandsMap() map[string]bool {
 		"Browser.getVersion": true,
 
 		// Target - detect/attach popup and close popup
-		"Target.setAutoAttach": true,
-		"Target.closeTarget":   true,
+		"Target.setAutoAttach":  true,
+		"Target.attachToTarget": true, // Required to bootstrap page-scoped command sessions
+		"Target.closeTarget":    true,
 
-		// Page - page spinner events
-		"Page.enable":              true, // Required to enable Page domain for events
-		"Page.frameStartedLoading": true,
-		"Page.loadEventFired":      true,
-		"Page.frameNavigated":      true,
+		// Page - enable domain to subscribe to page events
+		"Page.enable": true, // Required to enable Page domain for events
 	}
 }
 

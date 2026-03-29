@@ -148,6 +148,27 @@ func main() {
 		fs.ServeHTTP(w, r)
 	})
 
+	// Start the persistent CDP FocusTracker — it polls document.activeElement
+	// every 100ms and caches the result.
+	focusTracker := devtoolsproxy.NewFocusTracker(upstreamMgr, slogger)
+	defer focusTracker.Stop()
+
+	// Expose active-element cache on the primary API router so the gateway
+	// can route to it via the standard `/api/...` path.
+	// CORS is needed so the neko client (port 8080) can sync-XHR to this endpoint.
+	r.Get("/cdp/active-element", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/active-element", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
 		Handler: r,
@@ -183,6 +204,25 @@ func main() {
 	rDevtools.Get("/json/", jsonTargetHandler)
 	rDevtools.Get("/json/list", jsonTargetHandler)
 	rDevtools.Get("/json/list/", jsonTargetHandler)
+
+	// Cached active-element endpoint: reads atomic pointer (~0 latency).
+	// Must use Route (not just Get) to ensure chi matches this before the wildcard WebSocket catch-all below.
+	rDevtools.Route("/cdp", func(r chi.Router) {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				if req.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				next.ServeHTTP(w, req)
+			})
+		})
+		r.Get("/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
+	})
+
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		devtoolsproxy.WebSocketProxyHandlerFiltered(upstreamMgr, slogger, stz).ServeHTTP(w, r)
 	})
