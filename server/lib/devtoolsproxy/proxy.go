@@ -410,26 +410,6 @@ func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ct
 	allowedCommands := createAllowedCommandsMap()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Create a filtering transform that blocks non-whitelisted CDP commands
-		transform := func(direction string, mt websocket.MessageType, msg []byte) []byte {
-			// Only filter client->upstream messages
-			if direction != "->" || mt != websocket.MessageText {
-				return msg
-			}
-
-			var cdpMsg map[string]interface{}
-			if err := json.Unmarshal(msg, &cdpMsg); err == nil {
-				if method, ok := cdpMsg["method"].(string); ok && method != "" {
-					if !allowedCommands[method] {
-						logger.Warn("CDP command blocked by filter", slog.String("method", method))
-						// Return nil to skip forwarding this message
-						return nil
-					}
-				}
-			}
-			return msg
-		}
-
 		acceptOpts := &websocket.AcceptOptions{
 			OriginPatterns:  []string{"*"},
 			CompressionMode: websocket.CompressionContextTakeover,
@@ -504,8 +484,80 @@ func WebSocketProxyHandlerFiltered(mgr *UpstreamManager, logger *slog.Logger, ct
 			})
 		}
 
-		wsproxy.Pump(pumpCtx, clientConn, upstreamConn, cleanup, logger, transform)
+		// Use custom pump with CDP filtering
+		pumpWithCDPFilter(pumpCtx, clientConn, upstreamConn, cleanup, logger, allowedCommands)
 	})
+}
+
+// pumpWithCDPFilter bidirectionally copies messages between client and upstream
+// with filtering on client->upstream direction for CDP commands
+func pumpWithCDPFilter(ctx context.Context, client, upstream *websocket.Conn, onClose func(), logger *slog.Logger, allowedCommands map[string]bool) {
+	errChan := make(chan error, 2)
+
+	// Client -> Upstream (with filtering)
+	go func() {
+		for {
+			mt, msg, err := client.Read(ctx)
+			if err != nil {
+				logger.Error("client read error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+
+			// Filter CDP commands
+			if mt == websocket.MessageText {
+				var cdpMsg map[string]interface{}
+				if err := json.Unmarshal(msg, &cdpMsg); err == nil {
+					if method, ok := cdpMsg["method"].(string); ok && method != "" {
+						if !allowedCommands[method] {
+							logger.Warn("CDP command blocked by filter", slog.String("method", method))
+							// Send error response back to client
+							if id, hasID := cdpMsg["id"]; hasID {
+								errResp := map[string]interface{}{
+									"id":    id,
+									"error": map[string]interface{}{"code": -32000, "message": "Command not allowed"},
+								}
+								if respBytes, err := json.Marshal(errResp); err == nil {
+									_ = client.Write(ctx, websocket.MessageText, respBytes)
+								}
+							}
+							continue
+						}
+					}
+				}
+			}
+
+			if err := upstream.Write(ctx, mt, msg); err != nil {
+				logger.Error("upstream write error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	// Upstream -> Client (no filtering)
+	go func() {
+		for {
+			mt, msg, err := upstream.Read(ctx)
+			if err != nil {
+				logger.Error("upstream read error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+
+			if err := client.Write(ctx, mt, msg); err != nil {
+				logger.Error("client write error", slog.String("err", err.Error()))
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-errChan:
+	}
+	onClose()
 }
 
 // createAllowedCommandsMap returns the whitelist of CDP commands allowed on the restricted endpoint
@@ -524,6 +576,7 @@ func createAllowedCommandsMap() map[string]bool {
 		"Emulation.clearDeviceMetricsOverride": true,
 
 		// DOM - replacement for runtime eval to get coordinates
+		"DOM.enable":             true, // Required to enable DOM domain
 		"DOM.getNodeForLocation": true,
 		"DOM.describeNode":       true,
 
@@ -535,6 +588,7 @@ func createAllowedCommandsMap() map[string]bool {
 		"Target.closeTarget":   true,
 
 		// Page - page spinner events
+		"Page.enable":              true, // Required to enable Page domain for events
 		"Page.frameStartedLoading": true,
 		"Page.loadEventFired":      true,
 		"Page.frameNavigated":      true,

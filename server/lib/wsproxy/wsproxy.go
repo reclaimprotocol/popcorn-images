@@ -47,6 +47,10 @@ func Pump(ctx context.Context, client, upstream Conn, onClose func(), logger *sl
 			}
 			if transform != nil {
 				msg = transform("->", mt, msg)
+				// If transform returns nil, skip forwarding this message (filtered out)
+				if msg == nil {
+					continue
+				}
 			}
 			if err := upstream.Write(ctx, mt, msg); err != nil {
 				logger.Error("upstream write error", slog.String("err", err.Error()))
@@ -66,6 +70,10 @@ func Pump(ctx context.Context, client, upstream Conn, onClose func(), logger *sl
 			}
 			if transform != nil {
 				msg = transform("<-", mt, msg)
+				// If transform returns nil, skip forwarding this message (filtered out)
+				if msg == nil {
+					continue
+				}
 			}
 			if err := client.Write(ctx, mt, msg); err != nil {
 				logger.Error("client write error", slog.String("err", err.Error()))
