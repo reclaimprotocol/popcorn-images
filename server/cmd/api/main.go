@@ -252,7 +252,7 @@ func main() {
 	})
 
 	srvDevtoolsInternal := &http.Server{
-		Addr:    "0.0.0.0:9224",
+		Addr:    "0.0.0.0:9226",
 		Handler: rDevtoolsInternal,
 	}
 

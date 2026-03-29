@@ -22,6 +22,8 @@ type Config struct {
 
 	// DevTools proxy configuration
 	LogCDPMessages bool `envconfig:"LOG_CDP_MESSAGES" default:"false"`
+
+	// Note: Port 9222 is restricted CDP (filtered), port 9224 is for WebDriver/BiDi, port 9226 is internal/full CDP
 }
 
 // Load loads configuration from environment variables
