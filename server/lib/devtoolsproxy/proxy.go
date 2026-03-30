@@ -564,8 +564,9 @@ func pumpWithCDPFilter(ctx context.Context, client, upstream *websocket.Conn, on
 func createAllowedCommandsMap() map[string]bool {
 	return map[string]bool{
 		// Input - clipboard, scroll and input
-		"Input.insertText":         true,
-		"Input.dispatchKeyEvent":   true,
+		"Input.enable":            true, // Required to enable Input domain
+		"Input.insertText":        true,
+		"Input.dispatchKeyEvent":  true,
 		"Input.dispatchMouseEvent": true,
 		"Input.dispatchTouchEvent": true,
 
@@ -575,7 +576,7 @@ func createAllowedCommandsMap() map[string]bool {
 		"Emulation.setTouchEmulationEnabled":   true,
 		"Emulation.clearDeviceMetricsOverride": true,
 
-		// DOM - replacement for runtime eval to get coordinates
+		// DOM - element detection at tap point
 		"DOM.enable":             true, // Required to enable DOM domain
 		"DOM.getNodeForLocation": true,
 		"DOM.describeNode":       true,
@@ -583,13 +584,15 @@ func createAllowedCommandsMap() map[string]bool {
 		// Browser - CDP health ping
 		"Browser.getVersion": true,
 
-		// Target - detect/attach popup and close popup
+		// Target - popup handling, session management
 		"Target.setAutoAttach":  true,
 		"Target.attachToTarget": true, // Required to bootstrap page-scoped command sessions
 		"Target.closeTarget":    true,
+		"Target.getTargets":     true,
 
-		// Page - enable domain to subscribe to page events
+		// Page - navigation and lifecycle events
 		"Page.enable": true, // Required to enable Page domain for events
+		"Page.reload": true,
 	}
 }
 
