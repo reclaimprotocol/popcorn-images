@@ -1,10 +1,10 @@
-FROM docker.io/golang:1.25.3 AS server-builder
+FROM docker.io/golang:1.26 AS server-builder
 WORKDIR /workspace/server
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
-ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-golang1250
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-golang1260
 ENV CGO_ENABLED=1
 
 COPY server/go.mod ./
@@ -149,6 +149,7 @@ EOT
 FROM ghcr.io/kernel/neko/base:3.0.8-v1.4.0 AS neko
 # ^--- now has event.SYSTEM_PONG with legacy support to keepalive
 FROM node:22-bullseye-slim AS node-22
+FROM envoyproxy/envoy:v1.32-latest AS envoy-bin
 FROM docker.io/ubuntu:22.04
 
 # Allow cross-compilation when building with BuildKit platforms
@@ -295,14 +296,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
 # Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
 ARG CHROMEDRIVER_VERSION=
 RUN set -eux; \
-    if [ -z "$CHROMEDRIVER_VERSION" ]; then \
-        CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
-    fi; \
-    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
-    unzip /tmp/cd.zip -d /tmp; \
-    mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
-    chmod +x /usr/local/bin/chromedriver; \
-    rm -rf /tmp/cd.zip /tmp/chromedriver-linux64
+    ARCH=$(dpkg --print-architecture); \
+    if [ "$ARCH" = "arm64" ]; then \
+        echo "ARM64: installing chromedriver from apt (no Chrome for Testing ARM64 builds)"; \
+        apt-get update && apt-get install -y --no-install-recommends chromium-driver && rm -rf /var/lib/apt/lists/*; \
+        ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver; \
+    else \
+        if [ -z "$CHROMEDRIVER_VERSION" ]; then \
+            CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
+        fi; \
+        curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
+        unzip /tmp/cd.zip -d /tmp; \
+        mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
+        chmod +x /usr/local/bin/chromedriver; \
+        rm -rf /tmp/cd.zip /tmp/chromedriver-linux64; \
+    fi
 
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
@@ -359,9 +367,14 @@ COPY images/chromium-headful/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/services/
 COPY shared/envoy/supervisor-envoy.conf /etc/supervisor/conf.d/services/envoy.conf
 
-# Install Envoy proxy
-COPY shared/envoy/install-proxy.sh /usr/local/bin/install-proxy.sh
-RUN chmod +x /usr/local/bin/install-proxy.sh && /usr/local/bin/install-proxy.sh && rm /usr/local/bin/install-proxy.sh
+# Install Envoy proxy binary from official image (bypasses broken apt-key in ubuntu:22.04)
+COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+    apt-get update && \
+    apt-get install -y --no-install-recommends libnss3-tools curl netcat && \
+    apt-get clean -y && \
+    mkdir -p /etc/envoy/templates
 
 # Copy Envoy configuration files
 COPY shared/envoy/bootstrap.yaml /etc/envoy/templates/bootstrap.yaml
