@@ -149,7 +149,6 @@ EOT
 FROM ghcr.io/kernel/neko/base:3.0.8-v1.4.0 AS neko
 # ^--- now has event.SYSTEM_PONG with legacy support to keepalive
 FROM node:22-bullseye-slim AS node-22
-FROM envoyproxy/envoy:v1.32-latest AS envoy-bin
 FROM docker.io/ubuntu:22.04
 
 # Allow cross-compilation when building with BuildKit platforms
@@ -194,7 +193,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     liblzma-dev \
     # Network tools
     net-tools \
-    netcat \
     # PPA req
     software-properties-common && \
     # Userland apps
@@ -365,22 +363,6 @@ RUN chmod +x /images/chromium-headful/start-pulseaudio.sh
 COPY images/chromium-headful/wrapper.sh /wrapper.sh
 COPY images/chromium-headful/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/services/
-COPY shared/envoy/supervisor-envoy.conf /etc/supervisor/conf.d/services/envoy.conf
-
-# Install Envoy proxy binary from official image (bypasses broken apt-key in ubuntu:22.04)
-COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libnss3-tools curl netcat && \
-    apt-get clean -y && \
-    mkdir -p /etc/envoy/templates
-
-# Copy Envoy configuration files
-COPY shared/envoy/bootstrap.yaml /etc/envoy/templates/bootstrap.yaml
-COPY shared/envoy/init-envoy.sh /usr/local/bin/init-envoy.sh
-RUN chmod +x /usr/local/bin/init-envoy.sh
-
 # copy the kernel-images API binary built in the builder stage
 COPY --from=server-builder /out/kernel-images-api /usr/local/bin/kernel-images-api
 COPY --from=server-builder /out/chromium-launcher /usr/local/bin/chromium-launcher
