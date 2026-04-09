@@ -293,11 +293,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
 # Chromedriver and Chromium are not necessarily the same version, but we try to match them.
 # Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
 ARG CHROMEDRIVER_VERSION=
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+    set -eux; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "arm64" ]; then \
         echo "ARM64: installing chromedriver from apt (no Chrome for Testing ARM64 builds)"; \
-        apt-get update && apt-get install -y --no-install-recommends chromium-driver && rm -rf /var/lib/apt/lists/*; \
+        apt-get update && apt-get install -y --no-install-recommends chromium-driver; \
         ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver; \
     else \
         if [ -z "$CHROMEDRIVER_VERSION" ]; then \
