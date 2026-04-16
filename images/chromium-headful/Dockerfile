@@ -107,7 +107,7 @@ FROM ${NEKO_IMAGE} AS neko
 # ^--- now has event.SYSTEM_PONG with legacy support to keepalive
 FROM ${NODE_IMAGE} AS node-22
 FROM ${ARTIFACT_MIRROR_IMAGE} AS artifact-mirror
-FROM ubuntu-snapshot AS runtime
+FROM ubuntu-snapshot AS runtime-base
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
@@ -172,6 +172,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /tmp/ffmpeg* /tmp/artifacts && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+FROM runtime-base AS runtime-checkpoint-1
+
+FROM runtime-base AS runtime-fonts
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
 # Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
 # A minimal container has only 3 fonts, which is a strong fingerprinting signal
 # used by reCAPTCHA Enterprise and other bot detection vendors.
@@ -207,6 +213,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     fc-cache -f && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+FROM runtime-fonts AS runtime-checkpoint-2
+
+FROM runtime-fonts AS runtime-system
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
 # runtime
 ENV USERNAME=root
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
@@ -236,6 +248,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
     chown -R $USERNAME:$USERNAME /home/$USERNAME;
 
+FROM runtime-system AS runtime-checkpoint-3
+
+FROM runtime-system AS runtime-node
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG TYPESCRIPT_VERSION=6.0.2
+ARG PLAYWRIGHT_CORE_VERSION=1.59.1
+ARG PATCHRIGHT_VERSION=1.59.4
+ARG ESBUILD_VERSION=0.28.0
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
 COPY shared/chromium-policies/managed/policy.json /etc/chromium/policies/managed/policy.json
@@ -258,6 +280,12 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g \
     patchright@${PATCHRIGHT_VERSION} \
     esbuild@${ESBUILD_VERSION}
 
+FROM runtime-node AS runtime-checkpoint-4
+
+FROM runtime-node AS runtime-ssh
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
 # Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
 # Only installed, NOT configured: no host keys, no custom config, service not enabled.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
@@ -267,6 +295,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     rm -f /etc/ssh/ssh_host_*
 
+FROM runtime-ssh AS runtime-checkpoint-5
+
+FROM runtime-ssh AS runtime
+ARG SOURCE_DATE_EPOCH=0
 # setup desktop env & app
 ENV DISPLAY_NUM=1
 ENV HEIGHT=1080
