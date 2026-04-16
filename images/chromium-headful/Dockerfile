@@ -186,7 +186,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    find /etc /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    find /etc /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-base AS runtime-checkpoint-1
 
@@ -233,7 +235,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    find /etc /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    find /etc /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-fonts AS runtime-checkpoint-2
 
@@ -275,7 +279,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
         -delete; \
-    find /etc /home /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    find /etc /home /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-system AS runtime-checkpoint-3
 
@@ -329,7 +335,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
         -delete && \
-    find /etc /home /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    find /etc /home /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-ssh AS runtime-checkpoint-5
 
