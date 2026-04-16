@@ -190,7 +190,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-FROM runtime-base AS runtime-checkpoint-1
+FROM scratch AS runtime-checkpoint-1
+COPY --from=runtime-base / /
 
 FROM runtime-base AS runtime-fonts
 ARG TARGETARCH
@@ -239,7 +240,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-FROM runtime-fonts AS runtime-checkpoint-2
+FROM scratch AS runtime-checkpoint-2
+COPY --from=runtime-fonts / /
 
 FROM runtime-fonts AS runtime-system
 ARG TARGETARCH
@@ -283,7 +285,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-FROM runtime-system AS runtime-checkpoint-3
+FROM scratch AS runtime-checkpoint-3
+COPY --from=runtime-system / /
 
 FROM runtime-system AS runtime-node
 ARG TARGETARCH
@@ -315,7 +318,8 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g \
     patchright@${PATCHRIGHT_VERSION} \
     esbuild@${ESBUILD_VERSION}
 
-FROM runtime-node AS runtime-checkpoint-4
+FROM scratch AS runtime-checkpoint-4
+COPY --from=runtime-node / /
 
 FROM runtime-node AS runtime-ssh
 ARG TARGETARCH
@@ -339,7 +343,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-FROM runtime-ssh AS runtime-checkpoint-5
+FROM scratch AS runtime-checkpoint-5
+COPY --from=runtime-ssh / /
 
 FROM runtime-ssh AS runtime
 ARG SOURCE_DATE_EPOCH=0
