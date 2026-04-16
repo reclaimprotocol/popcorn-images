@@ -311,6 +311,14 @@ RUN useradd -m -s /bin/bash kernel && \
 FROM runtime AS packager
 ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
+    rm -rf /var/cache/fontconfig/*; \
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete; \
+    mkdir -p /var/log/neko; \
+    chmod 1777 /var/log/neko; \
     find / \
         \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
