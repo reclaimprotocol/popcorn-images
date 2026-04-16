@@ -57,12 +57,12 @@ RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target
     rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; \
     mkdir -p /etc/ssl/certs /etc/apt/apt.conf.d; \
     install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
-    cat <<EOF >/etc/apt/sources.list
-deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse
-deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse
-deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse
-deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse
-EOF
+    printf '%s\n' \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse" \
+        >/etc/apt/sources.list; \
     printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" \
         /etc \
