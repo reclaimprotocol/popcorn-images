@@ -312,7 +312,7 @@ FROM runtime AS packager
 ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
     find / \
-        \( -path /proc -o -path /sys -o -path /dev \) -prune -o \
+        \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch

@@ -38,7 +38,7 @@ async function fetchWithRetry(url, headers) {
       const response = await fetch(url, {
         headers,
         redirect: 'follow',
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(300000),
       });
       if (!response.ok) {
         throw new Error(`unexpected response: ${response.status} ${response.statusText}`);
