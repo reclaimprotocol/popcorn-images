@@ -51,18 +51,28 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm run build
 
 FROM ${UBUNTU_IMAGE} AS ubuntu-snapshot
 ARG UBUNTU_SNAPSHOT=20260416T000000Z
-COPY --from=server-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN set -eux; \
+ARG SOURCE_DATE_EPOCH=0
+RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/ca-certificates.crt,ro \
+    set -eux; \
     rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; \
-    mkdir -p /etc/ssl/certs; \
+    mkdir -p /etc/ssl/certs /etc/apt/apt.conf.d; \
+    install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
     cat <<EOF >/etc/apt/sources.list
 deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse
 deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse
 deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse
 deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse
 EOF
-RUN set -eux; \
-    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot
+    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot; \
+    touch -h -d "@${SOURCE_DATE_EPOCH}" \
+        /etc \
+        /etc/apt \
+        /etc/apt/apt.conf.d \
+        /etc/apt/apt.conf.d/99snapshot \
+        /etc/apt/sources.list \
+        /etc/ssl \
+        /etc/ssl/certs \
+        /etc/ssl/certs/ca-certificates.crt
 
 # xorg dependencies
 FROM ubuntu-snapshot AS xorg-deps
@@ -122,13 +132,14 @@ ARG ESBUILD_VERSION=0.28.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_PRIORITY=high
 
-COPY --from=artifact-mirror /artifacts/ /tmp/artifacts/
-
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    --mount=from=artifact-mirror,source=/artifacts,target=/mnt/artifacts,ro \
     set -eux; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
+    mkdir -p /tmp/artifacts; \
+    cp -a /mnt/artifacts/. /tmp/artifacts/; \
     apt-get update && \
     apt-get --no-install-recommends -y install \
     gpg-agent \
@@ -170,7 +181,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     install -m755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe && \
     install -m0755 /tmp/artifacts/bin/websocat.* /usr/local/bin/websocat && \
     rm -rf /tmp/ffmpeg* /tmp/artifacts && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache && \
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/fontconfig/* && \
+    find /var/log -mindepth 1 -delete && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    find /etc /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-base AS runtime-checkpoint-1
 
@@ -178,11 +194,13 @@ FROM runtime-base AS runtime-fonts
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
 # A minimal container has only 3 fonts, which is a strong fingerprinting signal
 # used by reCAPTCHA Enterprise and other bot detection vendors.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    set -eux; \
     apt-get update && \
     apt-get --no-install-recommends -y install \
     fonts-liberation \
@@ -211,7 +229,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     fonts-tibetan-machine \
     fonts-droid-fallback && \
     fc-cache -f && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/fontconfig/* && \
+    find /var/log -mindepth 1 -delete && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    find /etc /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-fonts AS runtime-checkpoint-2
 
@@ -219,6 +241,7 @@ FROM runtime-fonts AS runtime-system
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # runtime
 ENV USERNAME=root
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
@@ -246,7 +269,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     /home/$USERNAME/.local/share/xorg; \
     chmod 1777 /var/log/neko; \
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
-    chown -R $USERNAME:$USERNAME /home/$USERNAME;
+    chown -R $USERNAME:$USERNAME /home/$USERNAME; \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete; \
+    find /etc /home /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-system AS runtime-checkpoint-3
 
@@ -286,14 +315,21 @@ FROM runtime-node AS runtime-ssh
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
 # Only installed, NOT configured: no host keys, no custom config, service not enabled.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    set -eux; \
     apt-get update && \
     apt-get --no-install-recommends -y install openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    rm -f /etc/ssh/ssh_host_*
+    rm -f /etc/ssh/ssh_host_* && \
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete && \
+    find /etc /home /tmp /usr /var -xdev -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM runtime-ssh AS runtime-checkpoint-5
 
@@ -345,6 +381,7 @@ ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
     rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
     rm -rf /var/cache/fontconfig/*; \
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     find /var/log -mindepth 1 \
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
