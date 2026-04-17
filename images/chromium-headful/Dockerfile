@@ -181,7 +181,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     install -m755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe && \
     install -m0755 /tmp/artifacts/bin/websocat.* /usr/local/bin/websocat && \
     rm -rf /tmp/ffmpeg* /tmp/artifacts && \
-    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache && \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
+        /run/systemd/resolve/stub-resolv.conf && \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
@@ -400,7 +401,8 @@ RUN useradd -m -s /bin/bash kernel && \
 FROM runtime AS packager
 ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
-    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
+        /run/systemd/resolve/stub-resolv.conf; \
     rm -rf /var/cache/fontconfig/*; \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     find /var/log -mindepth 1 \

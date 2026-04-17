@@ -79,13 +79,13 @@
     "archives": {
       "amd64": {
         "filename": "ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz",
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz",
-        "sha256": "0e9947707802de37c028c27f89daa7a9515c32786df60442120b224ed7789788"
+        "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/398660565",
+        "sha256": "f416cf547189a744dfe7b92fbac4869b002685ad6534cac851b72133005ec54d"
       },
       "arm64": {
         "filename": "ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz",
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz",
-        "sha256": "6173ba8d3809c531072d78eabfa824a84b07b6ac3edd9ae8e66ec6c0186981a6"
+        "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/398660640",
+        "sha256": "adc83fdfaf485b9607451fdf4d868a9fd135659ca72f387adbdfe658dfbaa3be"
       }
     }
   },
