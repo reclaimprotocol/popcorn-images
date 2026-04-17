@@ -341,6 +341,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get update && \
     apt-get --no-install-recommends -y install openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    rm -f /var/cache/ldconfig/aux-cache && \
     rm -f /etc/ssh/ssh_host_* && \
     find /var/log -mindepth 1 \
         ! -path /var/log/neko \
