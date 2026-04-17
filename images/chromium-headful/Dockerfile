@@ -187,7 +187,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     find /etc /mnt /run /tmp /usr /var -xdev \
-        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/* \) -prune -o \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-1
@@ -237,7 +237,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     find /etc /mnt /run /tmp /usr /var -xdev \
-        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/* \) -prune -o \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-2
@@ -282,7 +282,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko/* \
         -delete; \
     find /etc /home /mnt /run /tmp /usr /var -xdev \
-        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/* \) -prune -o \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-3
@@ -340,7 +340,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko/* \
         -delete && \
     find /etc /home /mnt /run /tmp /usr /var -xdev \
-        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/* \) -prune -o \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-5
