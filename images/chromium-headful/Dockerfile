@@ -292,6 +292,7 @@ FROM runtime-system AS runtime-node
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 ARG TYPESCRIPT_VERSION=6.0.2
 ARG PLAYWRIGHT_CORE_VERSION=1.59.1
 ARG PATCHRIGHT_VERSION=1.59.4
@@ -312,11 +313,16 @@ RUN set -eux; \
     fi
 
 # Install TypeScript, Playwright, Patchright, esbuild globally
-RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g \
-    typescript@${TYPESCRIPT_VERSION} \
-    playwright-core@${PLAYWRIGHT_CORE_VERSION} \
-    patchright@${PATCHRIGHT_VERSION} \
-    esbuild@${ESBUILD_VERSION}
+RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
+    set -eux; \
+    npm install -g \
+        typescript@${TYPESCRIPT_VERSION} \
+        playwright-core@${PLAYWRIGHT_CORE_VERSION} \
+        patchright@${PATCHRIGHT_VERSION} \
+        esbuild@${ESBUILD_VERSION}; \
+    find /etc /home /mnt /root /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* -o -path /root/.npm -o -path /root/.npm/\* \) -prune -o \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-4
 COPY --from=runtime-node / /
