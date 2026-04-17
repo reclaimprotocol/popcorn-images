@@ -183,6 +183,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /tmp/ffmpeg* /tmp/artifacts && \
     rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
         /run/systemd/resolve/stub-resolv.conf && \
+    rm -rf /var/cache/debconf/* && \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
@@ -234,6 +235,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     fonts-droid-fallback && \
     fc-cache -f && \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/debconf/* && \
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -278,6 +280,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
     chown -R $USERNAME:$USERNAME /home/$USERNAME; \
     rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
+    rm -rf /var/cache/debconf/*; \
     find /var/log -mindepth 1 \
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
@@ -343,6 +346,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get --no-install-recommends -y install openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     rm -f /var/cache/ldconfig/aux-cache && \
+    rm -rf /var/cache/debconf/* && \
     rm -f /etc/ssh/ssh_host_* && \
     find /var/log -mindepth 1 \
         ! -path /var/log/neko \
@@ -403,6 +407,7 @@ ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
     rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
         /run/systemd/resolve/stub-resolv.conf; \
+    rm -rf /var/cache/debconf/*; \
     rm -rf /var/cache/fontconfig/*; \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     find /var/log -mindepth 1 \
