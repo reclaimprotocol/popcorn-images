@@ -186,7 +186,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    find /etc /tmp /usr /var -xdev \
+    find /etc /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
@@ -236,7 +236,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     rm -rf /var/cache/fontconfig/* && \
     find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    find /etc /tmp /usr /var -xdev \
+    find /etc /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
@@ -281,7 +281,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
         -delete; \
-    find /etc /home /tmp /usr /var -xdev \
+    find /etc /home /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
@@ -339,7 +339,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         ! -path /var/log/neko \
         ! -path /var/log/neko/* \
         -delete && \
-    find /etc /home /tmp /usr /var -xdev \
+    find /etc /home /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
