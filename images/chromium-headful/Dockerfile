@@ -279,38 +279,43 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
     chown -R $USERNAME:$USERNAME /home/$USERNAME;
 
-# install chromium and sqlite3 for debugging the cookies file
+# Chromium runtime libs (previously pulled in transitively by apt chromium)
+# plus sqlite3 for debugging the cookies file.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    add-apt-repository -y ppa:xtradeb/apps;
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    apt update -y && \
-    apt -y install chromium && \
-    apt --no-install-recommends -y install sqlite3;
+    apt-get update -y && \
+    apt-get --no-install-recommends -y install \
+    sqlite3 \
+    libcups2 \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libasound2 \
+    libpango-1.0-0 \
+    libxdamage1 \
+    libxkbcommon0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1;
 
-# Install ChromeDriver matching the installed Chromium version
-# Chromedriver and Chromium are not necessarily the same version, but we try to match them.
-# Override with --build-arg CHROMEDRIVER_VERSION=x.x.x.x if needed.
-ARG CHROMEDRIVER_VERSION=
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    set -eux; \
-    ARCH=$(dpkg --print-architecture); \
-    if [ "$ARCH" = "arm64" ]; then \
-        echo "ARM64: installing chromedriver from apt (no Chrome for Testing ARM64 builds)"; \
-        apt-get update && apt-get install -y --no-install-recommends chromium-driver; \
-        ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver; \
-    else \
-        if [ -z "$CHROMEDRIVER_VERSION" ]; then \
-            CHROMEDRIVER_VERSION=$(chromium --version | awk '{print $2}'); \
-        fi; \
-        curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/cd.zip; \
-        unzip /tmp/cd.zip -d /tmp; \
-        mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
-        chmod +x /usr/local/bin/chromedriver; \
-        rm -rf /tmp/cd.zip /tmp/chromedriver-linux64; \
-    fi
+# Install CloakBrowser (stealth Chromium build) in place of stock chromium.
+# The image bundles a matching chromedriver next to the chrome binary for both
+# amd64 and arm64, so we skip the per-arch chromedriver dance.
+COPY --from=cloakhq/cloakbrowser:latest /root/.cloakbrowser /opt/cloakbrowser
+RUN set -eux; \
+    CLOAK_DIR=$(find /opt/cloakbrowser -maxdepth 1 -type d -name 'chromium-*' | head -n1); \
+    test -n "$CLOAK_DIR"; \
+    test -x "$CLOAK_DIR/chrome"; \
+    test -x "$CLOAK_DIR/chromedriver"; \
+    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium; \
+    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium-browser; \
+    ln -sf "$CLOAK_DIR/chromedriver" /usr/local/bin/chromedriver; \
+    chromium --version; \
+    chromedriver --version
 
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed

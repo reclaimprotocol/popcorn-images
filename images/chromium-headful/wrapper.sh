@@ -286,34 +286,43 @@ if [[ "${RUN_AS_ROOT:-}" == "true" ]]; then
       OFFSET_X=0
     fi
 
-    # Wait for Chromium window to open before dismissing the --no-sandbox warning.
-    target='New Tab - Chromium'
-    echo "[wrapper] Waiting for Chromium window \"${target}\" to appear and become active..."
-    while :; do
-      win_id=$(xwininfo -root -tree 2>/dev/null | awk -v t="$target" '$0 ~ t {print $1; exit}')
+    # Wait for a Chromium window to open before dismissing the --no-sandbox warning.
+    # Match is loose because stealth builds (e.g. CloakBrowser) may rebrand the title.
+    target='New Tab|Chromium|Chrome'
+    echo "[wrapper] Waiting for Chromium window matching /${target}/ to appear and become active..."
+    window_found=false
+    for _ in $(seq 1 60); do
+      # `|| true` so a failing xwininfo/awk (under set -e + pipefail) doesn't kill the wrapper
+      win_id=$( { xwininfo -root -tree 2>/dev/null | awk -v t="$target" '$0 ~ t {print $1; exit}'; } || true )
       if [[ -n $win_id ]]; then
         win_id=${win_id%:}
-        if xdotool windowactivate --sync "$win_id"; then
-          echo "[wrapper] Focused window $win_id ($target) on $DISPLAY"
+        if xdotool windowactivate --sync "$win_id" 2>/dev/null; then
+          echo "[wrapper] Focused window $win_id on $DISPLAY"
+          window_found=true
           break
         fi
       fi
       sleep 0.5
     done
+    if [[ "$window_found" != "true" ]]; then
+      echo "[wrapper] No Chromium window matched within 30s; skipping sandbox warning dismissal." >&2
+    fi
 
-    # wait... not sure but this just increases the likelihood of success
-    # without the sleep you often open the live view and see the mouse hovering over the "X" to dismiss the warning, suggesting that it clicked before the warning or chromium appeared
-    sleep 5
+    if [[ "$window_found" == "true" ]]; then
+      # wait... not sure but this just increases the likelihood of success
+      # without the sleep you often open the live view and see the mouse hovering over the "X" to dismiss the warning, suggesting that it clicked before the warning or chromium appeared
+      sleep 5
 
-    # Attempt to click the warning's close button
-    echo "[wrapper] Clicking the warning's close button at x=$OFFSET_X y=115"
-    if curl -s -o /dev/null -X POST \
-      http://localhost:${API_PORT}/computer/click_mouse \
-      -H "Content-Type: application/json" \
-      -d "{\"x\":${OFFSET_X},\"y\":115}"; then
-        echo "[wrapper] Successfully clicked the warning's close button"
-    else
-      echo "[wrapper] Failed to click the warning's close button" >&2
+      # Attempt to click the warning's close button
+      echo "[wrapper] Clicking the warning's close button at x=$OFFSET_X y=115"
+      if curl -s -o /dev/null -X POST \
+        http://localhost:${API_PORT}/computer/click_mouse \
+        -H "Content-Type: application/json" \
+        -d "{\"x\":${OFFSET_X},\"y\":115}"; then
+          echo "[wrapper] Successfully clicked the warning's close button"
+      else
+        echo "[wrapper] Failed to click the warning's close button" >&2
+      fi
     fi
   else
     echo "[wrapper] xdotool failed to obtain display geometry; skipping sandbox warning dismissal." >&2
