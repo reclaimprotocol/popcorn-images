@@ -320,6 +320,7 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
         playwright-core@${PLAYWRIGHT_CORE_VERSION} \
         patchright@${PATCHRIGHT_VERSION} \
         esbuild@${ESBUILD_VERSION}; \
+    rm -rf /tmp/node-compile-cache; \
     find /etc /home /mnt /root /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* -o -path /root/.npm -o -path /root/.npm/\* \) -prune -o \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
