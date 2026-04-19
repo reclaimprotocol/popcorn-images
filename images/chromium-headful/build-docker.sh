@@ -8,6 +8,22 @@ source ../../shared/ensure-common-build-run-vars.sh chromium-headful
 
 source ../../shared/start-buildkit.sh
 
-# Build the Docker image using the repo root as build context
-# so the Dockerfile's first stage can access the server sources
-(cd "$SCRIPT_DIR/../.." && docker build -f images/chromium-headful/Dockerfile -t "$IMAGE" .)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
+eval "$("$REPO_ROOT/scripts/chromium-lock-env.sh" "${PLATFORM:-}")"
+
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$SCRIPT_DIR/../.." log -1 --pretty=%ct)}"
+ARTIFACT_MIRROR_IMAGE="${ARTIFACT_MIRROR_IMAGE:-chromium-base-artifacts:${ARTIFACT_MIRROR_TAG}}"
+
+(cd "$SCRIPT_DIR/../.." && docker build \
+    --build-arg "SOURCE_DATE_EPOCH=0" \
+    -f images/chromium-headful/artifact-mirror.Dockerfile \
+    -t "$ARTIFACT_MIRROR_IMAGE" \
+    .)
+
+(cd "$SCRIPT_DIR/../.." && docker build \
+    --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+    --build-arg "UBUNTU_SNAPSHOT=$UBUNTU_SNAPSHOT" \
+    --build-arg "ARTIFACT_MIRROR_IMAGE=$ARTIFACT_MIRROR_IMAGE" \
+    -f images/chromium-headful/Dockerfile \
+    -t "$IMAGE" \
+    .)

@@ -1,0 +1,107 @@
+{
+  "ubuntu_snapshot": "20260416T000000Z",
+  "chromium": {
+    "version": "147.0.7727.55-1xtradeb1.2204.1",
+    "packages": {
+      "amd64": [
+        {
+          "name": "chromium-common",
+          "filename": "chromium-common_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/856320441/chromium-common_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "sha256": "29c7f700c80a4974d13818ce691de6aac4350673e4de601c93e38326398674c4"
+        },
+        {
+          "name": "chromium",
+          "filename": "chromium_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/856320446/chromium_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "sha256": "dd72c554701b77540174b1fdaac0fd2255b7bdbbf1e4895ee678f283f3aad4a5"
+        },
+        {
+          "name": "chromium-driver",
+          "filename": "chromium-driver_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/856320436/chromium-driver_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "sha256": "09fc0ea47ffe5a21fdb79dbae03a7b60394d2791b8a90a0010d544a69fb42410"
+        },
+        {
+          "name": "chromium-sandbox",
+          "filename": "chromium-sandbox_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/856320443/chromium-sandbox_147.0.7727.55-1xtradeb1.2204.1_amd64.deb",
+          "sha256": "2b5360a9ccf6044b9b2c954cd7c6ed25e17e3970fdf36a1a57db609f32509747"
+        }
+      ],
+      "arm64": [
+        {
+          "name": "chromium-common",
+          "filename": "chromium-common_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/856305509/chromium-common_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "sha256": "3fd13bc8daa64f96618e5f0ed22d708ccf64d30bb178232085bbd4423ac840dc"
+        },
+        {
+          "name": "chromium",
+          "filename": "chromium_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/856305515/chromium_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "sha256": "b3cea635adf79d1ffd7a00c8babb149ac82ab469f9dc30012edb07604abc6268"
+        },
+        {
+          "name": "chromium-driver",
+          "filename": "chromium-driver_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/856305503/chromium-driver_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "sha256": "ae3299dc04ec83a5f77b3ef8b157fc0e54a0fe1069a750192fa488100d4e172d"
+        },
+        {
+          "name": "chromium-sandbox",
+          "filename": "chromium-sandbox_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/856305513/chromium-sandbox_147.0.7727.55-1xtradeb1.2204.1_arm64.deb",
+          "sha256": "7adf1b8f3056a69ac66af0651392439c7f2aa478f65a51d94556241a161bf613"
+        }
+      ]
+    }
+  },
+  "libxcvt0": {
+    "version": "0.1.2-1",
+    "packages": {
+      "amd64": {
+        "name": "libxcvt0",
+        "filename": "libxcvt0_0.1.2-1_amd64.deb",
+        "url": "https://deb.debian.org/debian/pool/main/libx/libxcvt/libxcvt0_0.1.2-1_amd64.deb",
+        "sha256": "7cf887f830748b89c4cd706b8aa8891856127333c96cb5c47e8390fcec263294"
+      },
+      "arm64": {
+        "name": "libxcvt0",
+        "filename": "libxcvt0_0.1.2-1_arm64.deb",
+        "url": "https://deb.debian.org/debian/pool/main/libx/libxcvt/libxcvt0_0.1.2-1_arm64.deb",
+        "sha256": "ad8724b48a1fa79ede417aa33197d1f779d59fcbc1fc232f603531b59988a280"
+      }
+    }
+  },
+  "ffmpeg": {
+    "version": "n7.1.3-45-g2d6ee37238",
+    "archives": {
+      "amd64": {
+        "filename": "ffmpeg-n7.1.3-45-g2d6ee37238-linux64-gpl-7.1.tar.xz",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-18-13-04/ffmpeg-n7.1.3-45-g2d6ee37238-linux64-gpl-7.1.tar.xz",
+        "sha256": "fd01794bf0647ee569b31b7e94ab648613912b6ec2203c8fb2dc3aca62e5eb46"
+      },
+      "arm64": {
+        "filename": "ffmpeg-n7.1.3-45-g2d6ee37238-linuxarm64-gpl-7.1.tar.xz",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-18-13-04/ffmpeg-n7.1.3-45-g2d6ee37238-linuxarm64-gpl-7.1.tar.xz",
+        "sha256": "4d66174a72e082b20c1ec1f2aa68c4e04de0bc76b9a7f6981a9758e0624f395c"
+      }
+    }
+  },
+  "websocat": {
+    "version": "v1.14.1",
+    "binaries": {
+      "amd64": {
+        "filename": "websocat.x86_64-unknown-linux-musl",
+        "url": "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.x86_64-unknown-linux-musl",
+        "sha256": "66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514"
+      },
+      "arm64": {
+        "filename": "websocat.aarch64-unknown-linux-musl",
+        "url": "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.aarch64-unknown-linux-musl",
+        "sha256": "711a69576a2ff473fb01a90ffafb571c2ed019e55479d7ae71b12c2eadeb7011"
+      }
+    }
+  }
+}
