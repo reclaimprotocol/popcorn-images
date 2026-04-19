@@ -75,17 +75,17 @@
     }
   },
   "ffmpeg": {
-    "version": "n7.1",
+    "version": "n7.1.3-45-g2d6ee37238",
     "archives": {
       "amd64": {
-        "filename": "ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz",
-        "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/398660565",
-        "sha256": "f416cf547189a744dfe7b92fbac4869b002685ad6534cac851b72133005ec54d"
+        "filename": "ffmpeg-n7.1.3-45-g2d6ee37238-linux64-gpl-7.1.tar.xz",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-18-13-04/ffmpeg-n7.1.3-45-g2d6ee37238-linux64-gpl-7.1.tar.xz",
+        "sha256": "fd01794bf0647ee569b31b7e94ab648613912b6ec2203c8fb2dc3aca62e5eb46"
       },
       "arm64": {
-        "filename": "ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz",
-        "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/398660640",
-        "sha256": "adc83fdfaf485b9607451fdf4d868a9fd135659ca72f387adbdfe658dfbaa3be"
+        "filename": "ffmpeg-n7.1.3-45-g2d6ee37238-linuxarm64-gpl-7.1.tar.xz",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-18-13-04/ffmpeg-n7.1.3-45-g2d6ee37238-linuxarm64-gpl-7.1.tar.xz",
+        "sha256": "4d66174a72e082b20c1ec1f2aa68c4e04de0bc76b9a7f6981a9758e0624f395c"
       }
     }
   },
