@@ -74,6 +74,26 @@ async function downloadArtifact({ url, filename, sha256, headers = {} }, outDir)
   }
 }
 
+async function runWithConcurrency(items, limit, worker) {
+  let nextIndex = 0;
+
+  async function runOne() {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => runOne());
+  await Promise.all(workers);
+}
+
 async function main() {
   const arch = process.env.TARGETARCH || 'amd64';
   const lock = JSON.parse(await fs.readFile('/tmp/chromium-lock.json', 'utf8'));
@@ -86,12 +106,16 @@ async function main() {
     throw new Error(`unsupported arch in chromium lock: ${arch}`);
   }
 
-  for (const artifact of chromiumPackages) {
-    await downloadArtifact(artifact, '/mirror/artifacts/debs');
-  }
-  await downloadArtifact(libxcvtPackage, '/mirror/artifacts/debs');
-  await downloadArtifact(ffmpegArchive, '/mirror/artifacts/archives');
-  await downloadArtifact(websocatBinary, '/mirror/artifacts/bin');
+  const downloads = [
+    ...chromiumPackages.map((artifact) => ({ artifact, outDir: '/mirror/artifacts/debs' })),
+    { artifact: libxcvtPackage, outDir: '/mirror/artifacts/debs' },
+    { artifact: ffmpegArchive, outDir: '/mirror/artifacts/archives' },
+    { artifact: websocatBinary, outDir: '/mirror/artifacts/bin' },
+  ];
+
+  await runWithConcurrency(downloads, 4, async ({ artifact, outDir }) => {
+    await downloadArtifact(artifact, outDir);
+  });
 
   const manifest = {
     arch,
