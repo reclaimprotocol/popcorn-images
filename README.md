@@ -50,6 +50,18 @@ IMAGE=kernel-docker ./build-docker.sh
 IMAGE=kernel-docker ENABLE_WEBRTC=true ./run-docker.sh
 ```
 
+If you want to mirror the locked Chromium build artifacts to a GitHub release first and have the build use those assets, run:
+
+```sh
+cd ..
+GITHUB_ARTIFACT_MIRROR_REPO=OWNER/REPO ./scripts/publish-chromium-artifacts-to-github.sh
+cd popcorn-images/images/chromium-headful
+export GITHUB_ARTIFACT_MIRROR_REPO=OWNER/REPO
+IMAGE=kernel-docker ./build-docker.sh
+```
+
+The build derives the release tag from `chromium-lock.json`, downloads `https://github.com/OWNER/REPO/releases/download/<lock-tag>/<filename>` first, and falls back to the pinned upstream URL if the mirrored asset is missing.
+
 ## Running on a Unikernel
 
 Alternatively, you can run the browser on a Unikraft unikernel.

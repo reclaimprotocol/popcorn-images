@@ -5,6 +5,7 @@ WORKDIR /mirror
 
 ARG TARGETARCH
 ARG SOURCE_DATE_EPOCH=0
+ARG ARTIFACT_MIRROR_PREFIX=
 
 COPY images/chromium-headful/chromium-lock.json /tmp/chromium-lock.json
 
@@ -15,6 +16,8 @@ const { createReadStream, createWriteStream, promises: fs } = require('node:fs')
 const path = require('node:path');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
+
+const RETRIABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 async function sha256File(filePath) {
   const hash = createHash('sha256');
@@ -31,25 +34,50 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url, headers) {
+function retryDelayMs(attempt, response) {
+  const retryAfter = response?.headers?.get?.('retry-after');
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000;
+    }
+  }
+
+  const base = Math.min(30000, 2000 * (2 ** (attempt - 1)));
+  const jitter = Math.floor(Math.random() * 1000);
+  return base + jitter;
+}
+
+async function fetchWithRetry(url, headers, artifactName) {
   let lastError;
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    let response;
     try {
-      const response = await fetch(url, {
+      response = await fetch(url, {
         headers,
         redirect: 'follow',
         signal: AbortSignal.timeout(1800000),
       });
       if (!response.ok) {
+        if (!RETRIABLE_STATUS_CODES.has(response.status)) {
+          const error = new Error(`unexpected response: ${response.status} ${response.statusText}`);
+          error.retriable = false;
+          throw error;
+        }
         throw new Error(`unexpected response: ${response.status} ${response.statusText}`);
       }
       return response;
     } catch (error) {
       lastError = error;
-      if (attempt === 5) {
+      if (error?.retriable === false) {
+        throw error;
+      }
+      if (attempt === 8) {
         throw lastError;
       }
-      await sleep(attempt * 2000);
+      const delayMs = retryDelayMs(attempt, response);
+      console.warn(`[download retry] ${artifactName} attempt ${attempt}/8 failed: ${error.message}; retrying in ${delayMs}ms`);
+      await sleep(delayMs);
     }
   }
   throw lastError;
@@ -57,21 +85,56 @@ async function fetchWithRetry(url, headers) {
 
 async function downloadArtifact({ url, filename, sha256, headers = {} }, outDir) {
   const outPath = path.join(outDir, filename);
-  const response = await fetchWithRetry(url, {
-    'accept': 'application/octet-stream',
-    'user-agent': 'popcorn-chromium-artifact-mirror/1.0',
-    ...headers,
-  });
+  const tmpOutPath = `${outPath}.part`;
+  const artifactMirrorPrefix = (process.env.ARTIFACT_MIRROR_PREFIX || '').replace(/\/+$/, '');
+  const candidateUrls = [];
+  if (artifactMirrorPrefix) {
+    candidateUrls.push(`${artifactMirrorPrefix}/${filename}`);
+  }
+  candidateUrls.push(url);
+  await fs.rm(tmpOutPath, { force: true });
+  let lastError;
 
-  if (!response.body) {
-    throw new Error(`failed to download ${url}: empty response body`);
+  for (const candidateUrl of candidateUrls) {
+    console.log(`[download] ${filename} <- ${candidateUrl}`);
+
+    try {
+      const response = await fetchWithRetry(candidateUrl, {
+        'accept': 'application/octet-stream',
+        'user-agent': 'popcorn-chromium-artifact-mirror/1.0',
+        ...headers,
+      }, filename);
+
+      if (!response.body) {
+        throw new Error(`failed to download ${candidateUrl}: empty response body`);
+      }
+
+      try {
+        await pipeline(Readable.fromWeb(response.body), createWriteStream(tmpOutPath));
+        const actual = await sha256File(tmpOutPath);
+        if (actual !== sha256) {
+          throw new Error(`checksum mismatch for ${filename}: expected ${sha256}, got ${actual}`);
+        }
+
+        await fs.rename(tmpOutPath, outPath);
+        console.log(`[download ok] ${filename}`);
+        return;
+      } catch (error) {
+        await fs.rm(tmpOutPath, { force: true });
+        throw error;
+      }
+    } catch (error) {
+      lastError = error;
+      await fs.rm(tmpOutPath, { force: true });
+      if (candidateUrl !== url) {
+        console.warn(`[download fallback] ${filename} mirror failed: ${error.message}`);
+        continue;
+      }
+      throw error;
+    }
   }
 
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(outPath));
-  const actual = await sha256File(outPath);
-  if (actual !== sha256) {
-    throw new Error(`checksum mismatch for ${filename}: expected ${sha256}, got ${actual}`);
-  }
+  throw lastError;
 }
 
 async function runWithConcurrency(items, limit, worker) {
@@ -94,6 +157,22 @@ async function runWithConcurrency(items, limit, worker) {
   await Promise.all(workers);
 }
 
+function concurrencyForHost(host) {
+  if (host === 'github.com') {
+    return 1;
+  }
+  if (host === 'launchpadlibrarian.net') {
+    return 1;
+  }
+  if (host === 'ppa.launchpadcontent.net') {
+    return 2;
+  }
+  if (host === 'deb.debian.org') {
+    return 1;
+  }
+  return 2;
+}
+
 async function main() {
   const arch = process.env.TARGETARCH || 'amd64';
   const lock = JSON.parse(await fs.readFile('/tmp/chromium-lock.json', 'utf8'));
@@ -113,9 +192,22 @@ async function main() {
     { artifact: websocatBinary, outDir: '/mirror/artifacts/bin' },
   ];
 
-  await runWithConcurrency(downloads, 4, async ({ artifact, outDir }) => {
-    await downloadArtifact(artifact, outDir);
-  });
+  const downloadsByHost = new Map();
+  for (const item of downloads) {
+    const host = new URL(item.artifact.url).host;
+    if (!downloadsByHost.has(host)) {
+      downloadsByHost.set(host, []);
+    }
+    downloadsByHost.get(host).push(item);
+  }
+
+  for (const [host, hostDownloads] of downloadsByHost) {
+    const limit = concurrencyForHost(host);
+    console.log(`[download group] host=${host} concurrency=${limit} count=${hostDownloads.length}`);
+    await runWithConcurrency(hostDownloads, limit, async ({ artifact, outDir }) => {
+      await downloadArtifact(artifact, outDir);
+    });
+  }
 
   const manifest = {
     arch,

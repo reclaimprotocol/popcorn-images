@@ -13,9 +13,15 @@ eval "$("$REPO_ROOT/scripts/chromium-lock-env.sh" "${PLATFORM:-}")"
 
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$SCRIPT_DIR/../.." log -1 --pretty=%ct)}"
 ARTIFACT_MIRROR_IMAGE="${ARTIFACT_MIRROR_IMAGE:-chromium-base-artifacts:${ARTIFACT_MIRROR_TAG}}"
+ARTIFACT_MIRROR_PREFIX="${ARTIFACT_MIRROR_PREFIX:-}"
+
+if [[ -z "$ARTIFACT_MIRROR_PREFIX" && -n "${GITHUB_ARTIFACT_MIRROR_REPO:-}" ]]; then
+    ARTIFACT_MIRROR_PREFIX="https://github.com/${GITHUB_ARTIFACT_MIRROR_REPO}/releases/download/${ARTIFACT_MIRROR_TAG}"
+fi
 
 (cd "$SCRIPT_DIR/../.." && docker build \
     --build-arg "SOURCE_DATE_EPOCH=0" \
+    --build-arg "ARTIFACT_MIRROR_PREFIX=$ARTIFACT_MIRROR_PREFIX" \
     -f images/chromium-headful/artifact-mirror.Dockerfile \
     -t "$ARTIFACT_MIRROR_IMAGE" \
     .)
