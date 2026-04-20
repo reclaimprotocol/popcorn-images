@@ -136,6 +136,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
     --mount=from=artifact-mirror,source=/artifacts,target=/mnt/artifacts,ro \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
     mkdir -p /tmp/artifacts; \
@@ -190,6 +191,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     find /etc /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-1
@@ -206,6 +208,7 @@ ARG SOURCE_DATE_EPOCH=0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     apt-get update && \
     apt-get --no-install-recommends -y install \
     fonts-liberation \
@@ -241,6 +244,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     find /etc /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-2
@@ -256,6 +260,7 @@ ENV USERNAME=root
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     apt-get update; \
     apt-get --no-install-recommends -y install \
     wget ca-certificates python2 supervisor xclip xdotool unclutter \
@@ -287,6 +292,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         -delete; \
     find /etc /home /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-3
@@ -319,6 +325,7 @@ RUN set -eux; \
 # Install TypeScript, Playwright, Patchright, esbuild globally
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     npm install -g \
         typescript@${TYPESCRIPT_VERSION} \
         playwright-core@${PLAYWRIGHT_CORE_VERSION} \
@@ -327,6 +334,7 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
     rm -rf /tmp/node-compile-cache; \
     find /etc /home /mnt /root /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* -o -path /root/.npm -o -path /root/.npm/\* \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-4
@@ -342,6 +350,7 @@ ARG SOURCE_DATE_EPOCH=0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     apt-get update && \
     apt-get --no-install-recommends -y install openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -354,6 +363,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
         -delete && \
     find /etc /home /mnt /run /tmp /usr /var -xdev \
         \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch AS runtime-checkpoint-5
@@ -405,6 +415,7 @@ RUN useradd -m -s /bin/bash kernel && \
 FROM runtime AS packager
 ARG SOURCE_DATE_EPOCH=0
 RUN set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
         /run/systemd/resolve/stub-resolv.conf; \
     rm -rf /var/cache/debconf/*; \
@@ -418,6 +429,7 @@ RUN set -eux; \
     chmod 1777 /var/log/neko; \
     find / \
         \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -newerct "$touch_start" \
         -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM scratch
