@@ -459,7 +459,60 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
     }
 
     this.emit('debug', `connected`)
+    void this.logSelectedIcePath()
     this[EVENT.CONNECTED]()
+  }
+
+  private async logSelectedIcePath() {
+    if (!this._peer) {
+      return
+    }
+
+    window.setTimeout(async () => {
+      if (!this._peer) {
+        return
+      }
+
+      try {
+        const stats = await this._peer.getStats()
+        let selectedPair: any | undefined
+
+        stats.forEach((report: any) => {
+          if (selectedPair) {
+            return
+          }
+
+          if (report.type === 'transport' && report.selectedCandidatePairId) {
+            selectedPair = stats.get(report.selectedCandidatePairId)
+            return
+          }
+
+          if (report.type === 'candidate-pair' && report.selected) {
+            selectedPair = report
+          }
+        })
+
+        if (!selectedPair) {
+          this.emit('debug', 'selected ICE path not available from peer stats yet')
+          return
+        }
+
+        const local = selectedPair.localCandidateId ? stats.get(selectedPair.localCandidateId) : undefined
+        const remote = selectedPair.remoteCandidateId ? stats.get(selectedPair.remoteCandidateId) : undefined
+
+        this.emit('info', 'selected ICE path', {
+          localCandidateType: local?.candidateType,
+          localAddress: local?.address || local?.ip,
+          localPort: local?.port,
+          remoteCandidateType: remote?.candidateType,
+          remoteAddress: remote?.address || remote?.ip,
+          remotePort: remote?.port,
+          protocol: local?.protocol || remote?.protocol,
+        })
+      } catch (err: any) {
+        this.emit('warn', 'failed to inspect selected ICE path', err)
+      }
+    }, 1000)
   }
 
   private onTimeout() {
