@@ -1,3 +1,8 @@
+# syntax=docker/dockerfile:1.7
+# The frontend version above honors SOURCE_DATE_EPOCH for COPY mtimes; combined
+# with `--output ...,rewrite-timestamp=true` on the build command, this makes the
+# resulting image bit-reproducible across rebuilds from the same commit.
+
 FROM docker.io/golang:1.26 AS server-builder
 WORKDIR /workspace/server
 
@@ -159,6 +164,28 @@ ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_PRIORITY=high
 
+# Write a small helper that strips volatile state which would otherwise defeat
+# image reproducibility (apt/dpkg logs, fontconfig cache UUIDs, ldconfig aux,
+# launchpad cache, machine-id, ssh host keys). Called at the end of every
+# RUN that mutates system state.
+RUN <<'EOT'
+set -eu
+cat > /usr/local/sbin/repro-strip <<'STRIP_EOF'
+#!/bin/sh
+# Reproducibility helper: remove volatile state so image layers are bit-stable.
+rm -rf /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
+       /var/cache/ldconfig/aux-cache /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin \
+       /root/.launchpadlib /root/.cache 2>/dev/null
+[ -d /var/cache/fontconfig ] && find /var/cache/fontconfig -name '*.cache-7' -delete 2>/dev/null
+find /usr/share/fonts /usr/local/share/fonts -name '.uuid' -delete 2>/dev/null
+[ -f /etc/machine-id ] && : > /etc/machine-id
+[ -f /var/lib/dbus/machine-id ] && : > /var/lib/dbus/machine-id
+rm -f /etc/ssh/ssh_host_*
+exit 0
+STRIP_EOF
+chmod +x /usr/local/sbin/repro-strip
+EOT
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
@@ -205,7 +232,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     libvulkan1 \
     fontconfig \
     unzip && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    /usr/local/sbin/repro-strip
 
 # Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
 # A minimal container has only 3 fonts, which is a strong fingerprinting signal
@@ -239,7 +267,8 @@ RUN apt-get update && \
     fonts-droid-fallback \
     fonts-unifont && \
     fc-cache -f && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    /usr/local/sbin/repro-strip
 
 # install ffmpeg manually since the version available in apt is from the 4.x branch due to #drama.
 COPY --from=ffmpeg-downloader /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
@@ -278,7 +307,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     /home/$USERNAME/.local/share/xorg; \
     chmod 1777 /var/log/neko; \
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
-    chown -R $USERNAME:$USERNAME /home/$USERNAME;
+    chown -R $USERNAME:$USERNAME /home/$USERNAME; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    /usr/local/sbin/repro-strip
 
 # Chromium runtime libs (previously pulled in transitively by apt chromium)
 # plus sqlite3 for debugging the cookies file.
@@ -301,12 +332,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     libxcomposite1 \
     libxfixes3 \
     libxrandr2 \
-    libgbm1;
+    libgbm1 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    /usr/local/sbin/repro-strip
 
 # Install CloakBrowser (stealth Chromium build) in place of stock chromium.
 # The image bundles a matching chromedriver next to the chrome binary for both
 # amd64 and arm64, so we skip the per-arch chromedriver dance.
-COPY --from=cloakhq/cloakbrowser:latest /root/.cloakbrowser /opt/cloakbrowser
+COPY --from=cloakhq/cloakbrowser@sha256:a82f46784efbf2dcdcfb35e45842a5d4259db68f4efca76b10d030521d666a78 /root/.cloakbrowser /opt/cloakbrowser
 RUN set -eux; \
     CLOAK_DIR=$(find /opt/cloakbrowser -maxdepth 1 -type d -name 'chromium-*' | head -n1); \
     test -n "$CLOAK_DIR"; \
@@ -333,8 +366,12 @@ RUN set -eux; \
     ln -sf /usr/local/lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack; \
     fi
 
-# Install TypeScript, Playwright, Patchright, esbuild globally
-RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install -g typescript playwright-core patchright esbuild
+# Install TypeScript, Playwright, Patchright, esbuild globally.
+# NODE_COMPILE_CACHE="" disables Node 22's V8 module compile cache, which would
+# otherwise drop ~550 non-deterministic files into /tmp/node-compile-cache.
+RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
+    NODE_COMPILE_CACHE="" npm install -g typescript playwright-core patchright esbuild && \
+    rm -rf /tmp/node-compile-cache
 
 # Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
 # Only installed, NOT configured: no host keys, no custom config, service not enabled.
@@ -350,7 +387,8 @@ RUN apt-get update && \
     esac && \
     curl -fsSL "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.${WEBSOCAT_ARCH}-unknown-linux-musl" \
         -o /usr/local/bin/websocat && \
-    chmod +x /usr/local/bin/websocat
+    chmod +x /usr/local/bin/websocat && \
+    /usr/local/sbin/repro-strip
 
 # setup desktop env & app
 ENV DISPLAY_NUM=1
@@ -391,6 +429,11 @@ RUN esbuild /tmp/playwright-daemon.ts \
     --external:esbuild \
     && rm /tmp/playwright-daemon.ts
 
-RUN useradd -m -s /bin/bash kernel
+RUN useradd -m -s /bin/bash kernel && \
+    # useradd's shadow-locking can leave a stale-but-byte-equal /etc/shadow-
+    # backup that flickers across builds (BuildKit's overlay diff detects the
+    # inode change even when content is unchanged). Drop the backup files
+    # outright — containers don't need them.
+    rm -f /etc/shadow- /etc/passwd- /etc/group- /etc/gshadow- /etc/subuid- /etc/subgid-
 
 ENTRYPOINT [ "/wrapper.sh" ]
