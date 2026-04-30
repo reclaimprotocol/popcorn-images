@@ -163,6 +163,22 @@ start_dynamic_log_aggregator
 
 export DISPLAY=:1
 
+# CloakBrowser stealth defaults. The javascript `launch()` wrapper normally injects
+# these; we invoke the chromium binary directly via chromium-launcher, so we add
+# them here. Without them, Akamai/Kasada flag the Linux fingerprint and the
+# unseeded GPU/hardware values. Seed is persisted in the user-data-dir so the
+# spoofed identity stays consistent across restarts (flipping fingerprints for
+# the same persisted profile is itself a bot signal).
+CLOAK_SEED_FILE="/home/kernel/user-data/.cloak-fingerprint-seed"
+mkdir -p "$(dirname "$CLOAK_SEED_FILE")"
+if [[ -s "$CLOAK_SEED_FILE" ]]; then
+  CLOAK_SEED=$(cat "$CLOAK_SEED_FILE")
+else
+  CLOAK_SEED=$(( (RANDOM * 32768 + RANDOM) % 90000 + 10000 ))
+  echo "$CLOAK_SEED" > "$CLOAK_SEED_FILE"
+fi
+export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --fingerprint=${CLOAK_SEED} --fingerprint-platform=windows --ignore-gpu-blocklist"
+
 # Set default extension flags for bundled extensions
 export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/kernel/extensions/proxy --load-extension=/home/kernel/extensions/proxy"
 

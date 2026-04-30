@@ -236,7 +236,8 @@ RUN apt-get update && \
     fonts-sil-padauk \
     fonts-thai-tlwg \
     fonts-tibetan-machine \
-    fonts-droid-fallback && \
+    fonts-droid-fallback \
+    fonts-unifont && \
     fc-cache -f && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
