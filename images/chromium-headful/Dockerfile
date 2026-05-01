@@ -3,13 +3,24 @@
 # with `--output ...,rewrite-timestamp=true` on the build command, this makes the
 # resulting image bit-reproducible across rebuilds from the same commit.
 
-FROM docker.io/golang:1.26 AS server-builder
+ARG GOLANG_IMAGE=docker.io/golang:1.26@sha256:5f3787b7f902c07c7ec4f3aa91a301a3eda8133aa32661a3b3a3a86ab3a68a36
+ARG NODE_IMAGE=docker.io/node:22-bullseye-slim@sha256:f8193a2e3e6c86d72ba378b929ae7db3f813018aff78e58cc11ac121439da8af
+ARG UBUNTU_IMAGE=docker.io/ubuntu:22.04@sha256:962f6cadeae0ea6284001009daa4cc9a8c37e75d1f5191cf0eb83fe565b63dd7
+ARG NEKO_IMAGE=ghcr.io/kernel/neko/base:3.0.8-v1.4.0@sha256:bf8a6eddcc7b19062e77652799a35c8c50d873b73d18388cc8289f62737dd3bf
+ARG ARTIFACT_MIRROR_IMAGE=docker.io/library/chromium-base-artifacts:local
+# CloakBrowser is a stealth-Chromium build distributed as an OCI image. Pinned
+# by digest so rebuilds get the exact same chrome+chromedriver bundle.
+ARG CLOAKBROWSER_IMAGE=docker.io/cloakhq/cloakbrowser@sha256:a82f46784efbf2dcdcfb35e45842a5d4259db68f4efca76b10d030521d666a78
+ARG UBUNTU_SNAPSHOT=20260416T000000Z
+
+FROM ${GOLANG_IMAGE} AS server-builder
 WORKDIR /workspace/server
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-golang1260
+ARG SOURCE_DATE_EPOCH=0
 ENV CGO_ENABLED=1
 
 COPY server/go.mod ./
@@ -24,16 +35,16 @@ COPY server/ .
 RUN --mount=type=cache,target=/root/.cache/go-build,id=$CACHEIDPREFIX-go-build \
     --mount=type=cache,target=/go/pkg/mod,id=$CACHEIDPREFIX-go-pkg-mod \
     GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-s -w" -o /out/kernel-images-api ./cmd/api
+    go build -buildvcs=false -trimpath -ldflags="-s -w -buildid=" -o /out/kernel-images-api ./cmd/api
 
 # Build chromium launcher
 RUN --mount=type=cache,target=/root/.cache/go-build,id=$CACHEIDPREFIX-go-build \
     --mount=type=cache,target=/go/pkg/mod,id=$CACHEIDPREFIX-go-pkg-mod \
     GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-s -w" -o /out/chromium-launcher ./cmd/chromium-launcher
+    go build -buildvcs=false -trimpath -ldflags="-s -w -buildid=" -o /out/chromium-launcher ./cmd/chromium-launcher
 
 # webrtc client
-FROM node:22-bullseye-slim AS client
+FROM ${NODE_IMAGE} AS client
 WORKDIR /src
 
 # Allow cross-compilation when building with BuildKit platforms
@@ -42,22 +53,47 @@ ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-node22bullseye
 
 COPY images/chromium-headful/client/package*.json ./
-RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm install
+RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm ci
 COPY images/chromium-headful/client/ .
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm run build
 
+FROM ${UBUNTU_IMAGE} AS ubuntu-snapshot
+ARG UBUNTU_SNAPSHOT=20260416T000000Z
+ARG SOURCE_DATE_EPOCH=0
+RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/ca-certificates.crt,ro \
+    set -eux; \
+    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; \
+    mkdir -p /etc/ssl/certs /etc/apt/apt.conf.d; \
+    install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
+    printf '%s\n' \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse" \
+        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse" \
+        >/etc/apt/sources.list; \
+    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot; \
+    touch -h -d "@${SOURCE_DATE_EPOCH}" \
+        /etc \
+        /etc/apt \
+        /etc/apt/apt.conf.d \
+        /etc/apt/apt.conf.d/99snapshot \
+        /etc/apt/sources.list \
+        /etc/ssl \
+        /etc/ssl/certs \
+        /etc/ssl/certs/ca-certificates.crt
+
 # xorg dependencies
-FROM docker.io/ubuntu:22.04 AS xorg-deps
+FROM ubuntu-snapshot AS xorg-deps
 WORKDIR /xorg
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
-
+ARG SOURCE_DATE_EPOCH=0
 ENV DEBIAN_FRONTEND=noninteractive
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-lib \
     set -eux; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
@@ -66,8 +102,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     git gcc pkgconf autoconf automake libtool make xorg-dev xutils-dev;
 COPY images/chromium-headful/xorg-deps/ /xorg/
 # build xf86-video-dummy v0.3.8 with RandR support
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-lib \
     set -eux; \
     cd xf86-video-dummy/v0.3.8; \
     patch -p1 < ../01_v0.3.8_xdummy-randr.patch; \
@@ -76,8 +112,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     make -j$(nproc); \
     make install;
 # build custom input driver
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-xorg-apt-lib \
     set -eux; \
     cd xf86-input-neko; \
     ./autogen.sh --prefix=/usr; \
@@ -85,116 +121,38 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     make -j$(nproc); \
     make install;
 
-FROM docker.io/ubuntu:22.04 AS ffmpeg-downloader
-
-# Allow cross-compilation when building with BuildKit platforms
-ARG TARGETARCH
-ARG TARGETOS
-ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    set -xe; \
-    rm -f /etc/apt/apt.conf.d/docker-clean; \
-    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
-    apt-get -yqq update; \
-    apt-get -yqq --no-install-recommends install ca-certificates curl xz-utils;
-
-# Download FFmpeg (latest static build) for the recording server
-RUN --mount=type=cache,target=/tmp/cache/ffmpeg,sharing=locked,id=$CACHEIDPREFIX-ffmpeg \
-    <<-'EOT'
-    set -eux
-    FFMPEG_CACHE_PATH="/tmp/cache/ffmpeg"
-    case ${TARGETARCH:-amd64} in
-        "amd64") FFMPEG_TARGET_ARCH="64" ;;
-        "arm64") FFMPEG_TARGET_ARCH="arm64" ;;
-    esac
-    FFMPEG_TARGET=linux${FFMPEG_TARGET_ARCH:?}
-    ARCHIVE_NAME="ffmpeg-n7.1-latest-${FFMPEG_TARGET}-gpl-7.1.tar.xz"
-    FFMPEG_CACHED_ARCHIVE_PATH="$FFMPEG_CACHE_PATH/$ARCHIVE_NAME"
-    FFMPEG_CACHED_ARCHIVE_CHECKSUM_PATH="$FFMPEG_CACHED_ARCHIVE_PATH.sha256"
-    URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ARCHIVE_NAME"
-    TEMPORARY_SHA256_CHECKSUM_PATH=$(mktemp /tmp/tmp_sha256.XXXXXXXXXX)
-    CONTINUE="true"
-    echo "Downloading FFmpeg checksum"
-    if curl --connect-timeout 10 -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256" -o $TEMPORARY_SHA256_CHECKSUM_PATH; then
-        grep -F "$ARCHIVE_NAME" $TEMPORARY_SHA256_CHECKSUM_PATH > $FFMPEG_CACHED_ARCHIVE_CHECKSUM_PATH
-    else
-        echo "Failed to connect to ffmpeg static build provider for checksum."
-        echo "Checking for cached version to use."
-        if [ -f "$FFMPEG_CACHED_ARCHIVE_CHECKSUM_PATH" ]; then
-            echo "Found cached checksum."
-        else
-            echo "Unable to locate cached checksum."
-            CONTINUE="false"
-        fi
-    fi
-    rm $TEMPORARY_SHA256_CHECKSUM_PATH
-
-    if [ "$CONTINUE" = "false" ]; then
-        exit 1
-    fi
-
-    echo "Checking cache for FFmpeg archive and validating checksum"
-    if (cd $FFMPEG_CACHE_PATH && sha256sum --check $FFMPEG_CACHED_ARCHIVE_CHECKSUM_PATH); then
-        echo "Checksum validated, using cached FFmpeg archive"
-    else
-        echo "Downloading FFmpeg static build from $URL"
-        curl -fsSL "$URL" -o $FFMPEG_CACHED_ARCHIVE_PATH
-        echo "Validating checksum of FFmpeg static build download"
-        (cd $FFMPEG_CACHE_PATH && sha256sum --check $FFMPEG_CACHED_ARCHIVE_CHECKSUM_PATH)
-    fi
-
-    tar -xJf $FFMPEG_CACHED_ARCHIVE_PATH -C /tmp
-    install -m755 /tmp/ffmpeg-*/bin/ffmpeg  /usr/local/bin/ffmpeg
-    install -m755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe
-    rm -rf /tmp/ffmpeg*
-EOT
-
-FROM ghcr.io/kernel/neko/base:3.0.8-v1.4.0 AS neko
+FROM ${NEKO_IMAGE} AS neko
 # ^--- now has event.SYSTEM_PONG with legacy support to keepalive
-FROM node:22-bullseye-slim AS node-22
-FROM docker.io/ubuntu:22.04
+FROM ${NODE_IMAGE} AS node-22
+FROM ${ARTIFACT_MIRROR_IMAGE} AS artifact-mirror
+FROM ${CLOAKBROWSER_IMAGE} AS cloakbrowser
+FROM ubuntu-snapshot AS runtime-base
 
 # Allow cross-compilation when building with BuildKit platforms
 ARG TARGETARCH
 ARG TARGETOS
 ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
+ARG TYPESCRIPT_VERSION=6.0.2
+ARG PLAYWRIGHT_CORE_VERSION=1.59.1
+ARG PATCHRIGHT_VERSION=1.59.4
+ARG ESBUILD_VERSION=0.28.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_PRIORITY=high
 
-# Write a small helper that strips volatile state which would otherwise defeat
-# image reproducibility (apt/dpkg logs, fontconfig cache UUIDs, ldconfig aux,
-# launchpad cache, machine-id, ssh host keys). Called at the end of every
-# RUN that mutates system state.
-RUN <<'EOT'
-set -eu
-cat > /usr/local/sbin/repro-strip <<'STRIP_EOF'
-#!/bin/sh
-# Reproducibility helper: remove volatile state so image layers are bit-stable.
-rm -rf /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
-       /var/cache/ldconfig/aux-cache /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin \
-       /root/.launchpadlib /root/.cache 2>/dev/null
-[ -d /var/cache/fontconfig ] && find /var/cache/fontconfig -name '*.cache-7' -delete 2>/dev/null
-find /usr/share/fonts /usr/local/share/fonts -name '.uuid' -delete 2>/dev/null
-[ -f /etc/machine-id ] && : > /etc/machine-id
-[ -f /var/lib/dbus/machine-id ] && : > /var/lib/dbus/machine-id
-rm -f /etc/ssh/ssh_host_*
-exit 0
-STRIP_EOF
-chmod +x /usr/local/sbin/repro-strip
-EOT
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    --mount=from=artifact-mirror,source=/artifacts,target=/mnt/artifacts,ro \
+    set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache; \
+    mkdir -p /tmp/artifacts; \
+    cp -a /mnt/artifacts/. /tmp/artifacts/; \
     apt-get update && \
-    apt-get -y upgrade && \
-    apt-get --no-install-recommends -y install  \
+    apt-get --no-install-recommends -y install \
     gpg-agent \
-    # UI Requirements
     xvfb \
     xterm \
     xdotool \
@@ -202,9 +160,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     imagemagick \
     sudo \
     mutter \
-    # Python/pyenv reqs
     build-essential \
-    libssl-dev  \
+    libssl-dev \
     zlib1g-dev \
     libbz2-dev \
     libreadline-dev \
@@ -218,27 +175,81 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     libxmlsec1-dev \
     libffi-dev \
     liblzma-dev \
-    # Network tools
     net-tools \
-    # PPA req
-    software-properties-common && \
-    # Userland apps
-    sudo add-apt-repository ppa:mozillateam/ppa && \
-    sudo apt-get --no-install-recommends -y install \
     x11-apps \
     tint2 \
     wget \
     xdg-utils \
     libvulkan1 \
     fontconfig \
+    sqlite3 \
+    # Chromium runtime libs — needed by cloakbrowser since we don't apt-install chromium.
+    libcups2 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
+    libasound2 libpango-1.0-0 libxdamage1 libxkbcommon0 libdrm2 \
+    libxcomposite1 libxfixes3 libxrandr2 libgbm1 \
+    # libxcvt0 from artifact-mirror (debian, not in jammy). Glob excludes chromium*.deb;
+    # those are downloaded into /tmp/artifacts/debs alongside libxcvt0 but unused
+    # because cloakbrowser provides chrome+chromedriver.
+    /tmp/artifacts/debs/libxcvt0_*.deb \
     unzip && \
+    tar -xJf /tmp/artifacts/archives/*.tar.xz -C /tmp && \
+    install -m755 /tmp/ffmpeg-*/bin/ffmpeg /usr/local/bin/ffmpeg && \
+    install -m755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe && \
+    install -m0755 /tmp/artifacts/bin/websocat.* /usr/local/bin/websocat && \
+    rm -rf /tmp/ffmpeg* /tmp/artifacts && \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
+        /run/systemd/resolve/stub-resolv.conf && \
+    rm -rf /var/cache/debconf/* && \
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/fontconfig/* && \
+    find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    /usr/local/sbin/repro-strip
+    find /etc /mnt /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
+FROM scratch AS runtime-checkpoint-1
+COPY --from=runtime-base / /
+
+# Install CloakBrowser (stealth Chromium build) in place of stock chromium.
+# The image bundles a matching chromedriver next to the chrome binary for both
+# amd64 and arm64, so we skip the per-arch chromedriver dance.
+FROM runtime-base AS runtime-chrome
+ARG SOURCE_DATE_EPOCH=0
+COPY --from=cloakbrowser /root/.cloakbrowser /opt/cloakbrowser
+RUN set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
+    CLOAK_DIR=$(find /opt/cloakbrowser -maxdepth 1 -type d -name 'chromium-*' | head -n1); \
+    test -n "$CLOAK_DIR"; \
+    test -x "$CLOAK_DIR/chrome"; \
+    test -x "$CLOAK_DIR/chromedriver"; \
+    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium; \
+    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium-browser; \
+    ln -sf "$CLOAK_DIR/chromedriver" /usr/local/bin/chromedriver; \
+    chromium --version; \
+    chromedriver --version; \
+    find /etc /opt /usr -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+FROM scratch AS runtime-checkpoint-1b
+COPY --from=runtime-chrome / /
+
+FROM runtime-chrome AS runtime-fonts
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # Install fonts to match a realistic Ubuntu 22.04 desktop fingerprint.
 # A minimal container has only 3 fonts, which is a strong fingerprinting signal
 # used by reCAPTCHA Enterprise and other bot detection vendors.
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
+    apt-get update && \
     apt-get --no-install-recommends -y install \
     fonts-liberation \
     fonts-liberation2 \
@@ -264,21 +275,32 @@ RUN apt-get update && \
     fonts-sil-padauk \
     fonts-thai-tlwg \
     fonts-tibetan-machine \
-    fonts-droid-fallback \
-    fonts-unifont && \
+    fonts-droid-fallback && \
     fc-cache -f && \
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/debconf/* && \
+    rm -rf /var/cache/fontconfig/* && \
+    find /var/log -mindepth 1 -delete && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    /usr/local/sbin/repro-strip
+    find /etc /mnt /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-# install ffmpeg manually since the version available in apt is from the 4.x branch due to #drama.
-COPY --from=ffmpeg-downloader /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-downloader /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+FROM scratch AS runtime-checkpoint-2
+COPY --from=runtime-fonts / /
 
+FROM runtime-fonts AS runtime-system
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # runtime
 ENV USERNAME=root
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
     set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
     apt-get update; \
     apt-get --no-install-recommends -y install \
     wget ca-certificates python2 supervisor xclip xdotool unclutter \
@@ -288,12 +310,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
     gstreamer1.0-pulseaudio gstreamer1.0-omx; \
-    #
-    # install libxcvt0 (not available in debian:bullseye)
-    ARCH=$(dpkg --print-architecture); \
-    wget http://ftp.de.debian.org/debian/pool/main/libx/libxcvt/libxcvt0_0.1.2-1_${ARCH}.deb; \
-    apt-get --no-install-recommends install ./libxcvt0_0.1.2-1_${ARCH}.deb; \
-    rm ./libxcvt0_0.1.2-1_${ARCH}.deb; \
     #
     # workaround for an X11 problem: http://blog.tigerteufel.de/?p=476
     mkdir /tmp/.X11-unix; \
@@ -308,49 +324,29 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ap
     chmod 1777 /var/log/neko; \
     chown $USERNAME /var/log/neko/ /tmp/runtime-$USERNAME; \
     chown -R $USERNAME:$USERNAME /home/$USERNAME; \
-    apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    /usr/local/sbin/repro-strip
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache; \
+    rm -rf /var/cache/debconf/*; \
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete; \
+    find /etc /home /mnt /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-# Chromium runtime libs (previously pulled in transitively by apt chromium)
-# plus sqlite3 for debugging the cookies file.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-apt-cache \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-apt-lib \
-    apt-get update -y && \
-    apt-get --no-install-recommends -y install \
-    sqlite3 \
-    libcups2 \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libatspi2.0-0 \
-    libasound2 \
-    libpango-1.0-0 \
-    libxdamage1 \
-    libxkbcommon0 \
-    libdrm2 \
-    libxcomposite1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    /usr/local/sbin/repro-strip
+FROM scratch AS runtime-checkpoint-3
+COPY --from=runtime-system / /
 
-# Install CloakBrowser (stealth Chromium build) in place of stock chromium.
-# The image bundles a matching chromedriver next to the chrome binary for both
-# amd64 and arm64, so we skip the per-arch chromedriver dance.
-COPY --from=cloakhq/cloakbrowser@sha256:a82f46784efbf2dcdcfb35e45842a5d4259db68f4efca76b10d030521d666a78 /root/.cloakbrowser /opt/cloakbrowser
-RUN set -eux; \
-    CLOAK_DIR=$(find /opt/cloakbrowser -maxdepth 1 -type d -name 'chromium-*' | head -n1); \
-    test -n "$CLOAK_DIR"; \
-    test -x "$CLOAK_DIR/chrome"; \
-    test -x "$CLOAK_DIR/chromedriver"; \
-    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium; \
-    ln -sf "$CLOAK_DIR/chrome" /usr/bin/chromium-browser; \
-    ln -sf "$CLOAK_DIR/chromedriver" /usr/local/bin/chromedriver; \
-    chromium --version; \
-    chromedriver --version
-
+FROM runtime-system AS runtime-node
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
+ARG TYPESCRIPT_VERSION=6.0.2
+ARG PLAYWRIGHT_CORE_VERSION=1.59.1
+ARG PATCHRIGHT_VERSION=1.59.4
+ARG ESBUILD_VERSION=0.28.0
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
 COPY shared/chromium-policies/managed/policy.json /etc/chromium/policies/managed/policy.json
@@ -366,30 +362,55 @@ RUN set -eux; \
     ln -sf /usr/local/lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack; \
     fi
 
-# Install TypeScript, Playwright, Patchright, esbuild globally.
-# NODE_COMPILE_CACHE="" disables Node 22's V8 module compile cache, which would
-# otherwise drop ~550 non-deterministic files into /tmp/node-compile-cache.
+# Install TypeScript, Playwright, Patchright, esbuild globally
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
-    NODE_COMPILE_CACHE="" npm install -g typescript playwright-core patchright esbuild && \
-    rm -rf /tmp/node-compile-cache
+    set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
+    npm install -g \
+        typescript@${TYPESCRIPT_VERSION} \
+        playwright-core@${PLAYWRIGHT_CORE_VERSION} \
+        patchright@${PATCHRIGHT_VERSION} \
+        esbuild@${ESBUILD_VERSION}; \
+    rm -rf /tmp/node-compile-cache; \
+    find /etc /home /mnt /root /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* -o -path /root/.npm -o -path /root/.npm/\* \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
+FROM scratch AS runtime-checkpoint-4
+COPY --from=runtime-node / /
+
+FROM runtime-node AS runtime-ssh
+ARG TARGETARCH
+ARG TARGETOS
+ARG CACHEIDPREFIX=${TARGETOS:-linux}-${TARGETARCH:-amd64}-ubuntu2204
+ARG SOURCE_DATE_EPOCH=0
 # Pre-install openssh-server and websocat for faster SSH setup via kernel CLI.
 # Only installed, NOT configured: no host keys, no custom config, service not enabled.
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-cache \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked,id=$CACHEIDPREFIX-runtime-apt-lib \
+    set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
+    apt-get update && \
     apt-get --no-install-recommends -y install openssh-server && \
-    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    rm -f /var/cache/ldconfig/aux-cache && \
+    rm -rf /var/cache/debconf/* && \
     rm -f /etc/ssh/ssh_host_* && \
-    ARCH=$(dpkg --print-architecture) && \
-    case "$ARCH" in \
-        amd64) WEBSOCAT_ARCH="x86_64" ;; \
-        arm64) WEBSOCAT_ARCH="aarch64" ;; \
-        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
-    esac && \
-    curl -fsSL "https://github.com/vi/websocat/releases/download/v1.14.1/websocat.${WEBSOCAT_ARCH}-unknown-linux-musl" \
-        -o /usr/local/bin/websocat && \
-    chmod +x /usr/local/bin/websocat && \
-    /usr/local/sbin/repro-strip
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete && \
+    find /etc /home /mnt /run /tmp /usr /var -xdev \
+        \( -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf -o -path /mnt/artifacts -o -path /mnt/artifacts/\* \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
+FROM scratch AS runtime-checkpoint-5
+COPY --from=runtime-ssh / /
+
+FROM runtime-ssh AS runtime
+ARG SOURCE_DATE_EPOCH=0
 # setup desktop env & app
 ENV DISPLAY_NUM=1
 ENV HEIGHT=1080
@@ -404,9 +425,8 @@ COPY --from=xorg-deps /usr/local/lib/xorg/modules/drivers/dummy_drv.so /usr/lib/
 COPY --from=xorg-deps /usr/local/lib/xorg/modules/input/neko_drv.so /usr/lib/xorg/modules/input/neko_drv.so
 
 COPY images/chromium-headful/image-chromium/ /
-COPY images/chromium-headful/start-pulseaudio.sh /images/chromium-headful/start-pulseaudio.sh
-RUN chmod +x /images/chromium-headful/start-pulseaudio.sh
-COPY images/chromium-headful/wrapper.sh /wrapper.sh
+COPY --chmod=0755 images/chromium-headful/start-pulseaudio.sh /images/chromium-headful/start-pulseaudio.sh
+COPY --chmod=0755 images/chromium-headful/wrapper.sh /wrapper.sh
 COPY images/chromium-headful/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/services/
 # copy the kernel-images API binary built in the builder stage
@@ -430,10 +450,35 @@ RUN esbuild /tmp/playwright-daemon.ts \
     && rm /tmp/playwright-daemon.ts
 
 RUN useradd -m -s /bin/bash kernel && \
-    # useradd's shadow-locking can leave a stale-but-byte-equal /etc/shadow-
-    # backup that flickers across builds (BuildKit's overlay diff detects the
-    # inode change even when content is unchanged). Drop the backup files
-    # outright — containers don't need them.
-    rm -f /etc/shadow- /etc/passwd- /etc/group- /etc/gshadow- /etc/subuid- /etc/subgid-
+    chage -d "$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%d)" kernel
+
+FROM runtime AS packager
+ARG SOURCE_DATE_EPOCH=0
+RUN set -eux; \
+    touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /var/cache/ldconfig/aux-cache \
+        /run/systemd/resolve/stub-resolv.conf; \
+    rm -rf /var/cache/debconf/*; \
+    rm -rf /var/cache/fontconfig/*; \
+    find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
+    find /var/log -mindepth 1 \
+        ! -path /var/log/neko \
+        ! -path /var/log/neko/* \
+        -delete; \
+    mkdir -p /var/log/neko; \
+    chmod 1777 /var/log/neko; \
+    find / \
+        \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o \
+        -newerct "$touch_start" \
+        -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+FROM scratch
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV USERNAME=root
+ENV DISPLAY_NUM=1
+ENV HEIGHT=1080
+ENV WIDTH=1920
+ENV WITHDOCKER=true
+COPY --from=packager / /
 
 ENTRYPOINT [ "/wrapper.sh" ]
