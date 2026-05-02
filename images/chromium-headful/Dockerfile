@@ -58,26 +58,23 @@ COPY images/chromium-headful/client/ .
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm npm run build
 
 FROM ${UBUNTU_IMAGE} AS ubuntu-snapshot
-ARG UBUNTU_SNAPSHOT=20260416T000000Z
+# UBUNTU_SNAPSHOT is kept as an ARG for compatibility with the parent CI, which
+# still passes it via --build-arg. We don't actually rewrite apt sources to
+# snapshot.ubuntu.com here because that cluster (185.125.189.0/24) filters
+# Blacksmith and most cloud/CI egress IP ranges, leaving CI permanently broken.
+# Falling back to the base image's default archive.ubuntu.com sources trades
+# cross-day apt reproducibility for build reachability — same-host-same-day
+# reproducibility within minutes still holds, and specific packages we care
+# about being pinned (libxcvt0, ffmpeg, websocat) are still SHA-pinned via
+# chromium-lock.json + the artifact-mirror flow.
+ARG UBUNTU_SNAPSHOT=
 ARG SOURCE_DATE_EPOCH=0
 RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/ca-certificates.crt,ro \
     set -eux; \
-    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; \
-    mkdir -p /etc/ssl/certs /etc/apt/apt.conf.d; \
+    mkdir -p /etc/ssl/certs; \
     install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
-    printf '%s\n' \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse" \
-        >/etc/apt/sources.list; \
-    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" \
         /etc \
-        /etc/apt \
-        /etc/apt/apt.conf.d \
-        /etc/apt/apt.conf.d/99snapshot \
-        /etc/apt/sources.list \
         /etc/ssl \
         /etc/ssl/certs \
         /etc/ssl/certs/ca-certificates.crt
