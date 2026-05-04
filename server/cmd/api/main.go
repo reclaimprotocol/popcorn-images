@@ -138,6 +138,7 @@ func main() {
 		id := chi.URLParam(r, "process_id")
 		apiService.HandleProcessAttachWS(w, r, id)
 	})
+	r.Post("/reclaim/validate-extraction", apiService.HandleReclaimValidateExtraction)
 
 	// Serve extension files for Chrome policy-installed extensions
 	// This allows Chrome to download .crx and update.xml files via HTTP
