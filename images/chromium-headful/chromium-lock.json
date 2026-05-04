@@ -7,25 +7,25 @@
         {
           "name": "chromium-common",
           "filename": "chromium-common_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-common_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/859619545/chromium-common_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
           "sha256": "4359f081a8038b1d70ec33b349ae8021ca0eeb28aa5b5876159276d9721041b5"
         },
         {
           "name": "chromium",
           "filename": "chromium_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/859619549/chromium_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
           "sha256": "b3df893c5184d722abae7dae7f501fb43d7511e0f4b293b3ebed5e90c5e8f817"
         },
         {
           "name": "chromium-driver",
           "filename": "chromium-driver_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-driver_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/859619540/chromium-driver_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
           "sha256": "fd119b6d299832d00fd1e2a13befd8db4b57da95ea2c53809db03ea5e2607cce"
         },
         {
           "name": "chromium-sandbox",
           "filename": "chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
+          "url": "https://launchpadlibrarian.net/859619547/chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_amd64.deb",
           "sha256": "46b996bd625df17c6f4643b32a337afbb9ef35186863449f217059c36b32fc1b"
         }
       ],
@@ -33,25 +33,25 @@
         {
           "name": "chromium-common",
           "filename": "chromium-common_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-common_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/859587363/chromium-common_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
           "sha256": "a0e0875343ce84c960cbdbae97611ea8169606c5e406d3bfe7b8812aa50f5f17"
         },
         {
           "name": "chromium",
           "filename": "chromium_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/859587367/chromium_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
           "sha256": "98d0c1ba3da4de49b6820c212958e36ffcf547cb168e0c6ac163c8663f389de7"
         },
         {
           "name": "chromium-driver",
           "filename": "chromium-driver_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-driver_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/859587358/chromium-driver_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
           "sha256": "9c4714895cf2cd34b29111942137c25517ea26ed250c7fd8008989e0739f5ef5"
         },
         {
           "name": "chromium-sandbox",
           "filename": "chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
-          "url": "https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
+          "url": "https://launchpadlibrarian.net/859587365/chromium-sandbox_147.0.7727.137-1xtradeb1.2204.1_arm64.deb",
           "sha256": "a5379e6117693fcf8dc613e06ffc51d17300253af3d229777cafa1910085b5a1"
         }
       ]
