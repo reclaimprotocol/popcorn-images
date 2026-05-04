@@ -6,10 +6,6 @@ WORKDIR /mirror
 ARG TARGETARCH
 ARG SOURCE_DATE_EPOCH=0
 ARG ARTIFACT_MIRROR_PREFIX=
-# Set SKIP_CHROMIUM=1 to omit chromium .deb downloads. Used by branches that
-# install chromium another way (e.g. cloakbrowser) and don't need apt chromium.
-ARG SKIP_CHROMIUM=
-ENV SKIP_CHROMIUM=${SKIP_CHROMIUM}
 
 COPY images/chromium-headful/chromium-lock.json /tmp/chromium-lock.json
 
@@ -179,14 +175,13 @@ function concurrencyForHost(host) {
 
 async function main() {
   const arch = process.env.TARGETARCH || 'amd64';
-  const skipChromium = !!process.env.SKIP_CHROMIUM;
   const lock = JSON.parse(await fs.readFile('/tmp/chromium-lock.json', 'utf8'));
-  const chromiumPackages = skipChromium ? [] : lock.chromium?.packages?.[arch];
+  const chromiumPackages = lock.chromium?.packages?.[arch];
   const libxcvtPackage = lock.libxcvt0?.packages?.[arch];
   const ffmpegArchive = lock.ffmpeg?.archives?.[arch];
   const websocatBinary = lock.websocat?.binaries?.[arch];
 
-  if ((!skipChromium && !chromiumPackages) || !libxcvtPackage || !ffmpegArchive || !websocatBinary) {
+  if (!chromiumPackages || !libxcvtPackage || !ffmpegArchive || !websocatBinary) {
     throw new Error(`unsupported arch in chromium lock: ${arch}`);
   }
 

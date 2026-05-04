@@ -42,13 +42,10 @@ PLATFORM="${PLATFORM:-linux/amd64}"
 # Build the artifact-mirror image first (chromium-lock-pinned debs, ffmpeg, websocat).
 # Uses the default docker driver so the resulting image lands in the local daemon
 # where the main build (also docker driver) can resolve it via FROM.
-# We only consume libxcvt0.deb + ffmpeg + websocat from it; the chromium .debs are
-# unused — cloakbrowser provides chrome/chromedriver — so SKIP_CHROMIUM=1.
 (cd "$PARENT_REPO_ROOT" && docker buildx build \
     --platform="$PLATFORM" \
     --build-arg "SOURCE_DATE_EPOCH=0" \
     --build-arg "ARTIFACT_MIRROR_PREFIX=$ARTIFACT_MIRROR_PREFIX" \
-    --build-arg "SKIP_CHROMIUM=1" \
     --provenance=false --sbom=false \
     -f "$SCRIPT_DIR/artifact-mirror.Dockerfile" \
     -t "$ARTIFACT_MIRROR_IMAGE" \
