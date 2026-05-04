@@ -68,17 +68,29 @@ FROM ${UBUNTU_IMAGE} AS ubuntu-snapshot
 # reproducibility within minutes still holds, and specific packages we care
 # about being pinned (libxcvt0, ffmpeg, websocat) are still SHA-pinned via
 # chromium-lock.json + the artifact-mirror flow.
+#
+# We also redirect security.ubuntu.com → archive.ubuntu.com because Canonical's
+# security mirror (185.125.190.0/24) is in the same egress-filtered range as
+# snapshot.ubuntu.com and is unreachable from Blacksmith. archive.ubuntu.com
+# serves the security pocket too with a small replication delay, which is
+# acceptable for jammy LTS.
 ARG UBUNTU_SNAPSHOT=
 ARG SOURCE_DATE_EPOCH=0
 RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/ca-certificates.crt,ro \
     set -eux; \
     mkdir -p /etc/ssl/certs; \
     install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
+    sed -i \
+        -e 's|http://security\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        -e 's|http://[a-z]*\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        /etc/apt/sources.list; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" \
         /etc \
         /etc/ssl \
         /etc/ssl/certs \
-        /etc/ssl/certs/ca-certificates.crt
+        /etc/ssl/certs/ca-certificates.crt \
+        /etc/apt \
+        /etc/apt/sources.list
 
 # xorg dependencies
 FROM ubuntu-snapshot AS xorg-deps
