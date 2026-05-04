@@ -6,11 +6,17 @@ WORKDIR /mirror
 ARG TARGETARCH
 ARG SOURCE_DATE_EPOCH=0
 ARG ARTIFACT_MIRROR_PREFIX=
+# When SKIP_CHROMIUM=1 (signaled by .skip-chromium-publish in the parent),
+# the cloak runtime base supplies chrome+chromedriver itself, so the four
+# chromium .debs (~165 MB, dominated by the chromium binary) are mounted
+# from the artifact mirror but never installed. Skipping them here drops
+# the slow launchpadlibrarian.net stage entirely.
+ARG SKIP_CHROMIUM=
 
 COPY images/chromium-headful/chromium-lock.json /tmp/chromium-lock.json
 
 RUN mkdir -p /mirror/artifacts/debs /mirror/artifacts/archives /mirror/artifacts/bin && \
-    node <<'EOF'
+    SKIP_CHROMIUM="${SKIP_CHROMIUM}" node <<'EOF'
 const { createHash } = require('node:crypto');
 const { createReadStream, createWriteStream, promises: fs } = require('node:fs');
 const path = require('node:path');
@@ -175,14 +181,19 @@ function concurrencyForHost(host) {
 
 async function main() {
   const arch = process.env.TARGETARCH || 'amd64';
+  const skipChromium = !!process.env.SKIP_CHROMIUM;
   const lock = JSON.parse(await fs.readFile('/tmp/chromium-lock.json', 'utf8'));
-  const chromiumPackages = lock.chromium?.packages?.[arch];
+  const chromiumPackages = skipChromium ? [] : lock.chromium?.packages?.[arch];
   const libxcvtPackage = lock.libxcvt0?.packages?.[arch];
   const ffmpegArchive = lock.ffmpeg?.archives?.[arch];
   const websocatBinary = lock.websocat?.binaries?.[arch];
 
-  if (!chromiumPackages || !libxcvtPackage || !ffmpegArchive || !websocatBinary) {
+  if (!libxcvtPackage || !ffmpegArchive || !websocatBinary || (!skipChromium && !chromiumPackages)) {
     throw new Error(`unsupported arch in chromium lock: ${arch}`);
+  }
+
+  if (skipChromium) {
+    console.log('[skip-chromium] omitting chromium .debs; cloak runtime supplies chrome itself');
   }
 
   const downloads = [
