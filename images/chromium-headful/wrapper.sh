@@ -163,24 +163,206 @@ start_dynamic_log_aggregator
 
 export DISPLAY=:1
 
-# CloakBrowser stealth defaults. The javascript `launch()` wrapper normally injects
-# these; we invoke the chromium binary directly via chromium-launcher, so we add
-# them here. Without them, Akamai/Kasada flag the Linux fingerprint and the
-# unseeded GPU/hardware values. Seed is persisted in the user-data-dir so the
-# spoofed identity stays consistent across restarts (flipping fingerprints for
-# the same persisted profile is itself a bot signal).
-CLOAK_SEED_FILE="/home/kernel/user-data/.cloak-fingerprint-seed"
-mkdir -p "$(dirname "$CLOAK_SEED_FILE")"
+# CloakBrowser stealth defaults. The javascript `launch()` wrapper normally
+# injects these; we invoke the chromium binary directly via chromium-launcher,
+# so we add them here. Without all four, Akamai/Cloudflare correlate the
+# mismatch: --fingerprint-platform=windows spoofs navigator.platform and
+# Sec-CH-UA-Platform to Windows, but Intl.DateTimeFormat().resolvedOptions()
+# .timeZone, navigator.language, and Date arithmetic still report whatever
+# the underlying Linux container says. A "Windows" UA reporting Etc/UTC and
+# lang=C is the tell that closes the trap.
+#
+# Seed, timezone, and locale are all persisted in user-data so the spoofed
+# identity stays stable across restarts. Flipping any of these against the
+# same profile is itself a bot signal — bot detectors track per-cookie-jar
+# fingerprint stability.
+CLOAK_PROFILE_DIR="/home/kernel/user-data"
+mkdir -p "$CLOAK_PROFILE_DIR"
+
+# Profile seed bundle. If $CLOAK_PROFILE_SEED points at a tarball and the
+# user-data dir looks empty, seed it. This is how cluster instances start
+# pre-logged-in: bundle a curated profile-state.tar.gz on a successful
+# manual login, ship that bundle alongside the image, and every fresh
+# instance untars it as its starting state. Keeps cookies, localStorage,
+# IndexedDB, and the persisted fingerprint seed intact.
+#
+# Skipped on subsequent boots (presence of .cloak-fingerprint-seed
+# indicates the profile is already initialized), so a successful 2FA
+# session inside the cluster instance accumulates further state without
+# being clobbered by the original seed bundle.
+#
+# The bundle is a *credential* — it carries auth cookies for whatever
+# sites you logged into. Treat it like a password: never commit, never
+# distribute over plain HTTP, rotate when it expires.
+if [[ -n "${CLOAK_PROFILE_SEED:-}" ]] \
+   && [[ -f "$CLOAK_PROFILE_SEED" ]] \
+   && [[ ! -e "$CLOAK_PROFILE_DIR/.cloak-fingerprint-seed" ]] \
+   && [[ ! -e "$CLOAK_PROFILE_DIR/Default" ]]; then
+  echo "[wrapper] seeding profile from $CLOAK_PROFILE_SEED"
+  tar -xzf "$CLOAK_PROFILE_SEED" -C "$CLOAK_PROFILE_DIR" \
+    && echo "[wrapper] profile seed restored" \
+    || echo "[wrapper] profile seed extraction failed (continuing with empty profile)" >&2
+fi
+
+CLOAK_SEED_FILE="$CLOAK_PROFILE_DIR/.cloak-fingerprint-seed"
 if [[ -s "$CLOAK_SEED_FILE" ]]; then
   CLOAK_SEED=$(cat "$CLOAK_SEED_FILE")
 else
-  CLOAK_SEED=$(( (RANDOM * 32768 + RANDOM) % 90000 + 10000 ))
+  # CSPRNG seed (was bash $RANDOM, which is 15-bit and seeds collide across
+  # fleet workers within hours — Akamai correlates _abck cookies on identical
+  # fingerprint seeds. /dev/urandom gives 32-bit entropy with negligible
+  # collision probability across thousands of pods.
+  CLOAK_SEED=$(( $(od -An -N4 -tu4 < /dev/urandom | tr -d ' ') % 9000000 + 1000000 ))
   echo "$CLOAK_SEED" > "$CLOAK_SEED_FILE"
 fi
-export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --fingerprint=${CLOAK_SEED} --fingerprint-platform=windows --ignore-gpu-blocklist"
+
+# geoip=True equivalent. CloakBrowser's launch() wrapper has a `geoip=True`
+# option that resolves the proxy exit IP to a timezone + locale at startup
+# and pins the fingerprint to those values. We're not using launch(), so we
+# replicate it inline: query ipapi.co once on first boot, derive timezone
+# from the response, derive a primary locale from `languages`, and persist.
+# Akamai/Cloudflare grade higher when the spoofed timezone+locale match the
+# IP's geographical region — running a residential proxy in Frankfurt while
+# reporting `Etc/UTC` + `en-US` is the tell. Default on; flip off with
+# CLOAK_GEOIP=false if you want to pin manually via CLOAK_TIMEZONE / CLOAK_LOCALE.
+CLOAK_GEOIP="${CLOAK_GEOIP:-true}"
+CLOAK_TZ_FILE="$CLOAK_PROFILE_DIR/.cloak-fingerprint-timezone"
+CLOAK_LOCALE_FILE="$CLOAK_PROFILE_DIR/.cloak-fingerprint-locale"
+
+if [[ ! -s "$CLOAK_TZ_FILE" || ! -s "$CLOAK_LOCALE_FILE" ]] \
+   && [[ "$CLOAK_GEOIP" == "true" ]]; then
+  echo "[wrapper] geoip: resolving timezone/locale from current exit IP…"
+  # 5s timeout; fail open. ipapi.co/json returns flat JSON with `timezone`
+  # and CSV `languages` ("en-US,es-US,..."). Parse with awk to avoid a jq
+  # dependency. The 1000-req/day rate limit is plenty for first-boot use.
+  GEOIP_JSON=$(curl -s --max-time 5 https://ipapi.co/json/ 2>/dev/null || true)
+  if [[ -n "$GEOIP_JSON" ]]; then
+    GEOIP_TZ=$(echo "$GEOIP_JSON" \
+      | awk -F'"' '/"timezone"[[:space:]]*:/ {print $4; exit}')
+    GEOIP_LANGS=$(echo "$GEOIP_JSON" \
+      | awk -F'"' '/"languages"[[:space:]]*:/ {print $4; exit}')
+    GEOIP_LOCALE=$(echo "$GEOIP_LANGS" | awk -F',' '{print $1}')
+    [[ -n "$GEOIP_TZ" ]]     && CLOAK_TIMEZONE="${CLOAK_TIMEZONE:-$GEOIP_TZ}"
+    [[ -n "$GEOIP_LOCALE" ]] && CLOAK_LOCALE="${CLOAK_LOCALE:-$GEOIP_LOCALE}"
+    echo "[wrapper] geoip: timezone=${CLOAK_TIMEZONE:-?} locale=${CLOAK_LOCALE:-?}"
+  else
+    echo "[wrapper] geoip: lookup failed (offline or rate-limited); falling back to env/defaults"
+  fi
+fi
+
+# Persisted-file priority: file → env (or geoip-resolved env) → fallback.
+# Once persisted, the value sticks across restarts regardless of env or
+# geoip changes — the spoofed identity must remain stable for the same
+# cookie jar.
+if [[ -s "$CLOAK_TZ_FILE" ]]; then
+  CLOAK_TIMEZONE=$(cat "$CLOAK_TZ_FILE")
+else
+  CLOAK_TIMEZONE="${CLOAK_TIMEZONE:-${TZ:-America/Los_Angeles}}"
+  echo "$CLOAK_TIMEZONE" > "$CLOAK_TZ_FILE"
+fi
+
+if [[ -s "$CLOAK_LOCALE_FILE" ]]; then
+  CLOAK_LOCALE=$(cat "$CLOAK_LOCALE_FILE")
+else
+  CLOAK_LOCALE="${CLOAK_LOCALE:-en-US}"
+  echo "$CLOAK_LOCALE" > "$CLOAK_LOCALE_FILE"
+fi
+
+# Align the OS-level TZ and zoneinfo so getTimezoneOffset() / Date arithmetic
+# match the spoofed Intl timezone. Without this, JS computing offset from
+# `new Date()` reads the container TZ while Intl reports the spoofed value —
+# a one-line correlation Akamai catches.
+export TZ="$CLOAK_TIMEZONE"
+if [[ -r "/usr/share/zoneinfo/$CLOAK_TIMEZONE" ]]; then
+  ln -sf "/usr/share/zoneinfo/$CLOAK_TIMEZONE" /etc/localtime 2>/dev/null || true
+  echo "$CLOAK_TIMEZONE" > /etc/timezone 2>/dev/null || true
+fi
+
+export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} \
+  --fingerprint=${CLOAK_SEED} \
+  --fingerprint-platform=windows \
+  --fingerprint-timezone=${CLOAK_TIMEZONE} \
+  --fingerprint-locale=${CLOAK_LOCALE} \
+  --lang=${CLOAK_LOCALE} \
+  --ignore-gpu-blocklist"
+
+# WebRTC public-IP alignment. CloakBrowser v0.3.26+ supports
+# `--fingerprint-webrtc-ip=auto` which resolves the proxy exit IP at runtime
+# (via STUN through the configured proxy). With geoip on, this is the right
+# default — STUN-leaked srflx candidates would otherwise betray the container's
+# real IP. Set CLOAK_WEBRTC_IP to a literal IP to override the auto resolution.
+if [[ -n "${CLOAK_WEBRTC_IP:-}" ]]; then
+  export CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --fingerprint-webrtc-ip=${CLOAK_WEBRTC_IP}"
+elif [[ "$CLOAK_GEOIP" == "true" ]]; then
+  export CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --fingerprint-webrtc-ip=auto"
+fi
+
+# Stealth status banner — surfaces what's active for ops debugging. If you ever
+# get caught, the first thing to verify is whether all four of these are on.
+# Anything missing is a deterministic Akamai BMP detection vector.
+echo "[stealth] CloakBrowser fingerprint: seed=${CLOAK_SEED} platform=windows tz=${CLOAK_TIMEZONE} locale=${CLOAK_LOCALE}"
+echo "[stealth] geoip resolution: ${CLOAK_GEOIP}"
+echo "[stealth] WebRTC IP spoof: ${CLOAK_WEBRTC_IP:-${CLOAK_GEOIP:+auto}${CLOAK_GEOIP:-disabled}}"
+echo "[stealth] page-world overrides: outerHeight/Width clamped (kiosk geometry leak fix)"
+echo "[stealth] consumer must apply: patchBrowser(browser, resolveConfig('default')) for humanize"
 
 # Set default extension flags for bundled extensions
 export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/kernel/extensions/proxy --load-extension=/home/kernel/extensions/proxy"
+
+# Resource-optimization flags — apply to *every* environment (local docker,
+# K8s/Agones fleet, unikernel) because they live in wrapper.sh rather than the
+# host-side run-docker.sh. Tuned for the 2 vCPU / 3 GiB Agones pod budget.
+#
+# CRITICAL CONSTRAINT: every flag here has been audited against Akamai BMP's
+# JS-side detection surface. Anything that mutates an API a real Chrome page
+# can observe is excluded. The kept set produces no JS-visible side effect:
+# they trim background services, telemetry, internal feature flags, and
+# the GPU-process subsystem. Real Chrome's navigator.plugins, chrome.cast,
+# popup-blocker behavior, and site-isolation boundary all stay intact, which
+# is what BMP fingerprints against.
+#
+# Specifically NOT included even though they'd save memory/CPU:
+#   --disable-features=MediaRouter         → would break chrome.cast.isAvailable()
+#   --disable-component-extensions-with-background-pages
+#                                          → would empty navigator.plugins of PDF viewer
+#   --disable-site-isolation-trials        → core site-per-process stays on, but BMP
+#                                            could probe trial-only behaviors
+#   --disable-popup-blocking               → real Chrome has blocking on by default;
+#                                            window.open behavior diverges if disabled
+#
+# GPU stack: --disable-gpu + --use-gl=swiftshader pairs SwiftShader-software
+# WebGL with a CPU compositor. Crucial: SwiftShader keeps WebGL functional
+# (CloakBrowser's renderer-string spoof needs a real context to overlay), while
+# the GPU process is skipped so the encoder's CPU isn't fighting GL emulation.
+# --enable-unsafe-swiftshader is required on chromium 117+ for SwiftShader to
+# bind without --enable-gpu.
+#
+# Memory: --renderer-process-limit caps process count so a misbehaving site
+# can't fork its way past the 3 GiB pod limit. Site isolation stays on by
+# default — we don't override it.
+export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} \
+  --disable-gpu \
+  --disable-gpu-compositing \
+  --enable-unsafe-swiftshader \
+  --use-gl=swiftshader \
+  --enable-zero-copy \
+  --in-process-gpu \
+  --renderer-process-limit=4 \
+  --mute-audio \
+  --disable-background-networking \
+  --disable-breakpad \
+  --disable-client-side-phishing-detection \
+  --disable-component-update \
+  --disable-default-apps \
+  --disable-domain-reliability \
+  --disable-features=Translate,OptimizationGuideModelDownloading,InterestFeedContentSuggestions,SidePanelPinning,DownloadBubble,DialMediaRouteProvider,CalculateNativeWinOcclusion \
+  --disable-hang-monitor \
+  --disable-prompt-on-repost \
+  --disable-sync \
+  --metrics-recording-only \
+  --no-default-browser-check \
+  --noerrdialogs \
+  --use-mock-keychain"
 
 # Predefine ports and export for services
 export INTERNAL_PORT="${INTERNAL_PORT:-9223}"
@@ -283,12 +465,28 @@ API_OUTPUT_DIR="${KERNEL_IMAGES_API_OUTPUT_DIR:-/recordings}"
 supervisorctl -c /etc/supervisor/supervisord.conf start kernel-images-api
 wait_for_tcp_port 127.0.0.1 "${API_PORT}" "kernel-images API"
 
-echo "[wrapper] Starting ChromeDriver via supervisord"
-supervisorctl -c /etc/supervisor/supervisord.conf start chromedriver
-wait_for_tcp_port 127.0.0.1 9225 "ChromeDriver" 50 0.2 "10s" || true
+# ChromeDriver is only useful for WebDriver-protocol clients (Selenium etc.).
+# Production consumers connect via direct CDP, so chromedriver is dead weight
+# in the cluster — ~50MB RAM and a JVM-style process group. Default off; set
+# ENABLE_CHROMEDRIVER=true for local dev or selenium-style use.
+if [[ "${ENABLE_CHROMEDRIVER:-false}" == "true" ]]; then
+  echo "[wrapper] Starting ChromeDriver via supervisord"
+  supervisorctl -c /etc/supervisor/supervisord.conf start chromedriver
+  wait_for_tcp_port 127.0.0.1 9225 "ChromeDriver" 50 0.2 "10s" || true
+else
+  echo "[wrapper] ChromeDriver disabled (ENABLE_CHROMEDRIVER!=true)"
+fi
 
-echo "[wrapper] Starting PulseAudio daemon via supervisord"
-supervisorctl -c /etc/supervisor/supervisord.conf start pulseaudio
+# PulseAudio: chromium runs with --mute-audio so there's no audio output to
+# route anywhere. PulseAudio is purely overhead in that case (~30MB and a
+# busy-loop service). Default off; set ENABLE_PULSEAUDIO=true if you actually
+# need audio capture.
+if [[ "${ENABLE_PULSEAUDIO:-false}" == "true" ]]; then
+  echo "[wrapper] Starting PulseAudio daemon via supervisord"
+  supervisorctl -c /etc/supervisor/supervisord.conf start pulseaudio
+else
+  echo "[wrapper] PulseAudio disabled (ENABLE_PULSEAUDIO!=true)"
+fi
 
 # close the "--no-sandbox unsupported flag" warning when running as root
 # in the unikernel runtime we haven't been able to get chromium to launch as non-root without cryptic crashpad errors

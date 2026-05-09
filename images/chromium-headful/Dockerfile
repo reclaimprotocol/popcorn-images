@@ -135,6 +135,7 @@ ARG TYPESCRIPT_VERSION=6.0.2
 ARG PLAYWRIGHT_CORE_VERSION=1.59.1
 ARG PATCHRIGHT_VERSION=1.59.4
 ARG ESBUILD_VERSION=0.28.0
+ARG CLOAKBROWSER_NPM_VERSION=0.3.26
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_PRIORITY=high
@@ -345,6 +346,7 @@ ARG TYPESCRIPT_VERSION=6.0.2
 ARG PLAYWRIGHT_CORE_VERSION=1.59.1
 ARG PATCHRIGHT_VERSION=1.59.4
 ARG ESBUILD_VERSION=0.28.0
+ARG CLOAKBROWSER_NPM_VERSION=0.3.26
 # Copy Chromium policy configuration
 RUN mkdir -p /etc/chromium/policies/managed
 COPY shared/chromium-policies/managed/policy.json /etc/chromium/policies/managed/policy.json
@@ -360,7 +362,17 @@ RUN set -eux; \
     ln -sf /usr/local/lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack; \
     fi
 
-# Install TypeScript, Playwright, Patchright, esbuild globally
+# Install TypeScript, Playwright, Patchright, CloakBrowser (JS humanize helpers
+# only — the chromium binary already comes from the cloakbrowser OCI image
+# stage), and esbuild globally.
+#
+# CLOAKBROWSER_AUTO_UPDATE=false + CLOAKBROWSER_BINARY_PATH point the npm
+# package at the existing /opt/cloakbrowser binary so its postinstall doesn't
+# fetch a duplicate ~200MB chromium at image-build time. We only need the JS
+# package for `cloakbrowser/human` (patchBrowser, resolveConfig) — the daemon
+# never calls launch().
+ENV CLOAKBROWSER_AUTO_UPDATE=false
+ENV CLOAKBROWSER_BINARY_PATH=/usr/bin/chromium
 RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
     set -eux; \
     touch_start="$(date -u +'%Y-%m-%d %H:%M:%S')"; \
@@ -368,6 +380,7 @@ RUN --mount=type=cache,target=/root/.npm,id=$CACHEIDPREFIX-npm \
         typescript@${TYPESCRIPT_VERSION} \
         playwright-core@${PLAYWRIGHT_CORE_VERSION} \
         patchright@${PATCHRIGHT_VERSION} \
+        cloakbrowser@${CLOAKBROWSER_NPM_VERSION} \
         esbuild@${ESBUILD_VERSION}; \
     rm -rf /tmp/node-compile-cache; \
     find /etc /home /mnt /root /run /tmp /usr /var -xdev \
@@ -444,6 +457,7 @@ RUN esbuild /tmp/playwright-daemon.ts \
     --outfile=/usr/local/lib/playwright-daemon.js \
     --external:playwright-core \
     --external:patchright \
+    --external:cloakbrowser \
     --external:esbuild \
     && rm /tmp/playwright-daemon.ts
 

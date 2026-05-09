@@ -14,6 +14,15 @@ import { unlinkSync, existsSync } from 'fs';
 import { transform } from 'esbuild';
 import { chromium as chromiumPW, Browser } from 'playwright-core';
 import { chromium as chromiumPR } from 'patchright';
+// Humanize patches are wrapper-level in CloakBrowser. The fingerprint patches
+// (canvas, WebGL, Sec-CH-UA, navigator.webdriver, ...) ride along with the
+// chromium binary and apply automatically over CDP, but the bezier-curve mouse
+// movement, per-character typing delays, and accelerate/cruise/decelerate
+// scrolling are JS-level monkey-patches over Playwright's Input API. CDP
+// clients have to install them explicitly. Without this, page.click() teleports
+// and reCAPTCHA v3 scores the session ~0.1; with it, ~0.7-0.9 on a residential
+// proxy.
+import { patchBrowser, resolveConfig } from 'cloakbrowser/human';
 
 const SOCKET_PATH = process.env.PLAYWRIGHT_DAEMON_SOCKET || '/tmp/playwright-daemon.sock';
 const CDP_ENDPOINT = process.env.CDP_ENDPOINT || 'ws://127.0.0.1:9222';
@@ -90,6 +99,20 @@ async function ensureBrowserConnection(): Promise<Browser> {
     console.error(`[playwright-daemon] Connecting to CDP: ${CDP_ENDPOINT}`);
     browser = await chromium.connectOverCDP(CDP_ENDPOINT);
     reconnectAttempts = 0;
+
+    // Install humanize on the connection. patchBrowser monkey-patches the
+    // Browser/Context/Page prototypes, so every context and page created from
+    // this connection inherits humanized mouse/keyboard/wheel automatically —
+    // no per-page wiring needed. Preset comes from CLOAKBROWSER_HUMANIZE_PRESET
+    // ('default' or 'careful'); 'careful' is slower and more deliberate, used
+    // when a target's behavioral classifier is especially sensitive.
+    try {
+      const preset = process.env.CLOAKBROWSER_HUMANIZE_PRESET || 'default';
+      patchBrowser(browser, resolveConfig(preset));
+      console.error(`[playwright-daemon] humanize patches installed (preset=${preset})`);
+    } catch (err) {
+      console.error('[playwright-daemon] humanize patch failed; continuing without humanization', err);
+    }
 
     browser.on('disconnected', () => {
       console.error('[playwright-daemon] Browser disconnected');
