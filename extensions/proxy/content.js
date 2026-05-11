@@ -15,17 +15,20 @@
   // Listen for messages from the injected script
   window.addEventListener('message', async (event) => {
     if (event.source !== window) return;
+    if (typeof event.origin !== 'string' || event.origin === 'null' || event.origin === 'undefined') return;
 
     const message = event.data;
     if (!message || !message.type || !message.type.startsWith('PCN_PROXY_')) return;
     if (message.direction !== 'to-extension') return;
+    if (event.origin !== window.location.origin) return;
 
     const requestId = message.requestId;
 
     try {
       const response = await chrome.runtime.sendMessage({
         type: message.type,
-        config: message.config
+        config: message.config,
+        requestOrigin: event.origin
       });
 
       window.postMessage({
@@ -35,7 +38,7 @@
         success: response.success,
         result: response.result || response.config,
         error: response.error
-      }, '*');
+      }, event.origin);
     } catch (error) {
       window.postMessage({
         type: 'PCN_PROXY_RESPONSE',
@@ -43,7 +46,7 @@
         requestId: requestId,
         success: false,
         error: error.message
-      }, '*');
+      }, event.origin);
     }
   });
 })();

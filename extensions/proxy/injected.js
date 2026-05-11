@@ -9,6 +9,8 @@
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
+    if (typeof event.origin !== 'string' || event.origin === 'null') return;
+    if (event.origin !== window.location.origin) return;
 
     const message = event.data;
     if (!message || message.type !== 'PCN_PROXY_RESPONSE') return;
@@ -42,7 +44,7 @@
         direction: 'to-extension',
         requestId: requestId,
         config: config
-      }, '*');
+      }, window.location.origin);
     });
   }
 
