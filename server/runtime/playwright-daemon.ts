@@ -11,6 +11,7 @@
 
 import { createServer, Socket } from 'net';
 import { unlinkSync, existsSync } from 'fs';
+import { createContext, Script, runInContext } from 'node:vm';
 import { transform } from 'esbuild';
 import { chromium as chromiumPW, Browser } from 'playwright-core';
 import { chromium as chromiumPR } from 'patchright';
@@ -37,6 +38,65 @@ interface ExecuteResponse {
   result?: unknown;
   error?: string;
   stack?: string;
+}
+
+function createExecutionContext(page: unknown, context: unknown, browserInstance: Browser) {
+  return createContext({
+    page,
+    context,
+    browser: browserInstance,
+    Promise,
+    Date,
+    Math,
+    JSON,
+    Number,
+    String,
+    Boolean,
+    Error,
+    TypeError,
+    ReferenceError,
+    SyntaxError,
+    URL,
+    URLSearchParams,
+    TextEncoder,
+    TextDecoder,
+    Array,
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+    console: {
+      log: (...args: unknown[]) => console.log(...args),
+      info: (...args: unknown[]) => console.info(...args),
+      warn: (...args: unknown[]) => console.warn(...args),
+      error: (...args: unknown[]) => console.error(...args),
+      debug: (...args: unknown[]) => console.debug(...args),
+    },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    process: undefined,
+    require: undefined,
+    module: undefined,
+    exports: undefined,
+    global: undefined,
+    globalThis: undefined,
+    __dirname: undefined,
+    __filename: undefined,
+    Function: undefined,
+    eval: undefined,
+    Buffer: undefined,
+    WebAssembly: undefined,
+    fetch: undefined,
+  });
+}
+
+function disallowDangerousCode(code: string): string | null {
+  if (/\b(?:node:\s*fs|node:\s*child_process|require\(|import\(|import\s+['"`]|new\s+Function|Function\s*\(|eval\s*\()/i.test(code)) {
+    return 'Restricted syntax is not allowed in daemon execution';
+  }
+  return null;
 }
 
 async function transformCode(code: string): Promise<string> {
@@ -148,15 +208,24 @@ async function executeCode(request: ExecuteRequest): Promise<ExecuteResponse> {
     const pages = context.pages();
     const page = pages.length > 0 ? pages[0] : await context.newPage();
 
-    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-    const userFunction = new AsyncFunction('page', 'context', 'browser', jsCode);
-
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`Execution timed out after ${timeout_ms}ms`)), timeout_ms);
     });
 
+    const sandbox = createExecutionContext(page, context, browserInstance);
+    const wrappedCode = `(async () => {\n${jsCode}\n})();`;
+    const script = new Script(wrappedCode, {
+      filename: `playwright-daemon:${id}`,
+      importModuleDynamically: () => {
+        throw new Error('Dynamic import is disabled in daemon execution');
+      },
+    });
+    const execution = Promise.resolve(runInContext(script, sandbox, {
+      timeout: timeout_ms,
+    }));
+
     const result = await Promise.race([
-      userFunction(page, context, browserInstance),
+      execution,
       timeoutPromise,
     ]);
 
@@ -198,6 +267,12 @@ function handleConnection(socket: Socket): void {
 
       if (!request.id || typeof request.code !== 'string') {
         socket.write(JSON.stringify({ id: request.id || 'unknown', success: false, error: 'Invalid request: missing id or code' }) + '\n');
+        continue;
+      }
+
+      const validationError = disallowDangerousCode(request.code);
+      if (validationError) {
+        socket.write(JSON.stringify({ id: request.id || 'unknown', success: false, error: validationError }) + '\n');
         continue;
       }
 
