@@ -1,5 +1,5 @@
 import { PluginObject } from 'vue'
-import { emitTelemetry } from './otel'
+import { logger } from './otel'
 
 // SeverityNumber from @opentelemetry/api-logs
 enum SeverityNumber {
@@ -89,135 +89,61 @@ function getLogLevel(): string {
   return params.get('log_level') ?? params.get('logLevel') ?? 'off'
 }
 
-const SENSITIVE_FIELD_PATTERNS = [/password/i, /token/i, /jwt/i, /secret/i, /authorization/i]
-
-function sanitizeStringValue(value: string): string {
-  if (!value) return value
-
-  const withoutQueries = value.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/\S+)\?[^\s]*/g, (_, match) => {
-    const [base] = match.split('?')
-    return base
-  })
-  return withoutQueries.replace(
-    /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\b/g,
-    '[REDACTED_JWT]',
-  )
-}
-
-function sanitizeLogArg(arg: any): any {
-  if (typeof arg === 'string') {
-    return sanitizeStringValue(arg)
-  }
-
-  if (arg instanceof Error) {
-    return {
-      name: arg.name,
-      message: sanitizeStringValue(arg.message),
-      stack: sanitizeStringValue(arg.stack || ''),
-    }
-  }
-
-  if (Array.isArray(arg)) {
-    return arg.map((entry) => sanitizeLogArg(entry))
-  }
-
-  if (typeof arg === 'object' && arg !== null) {
-    const normalized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(arg)) {
-      if (SENSITIVE_FIELD_PATTERNS.some((pattern) => pattern.test(key))) {
-        normalized[key] = '[REDACTED]'
-      } else {
-        normalized[key] = sanitizeLogArg(value)
-      }
-    }
-    return normalized
-  }
-
-  return arg
-}
-
-function serializeForTelemetry(log: any[]): string {
-  return log
-    .map((entry) => {
-      if (typeof entry === 'object') {
-        try {
-          return JSON.stringify(sanitizeLogArg(entry))
-        } catch (err) {
-          return String(entry)
-        }
-      }
-      return sanitizeStringValue(String(entry))
-    })
-    .join(' ')
-}
-
-function emitTelemetryLog(level: keyof Logger, body: string, attributes?: Record<string, string>) {
-  const severityConfig: Record<keyof Logger, { number: SeverityNumber; text: string }> = {
-    error: { number: SeverityNumber.ERROR, text: 'ERROR' },
-    warn: { number: SeverityNumber.WARN, text: 'WARN' },
-    info: { number: SeverityNumber.INFO, text: 'INFO' },
-    debug: { number: SeverityNumber.DEBUG, text: 'DEBUG' },
-  }
-
-  emitTelemetry({
-    severityNumber: severityConfig[level].number,
-    severityText: severityConfig[level].text,
-    body,
-    attributes: {
-      ...(attributes ?? {}),
-    },
-  })
-}
-
-function shouldEmitToTelemetry(baseLogger: Logger, method: keyof Logger) {
-  return baseLogger[method] !== offLoggers[method]
-}
-
 const plugin: PluginObject<undefined> = {
   install(Vue) {
     const baseLoggers = createLoggerForLevel(getLogLevel())
 
+    // Wrap base loggers with OTel integration (OTel always gets logs regardless of level)
     window.$log = {
       error: (error: Error) => {
         baseLoggers.error(error)
-        if (shouldEmitToTelemetry(baseLoggers, 'error')) {
-          try {
-            emitTelemetryLog('error', sanitizeStringValue(error.message || error.toString()), {
-              stack: sanitizeStringValue(error.stack || ''),
-            })
-          } catch (e) {
-            console.error('Failed to send log to OTel', e)
-          }
+        try {
+          logger.emit({
+            severityNumber: SeverityNumber.ERROR,
+            severityText: 'ERROR',
+            body: error.message || error.toString(),
+            attributes: {
+              stack: error.stack
+            }
+          })
+        } catch (e) {
+          console.error('Failed to send log to OTel', e)
         }
       },
       warn: (...log: any[]) => {
         baseLoggers.warn(...log)
-        if (shouldEmitToTelemetry(baseLoggers, 'warn')) {
-          try {
-            emitTelemetryLog('warn', sanitizeStringValue(serializeForTelemetry(log)))
-          } catch (e) {
-            console.error('Failed to send log to OTel', e)
-          }
+        try {
+          logger.emit({
+            severityNumber: SeverityNumber.WARN,
+            severityText: 'WARN',
+            body: log.map(l => (typeof l === 'object' ? JSON.stringify(l) : String(l))).join(' '),
+          })
+        } catch (e) {
+          console.error('Failed to send log to OTel', e)
         }
       },
       info: (...log: any[]) => {
         baseLoggers.info(...log)
-        if (shouldEmitToTelemetry(baseLoggers, 'info')) {
-          try {
-            emitTelemetryLog('info', sanitizeStringValue(serializeForTelemetry(log)))
-          } catch (e) {
-            console.error('Failed to send log to OTel', e)
-          }
+        try {
+          logger.emit({
+            severityNumber: SeverityNumber.INFO,
+            severityText: 'INFO',
+            body: log.map(l => (typeof l === 'object' ? JSON.stringify(l) : String(l))).join(' '),
+          })
+        } catch (e) {
+          console.error('Failed to send log to OTel', e)
         }
       },
       debug: (...log: any[]) => {
         baseLoggers.debug(...log)
-        if (shouldEmitToTelemetry(baseLoggers, 'debug')) {
-          try {
-            emitTelemetryLog('debug', sanitizeStringValue(serializeForTelemetry(log)))
-          } catch (e) {
-            console.error('Failed to send log to OTel', e)
-          }
+        try {
+          logger.emit({
+            severityNumber: SeverityNumber.DEBUG,
+            severityText: 'DEBUG',
+            body: log.map(l => (typeof l === 'object' ? JSON.stringify(l) : String(l))).join(' '),
+          })
+        } catch (e) {
+          console.error('Failed to send log to OTel', e)
         }
       },
     }

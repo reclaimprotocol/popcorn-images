@@ -89,11 +89,11 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
 
     this[EVENT.CONNECTING]()
 
-    const websocketUrl = `${url}?password=${encodeURIComponent(password)}&username=${encodeURIComponent(displayname)}`
-
     try {
-      this._ws = new WebSocket(websocketUrl)
-      this.emit('debug', `connecting to ${BaseClient.redactUrl(websocketUrl)}`)
+      this._ws = new WebSocket(
+        `${url}?password=${encodeURIComponent(password)}&username=${encodeURIComponent(displayname)}`,
+      )
+      this.emit('debug', `connecting to ${this._ws.url}`)
       this._ws.onmessage = this.onMessage.bind(this)
       this._ws.onerror = this.onError.bind(this)
       this._ws.onclose = (event) => {
@@ -104,10 +104,6 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
     } catch (err: any) {
       this.onDisconnected(err)
     }
-  }
-
-  private static redactUrl(url: string) {
-    return url.split('?')[0]
   }
 
   protected disconnect() {
