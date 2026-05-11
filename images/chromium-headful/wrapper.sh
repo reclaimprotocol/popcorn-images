@@ -284,7 +284,19 @@ export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} \
   --fingerprint-timezone=${CLOAK_TIMEZONE} \
   --fingerprint-locale=${CLOAK_LOCALE} \
   --lang=${CLOAK_LOCALE} \
-  --ignore-gpu-blocklist"
+  --ignore-gpu-blocklist \
+  --use-fake-device-for-media-stream"
+
+# --use-fake-device-for-media-stream: enumerateDevices() reports synthetic
+# camera/mic/speaker entries instead of an empty list. Real Chrome on a real
+# OS exposes at least one of each; the empty-list signature is a deterministic
+# headless tell that Akamai / reCAPTCHA Enterprise / Cloudflare BOT-MGMT all
+# probe. The device strings are stable per fingerprint seed (Chromium derives
+# them from the same source CloakBrowser seeds), so this stays consistent
+# across pod restarts. NOTE: we deliberately do NOT add --use-fake-ui-for-
+# media-stream — that would auto-grant getUserMedia silently, which is a
+# real security regression on a public/multi-tenant remote browser. The
+# permission prompt stays; only the device list shape changes.
 
 # WebRTC public-IP alignment. CloakBrowser v0.3.26+ supports
 # `--fingerprint-webrtc-ip=auto` which resolves the proxy exit IP at runtime
@@ -306,8 +318,12 @@ echo "[stealth] WebRTC IP spoof: ${CLOAK_WEBRTC_IP:-${CLOAK_GEOIP:+auto}${CLOAK_
 echo "[stealth] page-world overrides: outerHeight/Width clamped (kiosk geometry leak fix)"
 echo "[stealth] consumer must apply: patchBrowser(browser, resolveConfig('default')) for humanize"
 
-# Set default extension flags for bundled extensions
-export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/kernel/extensions/proxy --load-extension=/home/kernel/extensions/proxy"
+# Set default extension flags for bundled extensions.
+#
+# Extensions:
+#   proxy/  — chrome.proxy + page-world __pcn API for runtime proxy config
+EXTENSIONS_LIST="/home/kernel/extensions/proxy"
+export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=${EXTENSIONS_LIST} --load-extension=${EXTENSIONS_LIST}"
 
 # Resource-optimization flags — apply to *every* environment (local docker,
 # K8s/Agones fleet, unikernel) because they live in wrapper.sh rather than the
@@ -346,9 +362,6 @@ export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} \
   --enable-unsafe-swiftshader \
   --use-gl=swiftshader \
   --enable-zero-copy \
-  --in-process-gpu \
-  --renderer-process-limit=4 \
-  --mute-audio \
   --disable-background-networking \
   --disable-breakpad \
   --disable-client-side-phishing-detection \

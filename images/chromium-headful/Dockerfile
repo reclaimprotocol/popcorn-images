@@ -10,7 +10,7 @@ ARG NEKO_IMAGE=ghcr.io/kernel/neko/base:3.0.8-v1.4.0@sha256:bf8a6eddcc7b19062e77
 ARG ARTIFACT_MIRROR_IMAGE=docker.io/library/chromium-base-artifacts:local
 # CloakBrowser is a stealth-Chromium build distributed as an OCI image. Pinned
 # by digest so rebuilds get the exact same chrome+chromedriver bundle.
-ARG CLOAKBROWSER_IMAGE=docker.io/cloakhq/cloakbrowser@sha256:a82f46784efbf2dcdcfb35e45842a5d4259db68f4efca76b10d030521d666a78
+ARG CLOAKBROWSER_IMAGE=docker.io/cloakhq/cloakbrowser@sha256:ef8cf93374235b8432153056ad27676b39e832682589f2fb811efb5bf12c9083
 ARG UBUNTU_SNAPSHOT=20260416T000000Z
 
 FROM ${GOLANG_IMAGE} AS server-builder
@@ -286,7 +286,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     fonts-sil-padauk \
     fonts-thai-tlwg \
     fonts-tibetan-machine \
-    fonts-droid-fallback && \
+    fonts-droid-fallback \
+    # Anti-bot canvas-hash coverage: Kasada/Akamai render emoji and CJK glyphs
+    # on a hidden canvas and hash the pixel output. Missing any of these
+    # produces tofu boxes that hash differently from real Chrome on a real
+    # OS. fonts-noto-color-emoji + fonts-freefont-ttf are already above;
+    # the four below close the remaining gaps (Unifont fallback, JP, CN,
+    # Thai/Lao). Per CloakBrowser docs.
+    fonts-unifont \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-tlwg-loma-otf && \
     fc-cache -f && \
     find /usr/local/share/fonts /usr/share/fonts -name '.uuid' -delete 2>/dev/null || true; \
     rm -rf /var/cache/debconf/* && \
@@ -458,6 +468,12 @@ COPY --from=server-builder /out/chromium-launcher /usr/local/bin/chromium-launch
 
 # Copy bundled extensions
 COPY extensions/proxy/ /home/kernel/extensions/proxy/
+
+# Seeder helper: captures a warm chromium profile after a successful login
+# for use as CLOAK_PROFILE_SEED in worker pods. Run from a seeder pod after
+# completing a supervised login in the live browser:
+#   docker exec <seeder> /scripts/seed-profile.sh /tmp/profile-state.tar.gz
+COPY --chmod=0755 images/chromium-headful/scripts/seed-profile.sh /scripts/seed-profile.sh
 
 # Copy and compile the Playwright daemon
 COPY server/runtime/playwright-daemon.ts /tmp/playwright-daemon.ts
