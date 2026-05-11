@@ -2,11 +2,7 @@ import { LoggerProvider, BatchLogRecordProcessor } from '@opentelemetry/sdk-logs
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http'
 import { resourceFromAttributes } from '@opentelemetry/resources'
 
-// Optional: Add semantic conventions if we want standard attribute names, 
-// but user asked to minimize deps. 
-// We can just use string literals for resource attributes if we didn't install semantic-conventions.
-
-const collectorUrl = process.env.VUE_APP_OTEL_COLLECTOR_URL || 'https://raven.reclaimprotocol.org:4318/v1/logs'
+const collectorUrl = process.env.VUE_APP_OTEL_COLLECTOR_URL
 
 let sessionId = 'unknown'
 
@@ -14,9 +10,7 @@ try {
     // Expected URL format: /browser/test/<jwt>
     // Filter out empty strings to handle potential trailing slashes
     const pathSegments = window.location.pathname.split('/').filter(Boolean)
-    console.log('OTel: Path segments:', pathSegments)
     const jwt = pathSegments[pathSegments.length - 1] // Last segment is usually the JWT
-    console.log('OTel: Potential JWT:', jwt)
 
     if (jwt && jwt.split('.').length === 3) {
         const payload = jwt.split('.')[1]
@@ -32,7 +26,6 @@ try {
         )
 
         const claims = JSON.parse(jsonPayload)
-        console.log('OTel: Extracted claims:', claims)
         if (claims.sub) {
             sessionId = claims.sub
         }
@@ -48,15 +41,32 @@ const resource = resourceFromAttributes({
     ['SessionId']: sessionId,
 })
 
-const exporter = new OTLPLogExporter({
-    url: collectorUrl,
-})
+let logger = null as ReturnType<LoggerProvider['getLogger']> | null
 
-const processor = new BatchLogRecordProcessor(exporter)
+if (collectorUrl) {
+  const exporter = new OTLPLogExporter({
+      url: collectorUrl,
+  })
 
-const loggerProvider = new LoggerProvider({
+  const processor = new BatchLogRecordProcessor(exporter)
+
+  const loggerProvider = new LoggerProvider({
     resource: resource,
     processors: [processor],
-})
+  })
 
-export const logger = loggerProvider.getLogger('popcorn-client-logger')
+  logger = loggerProvider.getLogger('popcorn-client-logger')
+}
+
+type OTelPayload = {
+  severityNumber: number
+  severityText: string
+  body: string
+  attributes?: Record<string, string>
+}
+
+export const isTelemetryEnabled = Boolean(collectorUrl)
+export const emitTelemetry = (item: OTelPayload) => {
+  if (!logger) return
+  logger.emit(item)
+}
