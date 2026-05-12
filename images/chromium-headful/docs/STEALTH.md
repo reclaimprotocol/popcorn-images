@@ -61,7 +61,15 @@ What we ship:
   presents the same identity across restarts (bot classifiers correlate
   fingerprint drift on the same cookie jar — flipping is itself a tell).
   The seed is generated from `/dev/urandom`, not bash `$RANDOM` (15-bit,
-  collides at fleet scale).
+  collides at fleet scale). The seed deterministically maps to every
+  derived dimension including the spoofed `UNMASKED_RENDERER_WEBGL`
+  string — **a non-trivial fraction of seeds map to flagship discrete
+  GPUs ("NVIDIA GeForce RTX 4070 Ti" etc.), which under this image's
+  SwiftShader rasterization is a deterministic Akamai tell** (the
+  pixel-readback hash matches SwiftShader, never a real NVIDIA driver).
+  Override with `CLOAK_FINGERPRINT_SEED=<n>` to pin a known-good seed
+  that resolves to an integrated Intel GPU; discover candidates with
+  `scripts/probe-fingerprint.sh`.
 - `--fingerprint-platform=windows`: spoofs `navigator.platform`,
   `userAgentData.platform`, and the Sec-CH-UA-Platform header to
   Windows from a Linux container.

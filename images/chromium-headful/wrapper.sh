@@ -205,7 +205,23 @@ if [[ -n "${CLOAK_PROFILE_SEED:-}" ]] \
 fi
 
 CLOAK_SEED_FILE="$CLOAK_PROFILE_DIR/.cloak-fingerprint-seed"
-if [[ -s "$CLOAK_SEED_FILE" ]]; then
+# Priority: env override → persisted file → fresh CSPRNG.
+#
+# CLOAK_FINGERPRINT_SEED is the escape hatch for the WebGL-GPU mismatch problem:
+# cloakbrowser maps `--fingerprint=<seed>` deterministically to a GPU profile
+# from its internal pool, and the pool includes flagship discrete GPUs (e.g.
+# "NVIDIA GeForce RTX 4070 Ti"). When paired with the SwiftShader rasterizer
+# this image runs under (wrapper.sh:359), Akamai's WebGL pixel-readback probe
+# hashes to the canonical SwiftShader signature — which never matches a real
+# NVIDIA driver. Result: `_abck ~-1~` and Delta returns "invalid credentials"
+# on legit logins. The fix is to discover (via scripts/probe-fingerprint.sh) a
+# seed that maps to an integrated-class GPU (Intel UHD / Iris Xe), then pin it
+# via this env. Once pinned, the value also gets written to $CLOAK_SEED_FILE
+# so subsequent boots reuse it without needing the env again.
+if [[ -n "${CLOAK_FINGERPRINT_SEED:-}" ]]; then
+  CLOAK_SEED="$CLOAK_FINGERPRINT_SEED"
+  echo "$CLOAK_SEED" > "$CLOAK_SEED_FILE"
+elif [[ -s "$CLOAK_SEED_FILE" ]]; then
   CLOAK_SEED=$(cat "$CLOAK_SEED_FILE")
 else
   # CSPRNG seed (was bash $RANDOM, which is 15-bit and seeds collide across
@@ -317,6 +333,9 @@ echo "[stealth] geoip resolution: ${CLOAK_GEOIP}"
 echo "[stealth] WebRTC IP spoof: ${CLOAK_WEBRTC_IP:-${CLOAK_GEOIP:+auto}${CLOAK_GEOIP:-disabled}}"
 echo "[stealth] page-world overrides: outerHeight/Width clamped (kiosk geometry leak fix)"
 echo "[stealth] consumer must apply: patchBrowser(browser, resolveConfig('default')) for humanize"
+echo "[stealth] GPU profile from seed ${CLOAK_SEED}: resolved at runtime; check Chrome://gpu or run scripts/probe-fingerprint.sh"
+echo "[stealth] If WebGL renderer reports flagship discrete GPU (RTX/GTX/RX), Akamai will detect the SwiftShader mismatch."
+echo "[stealth] Pin a known-good seed via CLOAK_FINGERPRINT_SEED env to override the persisted random one."
 
 # Set default extension flags for bundled extensions.
 #
