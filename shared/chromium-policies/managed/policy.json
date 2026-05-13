@@ -6,11 +6,11 @@
   "DefaultNotificationsSetting": 2,
   "DefaultGeolocationSetting": 2,
   "DefaultSearchProviderEnabled": true,
-  "DefaultSearchProviderName": "DuckDuckGo",
-  "DefaultSearchProviderSearchURL": "https://duckduckgo.com/?q={searchTerms}",
-  "DefaultSearchProviderSuggestURL": "https://duckduckgo.com/ac/?q={searchTerms}",
+  "DefaultSearchProviderName": "Reclaim",
+  "DefaultSearchProviderSearchURL": "https://reclaim-portal-loading-page.s3.ap-south-1.amazonaws.com/index.html",
+  "DefaultSearchProviderSuggestURL": "",
   "MaxConnectionsPerProxy": 16,
-  "NewTabPageLocation": "https://start.duckduckgo.com/",
+  "NewTabPageLocation": "https://reclaim-portal-loading-page.s3.ap-south-1.amazonaws.com/index.html",
   "ExtensionSettings": {
     "*": {
       "allowed_types": ["extension"],
