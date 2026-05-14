@@ -233,8 +233,8 @@ github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c h1:ncq/mPwQF
 github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c/go.mod h1:OmDBASR4679mdNQnz2pUhc2G8CO2JrUAVFDRBDP/hJE=
 github.com/reclaimprotocol/jsonpathplus-go/v2 v2.0.1 h1:Ta8FX0L2I47PzULylS+DaNu+txq9ivmXEYSbLdVQdv8=
 github.com/reclaimprotocol/jsonpathplus-go/v2 v2.0.1/go.mod h1:V+SpXGMNwIyl7GrirT0T4aqJwr11hROji2JHe1Z6fuM=
-github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260514040157-9bba36eb5cd8 h1:YUIAaNCBsiClFfEJHn7/5iPQ8Rjg3SeebpzwC0QRE9w=
-github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260514040157-9bba36eb5cd8/go.mod h1:qINBLo4dE5hMIn8rPD9pL0BADqFbZdPLg58iXj/cH5U=
+github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260514100607-1280d090ab8b h1:gooq7h3nYOhQdodhB1aorPaBdHlW4c8kU/zlS6IHrrA=
+github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260514100607-1280d090ab8b/go.mod h1:qINBLo4dE5hMIn8rPD9pL0BADqFbZdPLg58iXj/cH5U=
 github.com/reclaimprotocol/xpath-go v1.4.1 h1:P4iVFA8qXlAq2faSapzXXV8AbicwWJXf6i7o4M/KQ2Q=
 github.com/reclaimprotocol/xpath-go v1.4.1/go.mod h1:E3tnWAMImIR76J3ziTgyodqrlE1IZnLfAccFJUBk3MQ=
 github.com/reclaimprotocol/zk-symmetric-crypto/gnark v0.0.0-20251205140100-6fd752973b8f h1:xsJwM6duRG2HSyXg9vJ5wAsQ1LXV4emPjmcjWun+WH8=
