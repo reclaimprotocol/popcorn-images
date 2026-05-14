@@ -163,6 +163,19 @@ start_dynamic_log_aggregator
 
 export DISPLAY=:1
 
+# Optionally replace Chromium's default search engine + new-tab page with the
+# Reclaim portal loader. Off by default: ship's policy.json keeps DuckDuckGo.
+# REPLACE_DEFAULT_PAGE=true -> swap in the Reclaim portal variant.
+if [[ "${REPLACE_DEFAULT_PAGE:-false}" == "true" ]]; then
+  RECLAIM_VARIANT="/etc/chromium/policy-variants/policy.reclaim-portal.json"
+  if [[ -f "$RECLAIM_VARIANT" ]]; then
+    echo "[wrapper] REPLACE_DEFAULT_PAGE=true -> applying Reclaim portal policy variant"
+    cp "$RECLAIM_VARIANT" /etc/chromium/policies/managed/policy.json
+  else
+    echo "[wrapper] WARNING: REPLACE_DEFAULT_PAGE=true but $RECLAIM_VARIANT missing; keeping default policy" >&2
+  fi
+fi
+
 # Set default extension flags for bundled extensions
 export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/kernel/extensions/proxy --load-extension=/home/kernel/extensions/proxy"
 
