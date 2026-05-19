@@ -75,10 +75,6 @@ if [[ -n "${REPLACE_DEFAULT_PAGE:-}" ]]; then
   RUN_ARGS+=( -e REPLACE_DEFAULT_PAGE="$REPLACE_DEFAULT_PAGE" )
 fi
 
-
-TURN_KEY_ID="${TURN_KEY_ID:-ebd479e992e9beff26344e214843fef1}"
-TURN_API_TOKEN="${TURN_API_TOKEN:-cac21320baa6b71fb59ec1d9822cfcd4119373e1533621b657916ca1bb58a656}"
-
 if [ ! -z "$TURN_KEY_ID" ] && [ ! -z "$TURN_API_TOKEN" ]; then
     echo "🔄 Fetching TURN credentials from Cloudflare..."
     RESPONSE=$(curl -s -X POST \
