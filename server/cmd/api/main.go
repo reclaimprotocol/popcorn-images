@@ -170,6 +170,35 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// One-shot CDP device emulation: lets the neko client switch the page
+	// into a mobile viewport without touching the Xorg framebuffer.
+	r.Post("/cdp/emulate-device", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.EmulateDeviceHandler(upstreamMgr, slogger).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/emulate-device", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Apply user-picked dropdown values from the portal select bridge.
+	r.Post("/cdp/set-select-value", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.SetSelectValueHandler(upstreamMgr, slogger).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/set-select-value", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
 		Handler: r,
@@ -212,7 +241,7 @@ func main() {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "*")
 				if req.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusOK)
@@ -222,6 +251,8 @@ func main() {
 			})
 		})
 		r.Get("/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
+		r.Post("/emulate-device", devtoolsproxy.EmulateDeviceHandler(upstreamMgr, slogger).ServeHTTP)
+		r.Post("/set-select-value", devtoolsproxy.SetSelectValueHandler(upstreamMgr, slogger).ServeHTTP)
 	})
 
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {

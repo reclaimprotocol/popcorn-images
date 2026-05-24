@@ -20,6 +20,53 @@ type ActiveElementResult struct {
 	Type         string `json:"type,omitempty"`
 	IsEditable   bool   `json:"isEditable,omitempty"`
 	RawOuterHTML string `json:"rawOuterHTML,omitempty"`
+
+	// Extra fields used by the popcorn client's Android auto-focus poller.
+	// Readonly/Disabled gate keyboard auto-pop. FocusKey is a stable
+	// per-element identifier so the poller can remember "user explicitly
+	// dismissed the keyboard on this exact field" — it stays suppressed
+	// until focus moves to a different element.
+	Readonly bool   `json:"readonly,omitempty"`
+	Disabled bool   `json:"disabled,omitempty"`
+	FocusKey string `json:"focusKey,omitempty"`
+
+	// Focused-element bounding box (CSS pixels, relative to the viewport).
+	// Used by the keyboard-aware lift to compute how much to translate the
+	// streamed video element. Omitted (all zero) for non-input focuses or
+	// when getBoundingClientRect() fails.
+	ElementTop    float64 `json:"elementTop,omitempty"`
+	ElementHeight float64 `json:"elementHeight,omitempty"`
+	ElementX      float64 `json:"x,omitempty"`
+	ElementY      float64 `json:"y,omitempty"`
+
+	// SelectInfo is populated when the focused element is a <select>. Carries
+	// the options + bounding rect so the popcorn page can postMessage a
+	// POPCORN_SHOW_SELECT to the embedding portal (which renders its own
+	// dropdown UI in place of Chromium's native, stream-invisible one).
+	SelectInfo *SelectInfo `json:"selectInfo,omitempty"`
+}
+
+// SelectInfo describes a focused <select> element. The shape matches the
+// `POPCORN_SHOW_SELECT` postMessage payload documented in MOBILE_INPUT.md.
+type SelectInfo struct {
+	Multiple bool           `json:"multiple"`
+	Rect     SelectRect     `json:"rect"`
+	Options  []SelectOption `json:"options"`
+}
+
+type SelectRect struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+type SelectOption struct {
+	Value      string `json:"value"`
+	Text       string `json:"text"`
+	Selected   bool   `json:"selected"`
+	Disabled   bool   `json:"disabled"`
+	GroupLabel string `json:"groupLabel,omitempty"`
 }
 
 const activeElementExpression = `
@@ -38,11 +85,81 @@ const activeElementExpression = `
   if (!el) return { error: 'null' };
   if (el === document.body) return { error: 'body' };
   if (el.isCrossoriginIframe) return { isCrossoriginIframe: true };
+
+  // Stable per-element key. Combines DOM position (parent chain indices) with
+  // identifying attributes — same element across re-renders gets the same key.
+  function focusKeyFor(node) {
+    var parts = [];
+    var n = node;
+    while (n && n !== document.documentElement && parts.length < 12) {
+      var idx = 0;
+      var sib = n.parentNode ? n.parentNode.firstChild : null;
+      while (sib && sib !== n) { idx++; sib = sib.nextSibling; }
+      parts.push((n.nodeName || '?') + ':' + idx);
+      n = n.parentNode;
+    }
+    var tagPart = (node.tagName || '').toLowerCase();
+    var idPart = node.id ? '#' + node.id : '';
+    var namePart = node.name ? '@' + node.name : '';
+    var typePart = node.type ? ':' + node.type : '';
+    return tagPart + idPart + namePart + typePart + '|' + parts.join('>');
+  }
+
+  var rect = null;
+  try { rect = el.getBoundingClientRect(); } catch (_) {}
+
+  // If a <select> is focused, collect its options + rect so the popcorn
+  // page can postMessage POPCORN_SHOW_SELECT to the portal in place of
+  // letting Chromium open its native (stream-invisible) dropdown.
+  var selectInfo = null;
+  if (el.tagName && el.tagName.toLowerCase() === 'select' && el.options) {
+    var opts = [];
+    var children = el.children || [];
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (!c.tagName) continue;
+      var tag = c.tagName.toLowerCase();
+      if (tag === 'optgroup') {
+        var label = c.label || '';
+        var inner = c.children || [];
+        for (var j = 0; j < inner.length; j++) {
+          var o = inner[j];
+          if (o.tagName && o.tagName.toLowerCase() === 'option') {
+            opts.push({
+              value: o.value, text: o.text || '',
+              selected: !!o.selected, disabled: !!o.disabled,
+              groupLabel: label
+            });
+          }
+        }
+      } else if (tag === 'option') {
+        opts.push({
+          value: c.value, text: c.text || '',
+          selected: !!c.selected, disabled: !!c.disabled,
+          groupLabel: ''
+        });
+      }
+    }
+    selectInfo = {
+      multiple: !!el.multiple,
+      rect: rect ? { x: rect.left, y: rect.top, width: rect.width, height: rect.height } : { x: 0, y: 0, width: 0, height: 0 },
+      options: opts
+    };
+  }
+
   return {
     tagName: (el.tagName || '').toLowerCase(),
     type: (el.type || '').toLowerCase(),
     isEditable: el.isContentEditable,
-    rawOuterHTML: el.outerHTML ? el.outerHTML.substring(0, 250) : ''
+    readonly: !!el.readOnly,
+    disabled: !!el.disabled,
+    focusKey: focusKeyFor(el),
+    rawOuterHTML: el.outerHTML ? el.outerHTML.substring(0, 250) : '',
+    elementTop: rect ? rect.top : 0,
+    elementHeight: rect ? rect.height : 0,
+    x: rect ? rect.left + rect.width / 2 : 0,
+    y: rect ? rect.top + rect.height / 2 : 0,
+    selectInfo: selectInfo
   };
 })()
 `
@@ -297,19 +414,46 @@ func parseEvalResult(raw json.RawMessage) *ActiveElementResult {
 	tag, _ := val["tagName"].(string)
 	typ, _ := val["type"].(string)
 	isEditable, _ := val["isEditable"].(bool)
+	readonly, _ := val["readonly"].(bool)
+	disabled, _ := val["disabled"].(bool)
+	focusKey, _ := val["focusKey"].(string)
 	rawHTML, _ := val["rawOuterHTML"].(string)
+	elementTop, _ := val["elementTop"].(float64)
+	elementHeight, _ := val["elementHeight"].(float64)
+	elementX, _ := val["x"].(float64)
+	elementY, _ := val["y"].(float64)
 
 	isInputTag := tag == "input" || tag == "textarea"
 	isTextType := typ == "" || typ == "text" || typ == "email" || typ == "password" ||
 		typ == "search" || typ == "tel" || typ == "url" || typ == "number"
 	isInput := (isInputTag && isTextType) || isEditable || tag == "textarea"
 
+	// selectInfo is heterogeneous JSON — round-trip via Marshal/Unmarshal to
+	// land in the typed SelectInfo struct without enumerating fields manually.
+	var selectInfo *SelectInfo
+	if si, ok := val["selectInfo"].(map[string]interface{}); ok && si != nil {
+		if b, err := json.Marshal(si); err == nil {
+			var parsed SelectInfo
+			if json.Unmarshal(b, &parsed) == nil {
+				selectInfo = &parsed
+			}
+		}
+	}
+
 	return &ActiveElementResult{
-		IsInput:      isInput,
-		Tag:          tag,
-		Type:         typ,
-		IsEditable:   isEditable,
-		RawOuterHTML: rawHTML,
+		IsInput:       isInput,
+		Tag:           tag,
+		Type:          typ,
+		IsEditable:    isEditable,
+		Readonly:      readonly,
+		Disabled:      disabled,
+		FocusKey:      focusKey,
+		RawOuterHTML:  rawHTML,
+		ElementTop:    elementTop,
+		ElementHeight: elementHeight,
+		ElementX:      elementX,
+		ElementY:      elementY,
+		SelectInfo:    selectInfo,
 	}
 }
 
