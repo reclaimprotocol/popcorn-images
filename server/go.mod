@@ -19,7 +19,7 @@ require (
 	github.com/m1k1o/neko/server v0.0.0-20260124102506-3f42ad9e78eb
 	github.com/nrednav/cuid2 v1.1.0
 	github.com/oapi-codegen/runtime v1.2.0
-	github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260514100607-1280d090ab8b
+	github.com/reclaimprotocol/reclaim-tee v0.1.1-0.20260529231056-e58cff27a292
 	github.com/samber/lo v1.52.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.40.0
