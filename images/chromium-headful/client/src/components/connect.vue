@@ -2,7 +2,7 @@
   <div class="connect">
     <div class="window">
       <div class="loader" v-if="connecting">
-        <img src="../assets/images/logo.svg" alt="loading" aria-hidden="true" class="kernel-logo" />
+        <img src="../assets/images/reclaim-logo.png" alt="loading" aria-hidden="true" class="reclaim-logo" />
       </div>
     </div>
   </div>
@@ -54,16 +54,16 @@
         justify-content: center;
         align-items: center;
 
-        .kernel-logo {
+        .reclaim-logo {
           width: 100%;
           height: 100%;
-          animation: kernel-logo-pulse 1.5s ease-in-out infinite;
+          animation: reclaim-logo-pulse 1.5s ease-in-out infinite;
         }
       }
     }
   }
 
-  @keyframes kernel-logo-pulse {
+  @keyframes reclaim-logo-pulse {
     0%,
     100% {
       transform: scale(0.85);
