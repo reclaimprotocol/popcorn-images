@@ -75,10 +75,6 @@ if [[ -n "${REPLACE_DEFAULT_PAGE:-}" ]]; then
   RUN_ARGS+=( -e REPLACE_DEFAULT_PAGE="$REPLACE_DEFAULT_PAGE" )
 fi
 
-if [[ -n "${HTTPS_PROXY_URL:-}" ]]; then
-  RUN_ARGS+=( -e HTTPS_PROXY_URL="$HTTPS_PROXY_URL" )
-fi
-
 if [ ! -z "$TURN_KEY_ID" ] && [ ! -z "$TURN_API_TOKEN" ]; then
     echo "🔄 Fetching TURN credentials from Cloudflare..."
     RESPONSE=$(curl -s -X POST \
