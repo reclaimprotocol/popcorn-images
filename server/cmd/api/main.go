@@ -225,6 +225,15 @@ func main() {
 	// per-request TCP/TLS setup on every keystroke.
 	r.Get("/cdp/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker).ServeHTTP)
 
+	// Browser-events session endpoints (in-image rewrite of the portal worker).
+	// Registered directly on the API router like the sibling /cdp/* and
+	// /reclaim/* endpoints; they attach to the local Chromium over CDP.
+	r.Post("/session/start", apiService.HandleSessionStart)
+	r.Post("/session/action", apiService.HandleSessionAction)
+	r.Post("/session/close", apiService.HandleSessionClose)
+	r.Get("/session/events", apiService.HandleSessionEvents)
+	r.Get("/session/claim", apiService.HandleSessionClaim)
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
 		Handler: r,

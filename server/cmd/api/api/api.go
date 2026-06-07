@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onkernel/kernel-images/server/cmd/api/api/browser"
 	"github.com/onkernel/kernel-images/server/cmd/config"
+	"github.com/onkernel/kernel-images/server/lib/cdpclient"
 	"github.com/onkernel/kernel-images/server/lib/devtoolsproxy"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	"github.com/onkernel/kernel-images/server/lib/nekoclient"
@@ -42,6 +44,10 @@ type ApiService struct {
 	// DevTools upstream manager (Chromium supervisord log tailer)
 	upstreamMgr *devtoolsproxy.UpstreamManager
 	stz         scaletozero.Controller
+
+	// browser is the in-image browser-events session manager. It attaches to
+	// the local Chromium over CDP and drives a single session per image.
+	browser *browser.Manager
 
 	// inputMu serializes input-related operations (mouse, keyboard, screenshot)
 	inputMu sync.Mutex
@@ -90,7 +96,7 @@ func New(cfg *config.Config, recordManager recorder.RecordManager, factory recor
 		return nil, fmt.Errorf("nekoAuthClient cannot be nil")
 	}
 
-	return &ApiService{
+	svc := &ApiService{
 		config:            cfg,
 		recordManager:     recordManager,
 		factory:           factory,
@@ -101,7 +107,10 @@ func New(cfg *config.Config, recordManager recorder.RecordManager, factory recor
 		stz:               stz,
 		nekoAuthClient:    nekoAuthClient,
 		policy:            &policy.Policy{},
-	}, nil
+	}
+	// browserProver is a method on svc, so wire the manager after construction.
+	svc.browser = browser.NewManager(upstreamMgr, cdpclient.Dial, svc.browserProver)
+	return svc, nil
 }
 
 func (s *ApiService) StartRecording(ctx context.Context, req oapi.StartRecordingRequestObject) (oapi.StartRecordingResponseObject, error) {

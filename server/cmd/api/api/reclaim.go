@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/onkernel/kernel-images/server/cmd/api/api/browser"
 	"github.com/onkernel/kernel-images/server/cmd/api/circuits"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
@@ -25,9 +27,6 @@ type reclaimConfigJSON struct {
 // ReclaimProve executes the TEE+MPC proof protocol
 func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequestObject) (oapi.ReclaimProveResponseObject, error) {
 	log := logger.FromContext(ctx)
-
-	// Setup ZK callback (idempotent, only runs once)
-	circuits.SetupZKCallback()
 
 	// Get TEE URLs from config (already includes env var overrides via envconfig)
 	teekUrl := s.config.TEEKUrl
@@ -73,18 +72,7 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		"attestor_url", attestorUrl,
 	)
 
-	// Parse provider data for ExecuteCompleteProtocol
-	var providerData client.ProviderRequestData
-	if err := json.Unmarshal([]byte(req.Body.ProviderParamsJson), &providerData); err != nil {
-		log.Error("failed to parse provider params", "err", err)
-		return oapi.ReclaimProve400JSONResponse{
-			BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("invalid provider parameters JSON: %v", err),
-			},
-		}, nil
-	}
-
-	// Build config JSON for the client library
+	// Build config JSON for the client library (resolved URLs + requestID).
 	clientConfigJSON, err := json.Marshal(reclaimConfigJSON{
 		TEEKUrl:     teekUrl,
 		TEETUrl:     teetUrl,
@@ -100,36 +88,57 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		}, nil
 	}
 
-	// Create reclaim client from JSON
-	reclaimClient, err := client.NewReclaimClientFromJSON(
-		req.Body.ProviderParamsJson,
-		string(clientConfigJSON),
-	)
+	claim, err := s.executeReclaimProve(ctx, req.Body.ProviderParamsJson, string(clientConfigJSON))
 	if err != nil {
-		log.Error("failed to create reclaim client", "err", err)
-		return oapi.ReclaimProve400JSONResponse{
-			BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{
-				Message: fmt.Sprintf("invalid provider parameters: %v", err),
-			},
+		msg := err.Error()
+		if strings.Contains(msg, "invalid provider parameters") {
+			return oapi.ReclaimProve400JSONResponse{
+				BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: msg},
+			}, nil
+		}
+		log.Error("proof execution failed", "request_id", requestID, "err", err)
+		return oapi.ReclaimProve500JSONResponse{
+			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: msg},
 		}, nil
 	}
 
-	// Create a context with timeout (5 minutes for proof generation)
+	log.Info("proof execution completed", "request_id", requestID, "identifier", claim.Claim.Identifier)
+	return oapi.ReclaimProve200JSONResponse{
+		SessionId: requestID,
+		Claim:     mapClaimToOapi(claim.Claim),
+		Signature: mapSignatureToOapi(claim.Signature),
+	}, nil
+}
+
+// executeReclaimProve runs the TEE+MPC proof protocol for the given
+// provider_params_json + client config json. It is shared by the HTTP endpoint
+// and the in-image browser proof pipeline. A 5-minute timeout and a panic
+// recover guard the external library.
+func (s *ApiService) executeReclaimProve(ctx context.Context, providerParamsJSON, clientConfigJSON string) (*client.ClaimWithSignatures, error) {
+	// Setup ZK callback (idempotent, only runs once).
+	circuits.SetupZKCallback()
+
+	var providerData client.ProviderRequestData
+	if err := json.Unmarshal([]byte(providerParamsJSON), &providerData); err != nil {
+		return nil, fmt.Errorf("invalid provider parameters JSON: %w", err)
+	}
+
+	reclaimClient, err := client.NewReclaimClientFromJSON(providerParamsJSON, clientConfigJSON)
+	if err != nil {
+		return nil, fmt.Errorf("invalid provider parameters: %w", err)
+	}
+
 	proofCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	// Execute protocol in a goroutine so we can handle timeout
 	type result struct {
 		claim *client.ClaimWithSignatures
 		err   error
 	}
 	resultCh := make(chan result, 1)
-
 	go func() {
-		// Recover from panics in the external library to prevent server crash
 		defer func() {
 			if r := recover(); r != nil {
-				log.Error("panic in ExecuteCompleteProtocol", "request_id", requestID, "panic", r)
 				resultCh <- result{err: fmt.Errorf("internal error: protocol execution panicked")}
 			}
 		}()
@@ -137,60 +146,83 @@ func (s *ApiService) ReclaimProve(ctx context.Context, req oapi.ReclaimProveRequ
 		resultCh <- result{claim: claim, err: err}
 	}()
 
-	// Wait for result or timeout
-	var timedOut bool
 	select {
 	case <-proofCtx.Done():
-		timedOut = true
-		log.Error("proof execution timed out, waiting for goroutine cleanup", "request_id", requestID)
+		// Don't race Close() with an in-flight protocol: clean up in the
+		// background after the goroutine drains (or a grace period elapses).
+		go func() {
+			select {
+			case <-resultCh:
+			case <-time.After(10 * time.Second):
+			}
+			reclaimClient.Close()
+		}()
+		return nil, fmt.Errorf("proof execution timed out")
 	case res := <-resultCh:
-		// Close client after goroutine completes
 		reclaimClient.Close()
-
 		if res.err != nil {
-			log.Error("proof execution failed", "request_id", requestID, "err", res.err)
-			return oapi.ReclaimProve500JSONResponse{
-				InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-					Message: fmt.Sprintf("proof execution failed: %v", res.err),
-				},
-			}, nil
+			return nil, fmt.Errorf("proof execution failed: %w", res.err)
 		}
-
-		log.Info("proof execution completed", "request_id", requestID, "identifier", res.claim.Claim.Identifier)
-
-		// Map result to response
-		return oapi.ReclaimProve200JSONResponse{
-			SessionId: requestID,
-			Claim:     mapClaimToOapi(res.claim.Claim),
-			Signature: mapSignatureToOapi(res.claim.Signature),
-		}, nil
+		return res.claim, nil
 	}
+}
 
-	// If we timed out, wait for the goroutine to complete before closing
-	// to avoid racing Close() with an in-flight protocol
-	if timedOut {
-		// Wait for goroutine with a grace period, then close regardless
-		select {
-		case <-resultCh:
-			log.Info("goroutine completed after timeout", "request_id", requestID)
-		case <-time.After(10 * time.Second):
-			log.Warn("goroutine did not complete within grace period, closing anyway", "request_id", requestID)
-		}
-		reclaimClient.Close()
+// buildReclaimClientConfigJSON builds the client config JSON from server config
+// + a per-session requestID (used by the browser proof pipeline).
+func (s *ApiService) buildReclaimClientConfigJSON(requestID string) (string, error) {
+	b, err := json.Marshal(reclaimConfigJSON{
+		TEEKUrl:     s.config.TEEKUrl,
+		TEETUrl:     s.config.TEETUrl,
+		AttestorUrl: s.config.AttestorUrl,
+		RequestID:   requestID,
+	})
+	return string(b), err
+}
 
-		return oapi.ReclaimProve500JSONResponse{
-			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-				Message: "proof execution timed out",
-			},
-		}, nil
+// browserProver is the browser.Prover injected into the session manager. It
+// runs an in-process reclaim-tee proof and maps the result to a sanitized
+// browser.ClaimResult.
+func (s *ApiService) browserProver(ctx context.Context, providerParamsJSON, requestID string) (*browser.ClaimResult, error) {
+	cfgJSON, err := s.buildReclaimClientConfigJSON(requestID)
+	if err != nil {
+		return nil, err
 	}
+	claim, err := s.executeReclaimProve(ctx, providerParamsJSON, cfgJSON)
+	if err != nil {
+		return nil, err
+	}
+	return mapClaimToBrowserResult(claim), nil
+}
 
-	// Should not reach here, but satisfy compiler
-	return oapi.ReclaimProve500JSONResponse{
-		InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
-			Message: "unexpected error",
-		},
-	}, nil
+func mapClaimToBrowserResult(c *client.ClaimWithSignatures) *browser.ClaimResult {
+	res := &browser.ClaimResult{}
+	type providerClaimData interface {
+		GetProvider() string
+		GetParameters() string
+		GetOwner() string
+		GetTimestampS() uint32
+		GetContext() string
+		GetIdentifier() string
+		GetEpoch() uint32
+	}
+	if cd, ok := any(c.Claim).(providerClaimData); ok {
+		res.Provider = cd.GetProvider()
+		res.Parameters = cd.GetParameters()
+		res.Owner = cd.GetOwner()
+		res.Context = cd.GetContext()
+		res.Identifier = cd.GetIdentifier()
+		res.Epoch = int(cd.GetEpoch())
+		res.TimestampS = int(cd.GetTimestampS())
+	}
+	type claimSignature interface {
+		GetAttestorAddress() string
+		GetClaimSignature() []byte
+	}
+	if sg, ok := any(c.Signature).(claimSignature); ok {
+		res.AttestorAddress = sg.GetAttestorAddress()
+		res.ClaimSignature = base64.StdEncoding.EncodeToString(sg.GetClaimSignature())
+	}
+	return res
 }
 
 func mapClaimToOapi(claim interface{}) oapi.ReclaimClaim {
