@@ -44,7 +44,10 @@ func Dial(ctx context.Context, devtoolsURL string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial devtools: %w", err)
 	}
-	conn.SetReadLimit(4 * 1024 * 1024)
+	// 16 MiB: small CDP replies (document.title, predicates) are tiny, but
+	// Page.captureScreenshot PNGs and Page.content can exceed the previous
+	// 4 MiB cap. This only raises the ceiling, so existing callers are unaffected.
+	conn.SetReadLimit(16 * 1024 * 1024)
 	return &Client{conn: conn}, nil
 }
 
@@ -96,6 +99,14 @@ func (c *Client) send(ctx context.Context, method string, params any, sessionID 
 		}
 		return resp.Result, nil
 	}
+}
+
+// Call sends a CDP command on the given session (empty sessionID = browser
+// level) and waits for the matching response, discarding intermediate events.
+// It is the exported entry point used by Session and other callers; for event
+// subscription, use a dedicated reader loop instead.
+func (c *Client) Call(ctx context.Context, method string, params any, sessionID string) (json.RawMessage, error) {
+	return c.send(ctx, method, params, sessionID)
 }
 
 // SetDeviceMetricsOverride sets the viewport dimensions on the first page

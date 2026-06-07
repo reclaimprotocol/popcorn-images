@@ -1,5 +1,7 @@
 package browser
 
+import "encoding/json"
+
 // SessionConfig is the start-session payload (the core subset of the portal's
 // SessionCreateRequestBody). Provider-selection fields are intentionally absent
 // — there is exactly one provider now (the local Chromium).
@@ -45,25 +47,14 @@ type Viewport struct {
 
 // RequestMatcher describes a request to capture and prove. JSON tags match the
 // portal wire shape so it can be decoded directly from provider_config.
+// responseMatches/responseRedactions are kept as raw JSON and passed through to
+// reclaim-tee verbatim, so fields like invert/isOptional/order/hash are never
+// dropped.
 type RequestMatcher struct {
-	URL                string              `json:"url"`
-	URLType            string              `json:"urlType,omitempty"` // EXACT|CONSTANT|REGEX|TEMPLATE
-	Method             string              `json:"method,omitempty"`
-	ResponseMatches    []ResponseMatch     `json:"responseMatches,omitempty"`
-	ResponseRedactions []ResponseRedaction `json:"responseRedactions,omitempty"`
-	GeoLocation        string              `json:"geoLocation,omitempty"`
-}
-
-// ResponseMatch is a reclaim-tee response match (Value/Type).
-type ResponseMatch struct {
-	Value string `json:"value"`
-	Type  string `json:"type,omitempty"` // contains|regex
-}
-
-// ResponseRedaction is a reclaim-tee response redaction.
-type ResponseRedaction struct {
-	XPath    string `json:"xPath,omitempty"`
-	JSONPath string `json:"jsonPath,omitempty"`
-	Regex    string `json:"regex,omitempty"`
-	Hash     string `json:"hash,omitempty"`
+	URL                string          `json:"url"`
+	URLType            string          `json:"urlType,omitempty"` // EXACT|CONSTANT|REGEX|TEMPLATE
+	Method             string          `json:"method,omitempty"`
+	ResponseMatches    json.RawMessage `json:"responseMatches,omitempty"`
+	ResponseRedactions json.RawMessage `json:"responseRedactions,omitempty"`
+	GeoLocation        string          `json:"geoLocation,omitempty"`
 }

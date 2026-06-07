@@ -96,6 +96,10 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 	m.capture.Start()
 	m.mu.Unlock()
 
+	// Inject the page runtime (window.Reclaim, login detection, interception,
+	// customInjection) before navigating, so init scripts run on the login page.
+	m.setupPageEnvironment(ctx, sess)
+
 	// Navigate to the login page (best-effort).
 	if lu := cfg.ProviderConfig.LoginURL; lu != "" && lu != "about:blank" {
 		if err := m.loadLoginPage(ctx, sess, lu); err != nil {

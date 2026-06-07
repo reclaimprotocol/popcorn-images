@@ -62,7 +62,27 @@ type NetCapture struct {
 	prove    Prover
 	onClaim  func(*ClaimResult)
 
+	// proven dedups proof attempts: each matcher is proved at most once per
+	// session (the same URL is often captured by more than one CDP request).
+	provenMu sync.Mutex
+	proven   map[int]bool
+
 	cancel context.CancelFunc
+}
+
+// markProven returns true if this matcher index hadn't been proved yet (and
+// marks it). Subsequent calls for the same index return false.
+func (nc *NetCapture) markProven(idx int) bool {
+	nc.provenMu.Lock()
+	defer nc.provenMu.Unlock()
+	if nc.proven == nil {
+		nc.proven = map[int]bool{}
+	}
+	if nc.proven[idx] {
+		return false
+	}
+	nc.proven[idx] = true
+	return true
 }
 
 func newNetCapture(upstream UpstreamCurrenter, logger *slog.Logger, sessionID string, publish func(StreamEvent), matchers []RequestMatcher, prove Prover, onClaim func(*ClaimResult)) *NetCapture {
@@ -434,7 +454,9 @@ func (nc *NetCapture) onLoadingFinished(params json.RawMessage, inflight map[str
 		nc.publish(newEvent(EvNetworkResponse, nc.sessionID, data))
 
 		if pr.MatcherIdx >= 0 && pr.MatcherIdx < len(nc.matchers) && nc.prove != nil {
-			nc.runProof(nc.matchers[pr.MatcherIdx], pr, body)
+			if nc.markProven(pr.MatcherIdx) {
+				nc.runProof(nc.matchers[pr.MatcherIdx], pr, body)
+			}
 		}
 	}()
 }

@@ -25,11 +25,13 @@ type sessionStartRequest struct {
 }
 
 type providerConfigDTO struct {
-	ProviderID      string       `json:"providerId"`
-	AppID           string       `json:"appId"`
-	LoginURL        string       `json:"loginUrl"`
-	UserAgent       string       `json:"userAgent"`
-	Viewport        *viewportDTO `json:"viewport"`
+	ProviderID string `json:"providerId"`
+	AppID      string `json:"appId"`
+	LoginURL   string `json:"loginUrl"`
+	// userAgent may be a string or an object ({ios,android}) in real configs;
+	// accept either and ignore it for now (not yet applied in-image).
+	UserAgent       json.RawMessage `json:"userAgent"`
+	Viewport        *viewportDTO    `json:"viewport"`
 	InjectionType   string       `json:"injectionType"`
 	CustomInjection string       `json:"customInjection"`
 	LogLevel        string       `json:"logLevel"`
@@ -82,12 +84,12 @@ func (b sessionStartRequest) toConfig() *browser.SessionConfig {
 			ProviderID:      b.ProviderConfig.ProviderID,
 			AppID:           b.ProviderConfig.AppID,
 			LoginURL:        b.ProviderConfig.LoginURL,
-			UserAgent:       b.ProviderConfig.UserAgent,
 			InjectionType:   b.ProviderConfig.InjectionType,
 			CustomInjection: b.ProviderConfig.CustomInjection,
 			LogLevel:        b.ProviderConfig.LogLevel,
 			RequestData:     b.ProviderConfig.RequestData,
 		}
+		// userAgent is intentionally not applied yet (accepted but ignored).
 		if v := b.ProviderConfig.Viewport; v != nil {
 			pc.Viewport = &browser.Viewport{Width: v.Width, Height: v.Height}
 		}

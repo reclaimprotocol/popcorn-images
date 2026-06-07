@@ -1,6 +1,9 @@
 package browser
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestMatchesURL(t *testing.T) {
 	cases := []struct {
@@ -50,9 +53,17 @@ func TestSeparateSecrets(t *testing.T) {
 func TestBuildProviderParamsRejectsOPRFRaw(t *testing.T) {
 	m := RequestMatcher{
 		URL:                "https://x.com/a",
-		ResponseRedactions: []ResponseRedaction{{Regex: "x", Hash: "oprf-raw"}},
+		ResponseRedactions: json.RawMessage(`[{"regex":"x","hash":"oprf-raw"}]`),
 	}
 	if _, err := buildProviderParamsJSON(m, capturedForProof{URL: "https://x.com/a"}); err == nil {
 		t.Fatal("expected oprf-raw to be rejected")
+	}
+	// "oprf" (normal mode) must NOT be rejected.
+	ok := RequestMatcher{
+		URL:                "https://x.com/a",
+		ResponseRedactions: json.RawMessage(`[{"jsonPath":"$.email","regex":"x","hash":"oprf"}]`),
+	}
+	if _, err := buildProviderParamsJSON(ok, capturedForProof{URL: "https://x.com/a"}); err != nil {
+		t.Fatalf("oprf (normal) should be allowed, got %v", err)
 	}
 }

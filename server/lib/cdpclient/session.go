@@ -153,6 +153,19 @@ func (s *Session) Reload(ctx context.Context) error {
 	return err
 }
 
+// PageEnable enables the Page domain (idempotent).
+func (s *Session) PageEnable(ctx context.Context) error {
+	_, err := s.Call(ctx, "Page.enable", nil)
+	return err
+}
+
+// AddInitScript registers a script to run on every new document (persists
+// across navigations), via Page.addScriptToEvaluateOnNewDocument.
+func (s *Session) AddInitScript(ctx context.Context, source string) error {
+	_, err := s.Call(ctx, "Page.addScriptToEvaluateOnNewDocument", map[string]any{"source": source})
+	return err
+}
+
 // SetViewport overrides the device metrics (viewport) for this page.
 func (s *Session) SetViewport(ctx context.Context, width, height int) error {
 	_, err := s.Call(ctx, "Emulation.setDeviceMetricsOverride", map[string]any{
