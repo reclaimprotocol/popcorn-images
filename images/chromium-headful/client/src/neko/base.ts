@@ -172,6 +172,7 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
 
   public sendData(event: 'wheel' | 'mousemove', data: { x: number; y: number }): void
   public sendData(event: 'mousedown' | 'mouseup' | 'keydown' | 'keyup', data: { key: number }): void
+  public sendData(event: 'touchstart' | 'touchmove' | 'touchend', data: { id: number; x: number; y: number }): void
   public sendData(event: string, data: any) {
     if (!this.connected) {
       this.emit('warn', `attempting to send data while disconnected`)
@@ -213,6 +214,21 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
         payload.setUint16(1, 8, true)
         payload.setBigUint64(3, BigInt(data.key), true)
         break
+      case 'touchstart':
+      case 'touchmove':
+      case 'touchend': {
+        const op = event === 'touchstart' ? OPCODE.TOUCH_BEGIN
+                 : event === 'touchmove' ? OPCODE.TOUCH_UPDATE
+                 : OPCODE.TOUCH_END
+        buffer = new ArrayBuffer(8)
+        payload = new DataView(buffer)
+        payload.setUint8(0, op)
+        payload.setUint16(1, 5, true)   // payload length: slot(1) + x(2) + y(2)
+        payload.setUint8(3, (data as { id: number }).id & 0xff)
+        payload.setInt16(4, (data as { x: number }).x, true)
+        payload.setInt16(6, (data as { y: number }).y, true)
+        break
+      }
       default:
         this.emit('warn', `unknown data event: ${event}`)
     }

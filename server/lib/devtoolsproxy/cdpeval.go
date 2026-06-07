@@ -36,6 +36,8 @@ type ActiveElementResult struct {
 	// when getBoundingClientRect() fails.
 	ElementTop    float64 `json:"elementTop,omitempty"`
 	ElementHeight float64 `json:"elementHeight,omitempty"`
+	ElementLeft   float64 `json:"elementLeft,omitempty"`
+	ElementWidth  float64 `json:"elementWidth,omitempty"`
 	ElementX      float64 `json:"x,omitempty"`
 	ElementY      float64 `json:"y,omitempty"`
 
@@ -44,6 +46,39 @@ type ActiveElementResult struct {
 	// POPCORN_SHOW_SELECT to the embedding portal (which renders its own
 	// dropdown UI in place of Chromium's native, stream-invisible one).
 	SelectInfo *SelectInfo `json:"selectInfo,omitempty"`
+
+	// InputRects is the bounding-box list of every visible text-input-like
+	// element in the page's layout viewport (CSS pixels). The client caches
+	// this from each focus push and uses it for synchronous tap-time hit
+	// tests — at 3 s RTT, a per-tap CDP round-trip is too slow, but
+	// matching against a 600 ms-fresh cache is O(N) local work and
+	// network-independent. Tap inside any rect → input → pop. Tap outside
+	// all rects → non-input → dismiss.
+	InputRects []SelectRect `json:"inputRects,omitempty"`
+
+	// ViewportWidth / ViewportHeight is chromium's current layout viewport
+	// in CSS pixels. Pushed so the client can transform tap coords into
+	// the SAME space rects are reported in — important because cdp-magnify
+	// (or any out-of-band Emulation.setDeviceMetricsOverride) changes this
+	// size and the client otherwise has no way to know.
+	ViewportWidth  float64 `json:"viewportWidth,omitempty"`
+	ViewportHeight float64 `json:"viewportHeight,omitempty"`
+
+	// Hints that drive the LOCAL proxy input's attributes so the
+	// platform IME (Gboard, Samsung Keyboard, iOS QuickType) shows the
+	// correct layout. Native pages get a numeric pad for type=number,
+	// email layout for type=email, etc. — without these, the proxy is
+	// just type=text and every field gets the same QWERTY.
+	//
+	// Mirrors the HTML attribute names so the client just does:
+	//   proxy.type = info.inputType
+	//   proxy.inputMode = info.inputMode
+	//   proxy.autocomplete = info.autocomplete
+	//   proxy.enterKeyHint = info.enterKeyHint
+	InputType     string `json:"inputType,omitempty"`
+	InputMode     string `json:"inputMode,omitempty"`
+	AutoComplete  string `json:"autoComplete,omitempty"`
+	EnterKeyHint  string `json:"enterKeyHint,omitempty"`
 }
 
 // SelectInfo describes a focused <select> element. The shape matches the
@@ -81,10 +116,70 @@ const activeElementExpression = `
     }
     return a;
   }
+
+  // Collect viewport + input rects FIRST — these are independent of which
+  // element happens to be focused, and the client needs them regardless
+  // (the input-rects cache drives tap-time hit-testing whether or not an
+  // input is currently focused, and viewport dims drive coord transforms).
+  var viewportWidth = document.documentElement ? document.documentElement.clientWidth : 0;
+  var viewportHeight = document.documentElement ? document.documentElement.clientHeight : 0;
+  var inputRects = [];
+  try {
+    var sel = 'input, textarea, [contenteditable=""], [contenteditable="true"]';
+    var nodes = document.querySelectorAll(sel);
+    for (var i = 0; i < nodes.length && inputRects.length < 100; i++) {
+      var n = nodes[i];
+      var t = (n.tagName || '').toLowerCase();
+      if (t === 'input') {
+        var tt = (n.type || '').toLowerCase();
+        if (tt && tt !== 'text' && tt !== 'email' && tt !== 'password' &&
+            tt !== 'search' && tt !== 'tel' && tt !== 'url' &&
+            tt !== 'number' && tt !== 'date' && tt !== 'datetime-local' &&
+            tt !== 'time' && tt !== 'month' && tt !== 'week') continue;
+      }
+      if (n.disabled || n.readOnly) continue;
+      // Exclude non-typeable combobox-style inputs — they look like a
+      // dropdown button (e.g. Kaggle's "Relevance" sort) but our
+      // selector picks them up because they're <input type=text>
+      // underneath. Tap should open the popup, not the soft keyboard.
+      //
+      // Distinguishing signal: a typeable autocomplete (like a search bar
+      // that shows suggestions) declares aria-autocomplete=list/both/inline.
+      // A non-typeable combobox sets role=combobox / aria-haspopup but
+      // omits aria-autocomplete (or sets it to "none"). Walk up a few
+      // ancestors so wrapper-divs with role=combobox also count.
+      var skipPopup = false;
+      var cur = n;
+      var typeable = false;
+      // Check the input itself for aria-autocomplete — only the input
+      // node knows whether the user types into it.
+      if (n.getAttribute) {
+        var selfAC = n.getAttribute('aria-autocomplete') || '';
+        if (selfAC === 'list' || selfAC === 'both' || selfAC === 'inline') typeable = true;
+      }
+      if (!typeable) {
+        for (var d = 0; cur && d < 4; d++) {
+          if (cur.getAttribute) {
+            var role = cur.getAttribute('role') || '';
+            var pop = cur.getAttribute('aria-haspopup') || '';
+            if (role === 'combobox' || role === 'listbox' || role === 'menu') { skipPopup = true; break; }
+            if (pop && pop !== 'false') { skipPopup = true; break; }
+          }
+          cur = cur.parentNode;
+        }
+      }
+      if (skipPopup) continue;
+      var r = null;
+      try { r = n.getBoundingClientRect(); } catch (_) {}
+      if (!r || r.width < 4 || r.height < 4) continue;
+      inputRects.push({ x: r.left, y: r.top, width: r.width, height: r.height });
+    }
+  } catch (_) { /* DOM unavailable */ }
+
   const el = getDeep(document);
-  if (!el) return { error: 'null' };
-  if (el === document.body) return { error: 'body' };
-  if (el.isCrossoriginIframe) return { isCrossoriginIframe: true };
+  if (!el) return { error: 'null', viewportWidth: viewportWidth, viewportHeight: viewportHeight, inputRects: inputRects };
+  if (el === document.body) return { error: 'body', viewportWidth: viewportWidth, viewportHeight: viewportHeight, inputRects: inputRects };
+  if (el.isCrossoriginIframe) return { isCrossoriginIframe: true, viewportWidth: viewportWidth, viewportHeight: viewportHeight, inputRects: inputRects };
 
   // Stable per-element key. Combines DOM position (parent chain indices) with
   // identifying attributes — same element across re-renders gets the same key.
@@ -147,9 +242,22 @@ const activeElementExpression = `
     };
   }
 
+  // Pull the IME-shaping attributes off the focused element. inputmode
+  // (HTML spec: numeric, email, tel, decimal, url, search) overrides
+  // the type-derived default; modern sites set it explicitly. Fall back
+  // to type/autocomplete heuristics if the page didn't set inputmode.
+  function attrOr(node, name, dflt) {
+    try { var v = node.getAttribute ? node.getAttribute(name) : null;
+          return (v == null || v === '') ? dflt : v; } catch (_) { return dflt; }
+  }
+  var inputType = (el.type || '').toLowerCase();
+  var inputMode = (attrOr(el, 'inputmode', '') || '').toLowerCase();
+  var autoComplete = attrOr(el, 'autocomplete', '');
+  var enterKeyHint = attrOr(el, 'enterkeyhint', '');
+
   return {
     tagName: (el.tagName || '').toLowerCase(),
-    type: (el.type || '').toLowerCase(),
+    type: inputType,
     isEditable: el.isContentEditable,
     readonly: !!el.readOnly,
     disabled: !!el.disabled,
@@ -157,9 +265,18 @@ const activeElementExpression = `
     rawOuterHTML: el.outerHTML ? el.outerHTML.substring(0, 250) : '',
     elementTop: rect ? rect.top : 0,
     elementHeight: rect ? rect.height : 0,
+    elementLeft: rect ? rect.left : 0,
+    elementWidth: rect ? rect.width : 0,
     x: rect ? rect.left + rect.width / 2 : 0,
     y: rect ? rect.top + rect.height / 2 : 0,
-    selectInfo: selectInfo
+    selectInfo: selectInfo,
+    inputRects: inputRects,
+    viewportWidth: viewportWidth,
+    viewportHeight: viewportHeight,
+    inputType: inputType,
+    inputMode: inputMode,
+    autoComplete: autoComplete,
+    enterKeyHint: enterKeyHint
   };
 })()
 `
@@ -353,15 +470,129 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 
 	ft.logger.Info("[FocusTracker] connected, starting poll loop", "targetId", targetID, "sessionId", sessionID)
 
-	// Step 3: poll loop — evaluate document.activeElement repeatedly
+	// Step 3: install Runtime.addBinding + focus listeners so the PAGE
+	// pushes focus events to us as they happen — eliminates the
+	// poll-interval staleness that caused the "keyboard pops on stale
+	// activeElement" class of bugs. The 100 ms poll loop below stays as
+	// a safety net (covers cases where the binding fails to install,
+	// the listener gets nuked by page JS, etc.).
+	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.enable", Params: json.RawMessage(`{}`), SessionID: sessionID})
+	_ = send(cdpMsg{ID: nextID(), Method: "Page.enable", Params: json.RawMessage(`{}`), SessionID: sessionID})
+	bindingParams, _ := json.Marshal(map[string]interface{}{"name": "popcornFocusChanged"})
+	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.addBinding", Params: bindingParams, SessionID: sessionID})
+	// listenerSource: registers focus + mutation + scroll listeners on
+	// each new document and calls popcornFocusChanged whenever something
+	// the input-rects cache cares about changes. Coalesces all signals
+	// through a 60 ms trailing debounce so a burst of DOM mutations
+	// (React commits, SPA route changes, infinite-scroll inserts) fires
+	// at most one push per debounce window.
+	listenerSource := `
+(function(){
+  if (window.__popcornFocusInstalled) return;
+  window.__popcornFocusInstalled = true;
+  var t = null;
+  function fire(kind) {
+    if (t) return;
+    t = setTimeout(function(){
+      t = null;
+      try { if (window.popcornFocusChanged) window.popcornFocusChanged(kind); } catch (_) {}
+    }, 60);
+  }
+  // Focus changes — the primary signal for keyboard pop / dismiss.
+  document.addEventListener('focusin', function(){ fire('focusin'); }, true);
+  document.addEventListener('focusout', function(){ fire('focusout'); }, true);
+  // Scroll changes shift every input's rect under our cached coords.
+  // Listening on the window catches both root and inner-scroller cases.
+  window.addEventListener('scroll', function(){ fire('scroll'); }, true);
+  // DOM mutations (input add/remove, attribute changes that affect our
+  // selectors). Subtree watching is expensive; filter attributes to
+  // just the ones we filter on so React style mutations don't trigger
+  // hundreds of pushes per second.
+  try {
+    var mo = new MutationObserver(function(){ fire('mutation'); });
+    mo.observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['disabled', 'readonly', 'contenteditable',
+                        'inputmode', 'type', 'role', 'aria-haspopup',
+                        'aria-autocomplete', 'aria-hidden', 'hidden',
+                        'style', 'class']
+    });
+  } catch (_) { /* MutationObserver unavailable; fall back to poll */ }
+  // Resize too — viewport changes (orientation, address-bar collapse).
+  window.addEventListener('resize', function(){ fire('resize'); }, true);
+})();
+`
+	scriptParams, _ := json.Marshal(map[string]interface{}{"source": listenerSource})
+	_ = send(cdpMsg{ID: nextID(), Method: "Page.addScriptToEvaluateOnNewDocument", Params: scriptParams, SessionID: sessionID})
+	// Also apply to the currently-loaded document (the script-on-new-
+	// document only fires for subsequent loads).
+	evalNowParams, _ := json.Marshal(map[string]interface{}{"expression": listenerSource})
+	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.evaluate", Params: evalNowParams, SessionID: sessionID})
+
+	// Step 4: hybrid poll + event-driven loop. The poll is the safety
+	// net; Runtime.bindingCalled events trigger immediate re-evaluation
+	// for low-latency focus tracking.
+	evalRequested := make(chan struct{}, 1)
+	requestEval := func() {
+		select {
+		case evalRequested <- struct{}{}:
+		default: // already pending
+		}
+	}
+
+	// Goroutine reads CDP events and triggers an eval whenever the
+	// binding fires. Runs until the connection dies.
+	readerDone := make(chan error, 1)
+	pendingEvalID := 0
+	var pendingMu sync.Mutex
+	go func() {
+		for {
+			m, err := recv()
+			if err != nil {
+				readerDone <- err
+				return
+			}
+			// Handle our own eval responses.
+			if m.ID != 0 {
+				pendingMu.Lock()
+				want := pendingEvalID
+				pendingMu.Unlock()
+				if m.ID == want {
+					result := parseEvalResult(m.Result)
+					ft.cached.Store(result)
+				}
+				continue
+			}
+			// Method == "Runtime.bindingCalled" means our focus listener
+			// fired — schedule an immediate re-eval to capture the new
+			// state.
+			if m.Method == "Runtime.bindingCalled" {
+				requestEval()
+			}
+		}
+	}()
+
+	// Driver loop: triggers Runtime.evaluate on either a tick or a
+	// binding event. ID coordination via pendingMu so the reader
+	// recognizes our response.
+	ticker := time.NewTicker(ft.pollInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(ft.pollInterval):
+		case <-ticker.C:
+		case <-evalRequested:
 		}
 
 		id := nextID()
+		pendingMu.Lock()
+		pendingEvalID = id
+		pendingMu.Unlock()
+
 		evalParams, _ := json.Marshal(map[string]interface{}{
 			"expression":    activeElementExpression,
 			"returnByValue": true,
@@ -371,20 +602,13 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 			return
 		}
 
-		// Read until we get our response (skip events)
-		for {
-			m, err := recv()
-			if err != nil {
-				ft.logger.Warn("[FocusTracker] evaluate recv failed, reconnecting", "err", err)
-				return
-			}
-			if m.ID != id {
-				continue // skip CDP events (e.g. Target.attachedToTarget)
-			}
-
-			result := parseEvalResult(m.Result)
-			ft.cached.Store(result)
-			break
+		// Bail out promptly if the reader goroutine reports the
+		// connection died (no point looping on a dead socket).
+		select {
+		case err := <-readerDone:
+			ft.logger.Warn("[FocusTracker] reader exited, reconnecting", "err", err)
+			return
+		default:
 		}
 	}
 }
@@ -404,11 +628,33 @@ func parseEvalResult(raw json.RawMessage) *ActiveElementResult {
 		return &ActiveElementResult{IsInput: false, Tag: "parse-error"}
 	}
 
+	// Pull viewport + inputRects out before checking the early-exit paths
+	// (body / null activeElement / cross-origin iframe). These fields are
+	// independent of focus state, and the client needs them on every push.
+	viewportWidthEarly, _ := val["viewportWidth"].(float64)
+	viewportHeightEarly, _ := val["viewportHeight"].(float64)
+	var inputRectsEarly []SelectRect
+	if ir, ok := val["inputRects"].([]interface{}); ok && len(ir) > 0 {
+		if b, err := json.Marshal(ir); err == nil {
+			_ = json.Unmarshal(b, &inputRectsEarly)
+		}
+	}
+
 	if errStr, ok := val["error"].(string); ok {
-		return &ActiveElementResult{IsInput: false, Tag: errStr}
+		return &ActiveElementResult{
+			IsInput: false, Tag: errStr,
+			InputRects:     inputRectsEarly,
+			ViewportWidth:  viewportWidthEarly,
+			ViewportHeight: viewportHeightEarly,
+		}
 	}
 	if val["isCrossoriginIframe"] == true {
-		return &ActiveElementResult{IsInput: true, Tag: "iframe"}
+		return &ActiveElementResult{
+			IsInput: true, Tag: "iframe",
+			InputRects:     inputRectsEarly,
+			ViewportWidth:  viewportWidthEarly,
+			ViewportHeight: viewportHeightEarly,
+		}
 	}
 
 	tag, _ := val["tagName"].(string)
@@ -420,6 +666,8 @@ func parseEvalResult(raw json.RawMessage) *ActiveElementResult {
 	rawHTML, _ := val["rawOuterHTML"].(string)
 	elementTop, _ := val["elementTop"].(float64)
 	elementHeight, _ := val["elementHeight"].(float64)
+	elementLeft, _ := val["elementLeft"].(float64)
+	elementWidth, _ := val["elementWidth"].(float64)
 	elementX, _ := val["x"].(float64)
 	elementY, _ := val["y"].(float64)
 
@@ -440,6 +688,16 @@ func parseEvalResult(raw json.RawMessage) *ActiveElementResult {
 		}
 	}
 
+	// Reuse the focus-independent fields we already extracted at the top.
+	inputRects := inputRectsEarly
+	viewportWidth := viewportWidthEarly
+	viewportHeight := viewportHeightEarly
+
+	inputType, _ := val["inputType"].(string)
+	inputMode, _ := val["inputMode"].(string)
+	autoComplete, _ := val["autoComplete"].(string)
+	enterKeyHint, _ := val["enterKeyHint"].(string)
+
 	return &ActiveElementResult{
 		IsInput:       isInput,
 		Tag:           tag,
@@ -451,9 +709,18 @@ func parseEvalResult(raw json.RawMessage) *ActiveElementResult {
 		RawOuterHTML:  rawHTML,
 		ElementTop:    elementTop,
 		ElementHeight: elementHeight,
+		ElementLeft:   elementLeft,
+		ElementWidth:  elementWidth,
 		ElementX:      elementX,
 		ElementY:      elementY,
-		SelectInfo:    selectInfo,
+		SelectInfo:     selectInfo,
+		InputRects:     inputRects,
+		ViewportWidth:  viewportWidth,
+		ViewportHeight: viewportHeight,
+		InputType:      inputType,
+		InputMode:      inputMode,
+		AutoComplete:   autoComplete,
+		EnterKeyHint:   enterKeyHint,
 	}
 }
 

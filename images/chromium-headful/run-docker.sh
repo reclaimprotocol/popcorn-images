@@ -99,6 +99,7 @@ RUN_ARGS=(
   --memory 3072m
   -p 9222:9222
   -p 9224:9224
+  -p 9226:9226
   -p 444:10001
   -e DISPLAY_NUM=1
   -e HEIGHT=1080

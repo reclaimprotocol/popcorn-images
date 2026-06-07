@@ -2,7 +2,7 @@
   <div class="connect">
     <div class="window">
       <div class="loader" v-if="connecting">
-        <img src="../assets/images/logo.svg" alt="loading" aria-hidden="true" class="kernel-logo" />
+        <img src="../assets/images/reclaim-logo.png" alt="loading" aria-hidden="true" class="kernel-logo" />
       </div>
     </div>
   </div>

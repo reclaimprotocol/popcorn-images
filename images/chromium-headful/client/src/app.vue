@@ -127,9 +127,14 @@
   @media only screen and (max-width: 1024px) {
     html,
     body {
-      overflow-y: auto !important;
-      width: auto !important;
-      height: auto !important;
+      /* Lock html/body to the visual viewport so the streamed video can fill
+         it edge-to-edge without leaving slack the user could scroll into. */
+      overflow: hidden !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      height: 100dvh !important;
+      margin: 0 !important;
+      padding: 0 !important;
     }
 
     body > p {
@@ -137,16 +142,23 @@
     }
 
     #neko {
-      position: relative;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
       flex-direction: column;
       max-height: initial !important;
 
       .neko-main {
         height: 100vh;
+        height: 100dvh;
       }
 
       .neko-menu {
         height: 100vh;
+        height: 100dvh;
         width: 100% !important;
       }
     }

@@ -1,8 +1,8 @@
 <template>
   <div ref="component" class="video">
     <div ref="player" class="player">
-      <div ref="container" class="player-container">
-        <video ref="video" playsinline :class="{ magnified: mobileMagnified }" :style="magnifyStyle" />
+      <div ref="container" :class="['player-container', mobileViewportActive ? 'mobile-viewport' : '']">
+        <video ref="video" playsinline />
         <div class="emotes">
           <template v-for="(emote, index) in emotes">
             <neko-emote :id="index" :key="index" />
@@ -63,6 +63,22 @@
         </div>
 -->
         <div ref="aspect" class="player-aspect" />
+        <!-- ?debug=rects: paints translucent red boxes over every cached
+             input rect so we can visually verify what the hit-test sees.
+             pointer-events:none so it never absorbs taps. -->
+        <div v-if="debugRects" class="rect-debug-overlay" aria-hidden="true">
+          <div
+            v-for="(r, i) in debugRectStyles"
+            :key="i"
+            class="rect-debug-box"
+            :style="r"
+          />
+          <div class="rect-debug-status">
+            rects: {{ inputRectsCache.length }} ready={{ inputRectsReady }}<br>
+            vp: {{ cdpFocusCache && cdpFocusCache.viewportWidth || '?' }}×{{ cdpFocusCache && cdpFocusCache.viewportHeight || '?' }}<br>
+            kbd: {{ keyboardActive }} last: {{ lastHitResult }}
+          </div>
+        </div>
       </div>
       <ul v-if="!fullscreen && !hideControls" class="video-menu top">
         <!-- KERNEL: disable fullscreen and resolution controls
@@ -104,6 +120,13 @@
         >
           <i class="fas fa-keyboard" />
         </li>
+        <li
+          v-if="hosting && is_touch_device"
+          :class="extraControls || 'extra-control'"
+          @click.stop.prevent="toggleMagnify"
+        >
+          <i :class="['fas', isMagnified ? 'fa-compress' : 'fa-search-plus']" />
+        </li>
       </ul>
       <neko-resolution ref="resolution" v-if="admin" />
       <neko-clipboard ref="clipboard" v-if="hosting && (!clipboard_read_available || !clipboard_write_available)" />
@@ -122,6 +145,7 @@
       justify-content: center;
       align-items: center;
       background: #000;
+
 
       .video-menu {
         position: absolute;
@@ -193,16 +217,6 @@
             display: none !important;
           }
 
-          /* Magnify mode: the inline `videoStyle` getter sizes this element
-             to the framebuffer's native pixel dimensions and applies a CSS
-             scale transform that maps the *emulated* viewport into the
-             *visible* container area. The container's `overflow: hidden`
-             clips the parts of the framebuffer outside that emulated region.
-             `object-fit: fill` ensures the streamed pixels fill the element
-             box at 1:1 (no intrinsic letterbox). */
-          &.magnified {
-            object-fit: fill;
-          }
         }
 
         .player-overlay,
@@ -245,11 +259,43 @@
           caret-color: transparent;
           background: transparent;
           resize: none;
+          touch-action: none;
         }
 
         .player-aspect {
           display: block;
           padding-bottom: 56.25%;
+        }
+
+        /* Mobile viewport magnify: fill the screen and crop the 1920×1080
+           stream to show only the top-left emulated area at 1:1 pixels.
+           Pairs with the `./cdp-magnify.sh` script which tells chromium to
+           render the page into that same top-left rect.
+           Uses 100dvh (dynamic viewport height) to avoid iOS Safari's
+           100vh bug where it includes the area behind the address bar. */
+        &.mobile-viewport {
+          max-width: 100vw !important;
+          width: 100vw !important;
+          height: 100vh !important;
+          height: 100dvh !important;
+
+          video {
+            object-fit: none;
+            object-position: 0 0;
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+          }
+
+          .overlay {
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+          }
+
+          .player-aspect {
+            display: none !important;
+          }
         }
 
         /* Mobile IME proxy input. Visually invisible but real enough for
@@ -269,6 +315,37 @@
           caret-color: transparent;
           z-index: 9999;
         }
+
+        /* ?debug=rects overlay. Fixed-position boxes painted at the same
+           screen coords the hit-test uses, so visual position == what the
+           system believes is an input. */
+        .rect-debug-overlay {
+          position: fixed;
+          inset: 0;
+          pointer-events: none;
+          z-index: 9998;
+        }
+        .rect-debug-box {
+          position: fixed;
+          border: 2px solid rgba(255, 0, 64, 0.85);
+          background: rgba(255, 0, 64, 0.12);
+          box-sizing: border-box;
+          pointer-events: none;
+        }
+        .rect-debug-status {
+          position: fixed;
+          top: 4px;
+          left: 4px;
+          padding: 4px 6px;
+          font: 11px/1.3 monospace;
+          background: rgba(0, 0, 0, 0.75);
+          color: #0f0;
+          border: 1px solid rgba(0, 255, 0, 0.4);
+          border-radius: 3px;
+          pointer-events: none;
+          z-index: 9999;
+          white-space: nowrap;
+        }
       }
     }
   }
@@ -287,6 +364,43 @@
   import GuacamoleKeyboard from '~/utils/guacamole-keyboard.ts'
 
   const WHEEL_LINE_HEIGHT = 19
+
+  interface HitTestReply {
+    isInput: boolean
+    tag?: string
+    readonly?: boolean
+    disabled?: boolean
+    isEditable?: boolean
+    focusKey?: string
+  }
+
+  interface InputRect { x: number; y: number; width: number; height: number }
+
+  interface ActiveElementInfo {
+    isInput: boolean
+    tag: string
+    type?: string
+    isEditable?: boolean
+    readonly?: boolean
+    disabled?: boolean
+    focusKey?: string
+    elementTop?: number
+    elementHeight?: number
+    elementLeft?: number
+    elementWidth?: number
+    selectInfo?: {
+      multiple: boolean
+      rect: { x: number; y: number; width: number; height: number }
+      options: Array<{ value: string; text: string; selected: boolean; disabled: boolean; groupLabel?: string }>
+    }
+    inputRects?: InputRect[]
+    viewportWidth?: number
+    viewportHeight?: number
+    inputType?: string
+    inputMode?: string
+    autoComplete?: string
+    enterKeyHint?: string
+  }
 
   @Component({
     name: 'neko-video',
@@ -319,13 +433,12 @@
     private mutedOverlay = true
     private isVideoSyncing = false
 
-    // Mobile-magnify hack: when the remote framebuffer stays at desktop size
-    // but the page renders into the top-left magnifyW x magnifyH region, we
-    // visually scale the video element so that region fills the iframe.
-    // Coord scaling and aspect ratio are adjusted to match.
-    private mobileMagnified = false
-    private magnifyW = 0
-    private magnifyH = 0
+    // Magnify toggle for touch viewers. true = native 1920×1080 letterboxed
+    // view (initial state — page is visible at desktop aspect with bars).
+    // false = mobile-viewport CSS crop active (pairs with cdp-magnify CDP
+    // emulation; toggled via the magnify button which also auto-applies the
+    // CDP emulation at the viewer's actual screen size).
+    isMagnified = true
 
     // IME composition state. Only used on iOS — Android (Samsung Keyboard
     // especially) treats every word as a composition session, so suppressing
@@ -364,15 +477,55 @@
     private lastCharSent = ''
     private lastPunctuationTime = 0
 
-    // Android auto-focus poller state.
-    // suppressedFocusKey: focusKey of the element on which the user last
-    //   dismissed the keyboard. While the same element remains focused, the
-    //   poller stays out of the way; cleared as soon as focus moves.
-    // autoFocusPoll: setInterval handle so we can stop on destroy / disable.
-    private suppressedFocusKey: string | null = null
-    private autoFocusPoll: number | null = null
+    // Mobile keyboard pops on user tap only — no background polling. The
+    // touchend handler does a /cdp/active-element check (sync on iOS,
+    // 150 ms async on Android) and pops the keyboard if the tap landed on
+    // a focusable input. This avoids the constant /cdp/active-element
+    // traffic the old auto-focus poller created, which on shit networks
+    // competed with text POSTs for the same HTTPS path.
 
     // Cached regex test once on construction; the result doesn't change.
+    // Debug overlay: enable with ?debug=rects in the URL. Renders red
+    // outlines over every cached input rect so we can visually verify
+    // what the hit-test "sees" — invaluable on pages where the keyboard
+    // misbehaves (cache stale, wrong rects, cross-origin iframe gaps).
+    get debugRects(): boolean {
+      const debugParam = new URLSearchParams(window.location.search).get('debug') || ''
+      return debugParam.split(',').includes('rects')
+    }
+
+    // Reactivity hook: bumped on every WS focus push so the v-for above
+    // re-renders the overlay. (cdpFocusCacheAt is a Vue-reactive field
+    // because Vue's reactivity intercepts the assignment in onmessage.)
+    get debugRectStyles(): Array<Record<string, string>> {
+      if (!this.debugRects) return []
+      // Track cdpFocusCacheAt so the computed re-runs on each push.
+      void this.cdpFocusCacheAt
+      const rects = this.inputRectsCache
+      if (!rects.length) return []
+      const overlay = this._overlay?.getBoundingClientRect()
+      if (!overlay) return []
+      const vw = this.cdpFocusCache?.viewportWidth
+      const vh = this.cdpFocusCache?.viewportHeight
+      // CSS-crop mode: 1:1 mapping; otherwise scale overlay → server vp.
+      let sx: number, sy: number
+      if (this.mobileViewportActive) {
+        sx = 1
+        sy = 1
+      } else {
+        const rw = vw && vw > 0 ? vw : (this.width || overlay.width)
+        const rh = vh && vh > 0 ? vh : (this.height || overlay.height)
+        sx = overlay.width / rw
+        sy = overlay.height / rh
+      }
+      return rects.map(r => ({
+        left: `${overlay.left + r.x * sx}px`,
+        top: `${overlay.top + r.y * sy}px`,
+        width: `${r.width * sx}px`,
+        height: `${r.height * sy}px`,
+      }))
+    }
+
     get isAndroid(): boolean {
       return /android/i.test(navigator.userAgent)
     }
@@ -384,22 +537,18 @@
       return false
     }
 
-    // Inline style for the hidden proxy input. Fixed off-screen when keyboard
-    // is inactive; moves to viewport-center when active so platform IMEs
-    // (Samsung especially) attach and dispatch input events.
+    // Inline style for the hidden proxy input. Keep it on-screen at the
+    // top-left even when inactive so iOS doesn't fire a scroll-to-focused-
+    // input dance when the input gains focus (the dance would visibly shift
+    // the popcorn page upward, since iOS scrolls the visual viewport even
+    // when document scrolling is disabled). Top-anchored = already above the
+    // soft keyboard, so no scroll needed.
     get proxyInputStyle(): Record<string, string> {
-      if (this.keyboardActive) {
-        return {
-          position: 'fixed',
-          top: '50%',
-          left: '50%',
-          transform: 'translate(-50%, -50%)',
-        }
-      }
       return {
         position: 'fixed',
-        top: '-9999px',
-        left: '-9999px',
+        top: '0',
+        left: '0',
+        zIndex: '9999',
       }
     }
 
@@ -413,11 +562,20 @@
     private touchLastWheelEmit = 0
     private longPressTimer: number | null = null
 
-    // CDP state
-    private cdpSocket: WebSocket | null = null
-    private pendingCDPCommands: Map<number, { resolve: Function, reject: Function }> = new Map()
-    private cdpCommandId = 1
-    private cdpSessionId: string | null = null
+    // iOS-only: fired on touchstart so the focus-state RTT runs in parallel
+    // with the tap itself. By the time touchend fires (~150–300 ms later)
+    // the answer is usually already in hand and we can decide whether to
+    // pop the keyboard without doing a blocking sync XHR — which on a slow
+    // network would freeze the page for the duration of one round-trip.
+    // Set to undefined when not yet resolved; null on transport error.
+    private touchstartFocusResult: ActiveElementInfo | null | undefined = undefined
+
+    // Mobile typing transport state. Each keystroke POSTs to /cdp/input on
+    // the gateway-reachable API, which forwards into a server-side persistent
+    // CDP session. A direct browser→:9222 WebSocket would be lower latency
+    // but is unreachable in most deployments and silently drops keystrokes
+    // on disconnect; HTTP requests are independent so a flaky cellular link
+    // loses at most the in-flight char.
 
     get admin() {
       return this.$accessor.user.admin
@@ -533,6 +691,66 @@
       return this.$accessor.video.horizontal
     }
 
+    // Whether the mobile-viewport CSS crop is active. The CSS shows only
+    // the top-left screenW × screenH of the 1920×1080 framebuffer, so when
+    // chromium is rendering a mobile layout (cdp-magnify.sh active) the
+    // empty padding around it doesn't fill the user's screen.
+    //
+    // Two activation signals:
+    //   1. The local magnify toggle (user tapped the in-app magnify button).
+    //   2. The server's pushed viewportWidth shrunk below the native stream
+    //      resolution — i.e. someone ran cdp-magnify.sh externally and the
+    //      remote chromium is now mobile-sized. Auto-detect via the focus
+    //      push so the script works standalone without requiring the
+    //      viewer to also tap the in-app button.
+    get mobileViewportActive(): boolean {
+      if (!this.is_touch_device) return false
+      const vw = this.cdpFocusCache?.viewportWidth || 0
+      const remoteShrunk = vw > 0 && this.width > 0 && vw < this.width - 50
+      return !this.isMagnified || remoteShrunk
+    }
+
+    toggleMagnify() {
+      this.isMagnified = !this.isMagnified
+      this.applyViewportEmulation()
+    }
+
+    // Server endpoint that runs Emulation.* against the upstream chromium.
+    // Mirrors the URL pattern of /cdp/active-element (gateway-routed in prod).
+    private getEmulateDeviceUrl(): string {
+      return this.resolveCDPUrl('emulate-device')
+    }
+
+    // Sync the remote chromium's emulated viewport with the magnify state.
+    // When the CSS crop is active (mobileViewportActive), tell chromium to
+    // lay out at the viewer's window size into the top-left of the frame so
+    // the visible region matches what the CSS shows. When magnified, clear
+    // the override so chromium renders desktop into the full 1920×1080.
+    private applyViewportEmulation() {
+      const url = this.getEmulateDeviceUrl()
+      const body = this.mobileViewportActive
+        ? {
+            width: Math.max(1, Math.round(window.innerWidth)),
+            height: Math.max(1, Math.round(Math.min(window.innerHeight, this.height || 1080))),
+            mobile: true,
+            // deviceScaleFactor: 1 — DPR>1 makes chromium render at 2× and
+            // overflow the 1920×1080 stream, then the CSS crop misses the
+            // bottom rows.
+            deviceScaleFactor: 1,
+            touch: true,
+            maxTouchPoints: 5,
+            // Pass the viewer's real UA through so Cloudflare/bot detection
+            // sees a consistent UA + TLS fingerprint.
+            userAgent: navigator.userAgent,
+          }
+        : { width: this.width || 1920, height: this.height || 1080, mobile: false, deviceScaleFactor: 1, touch: false }
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).catch((err) => console.warn('[CDP] emulate-device failed', err))
+    }
+
     get is_touch_device() {
       return (
         // detect if the device has touch support
@@ -543,78 +761,6 @@
       )
     }
 
-    // Effective dims: what the iframe actually displays (and what taps should
-    // map onto). With the mobile-magnify hack, that's the mobile region; otherwise
-    // it's the full framebuffer as reported by neko.
-    get effectiveW(): number {
-      return this.mobileMagnified && this.magnifyW > 0 ? this.magnifyW : this.width
-    }
-    get effectiveH(): number {
-      return this.mobileMagnified && this.magnifyH > 0 ? this.magnifyH : this.height
-    }
-
-    // Reactive container dims, updated by ResizeObserver via onResize().
-    // Used by videoStyle/overlayInfo to compute the magnify scale transform.
-    private containerW = 0
-    private containerH = 0
-
-    // The websdk-style viewport pipeline:
-    //   * `<video>` is sized at the framebuffer's native pixel dimensions
-    //     (this.width × this.height) so it represents a true 1:1 capture surface
-    //   * `transform: scale(N)` maps the *emulated* viewport (what CDP told the
-    //     page to render at) into the *visible* container area
-    //   * `left/top` centers the visible region when it doesn't fill the
-    //     container (letterbox case)
-    //   * `overflow: hidden` on .player-container clips the framebuffer pixels
-    //     outside the emulated region
-    //
-    // overlayInfo exposes scale/offset/size so future overlays (popup anchors,
-    // selection rects) can be positioned against the same coordinate basis,
-    // matching the `_overlayInfo` block in the websdk's useViewportManagement.
-    get overlayInfo() {
-      const emulatedW = this.mobileMagnified && this.magnifyW > 0 ? this.magnifyW : (this.width || 1920)
-      const emulatedH = this.mobileMagnified && this.magnifyH > 0 ? this.magnifyH : (this.height || 1080)
-      const visibleW = this.containerW || emulatedW
-      const visibleH = this.containerH || emulatedH
-
-      const scaleX = visibleW / emulatedW
-      const scaleY = visibleH / emulatedH
-      const scale = Math.min(scaleX, scaleY)
-      const scaledW = emulatedW * scale
-      const scaledH = emulatedH * scale
-      const offsetX = (visibleW - scaledW) / 2
-      const offsetY = (visibleH - scaledH) / 2
-
-      return { emulatedW, emulatedH, visibleW, visibleH, scale, scaledW, scaledH, offsetX, offsetY }
-    }
-
-    // Inline style on the <video> element. Active only in magnify mode — when
-    // off we fall back to the scoped CSS (width: 100%, height: 100%) which
-    // lets the video fill the player-container conventionally.
-    get magnifyStyle(): Record<string, string> | undefined {
-      if (!this.mobileMagnified) return undefined
-      const fbW = this.width || 1920
-      const fbH = this.height || 1080
-      const { scale, offsetX, offsetY } = this.overlayInfo
-      return {
-        width: `${fbW}px`,
-        height: `${fbH}px`,
-        transform: `scale(${scale})`,
-        transformOrigin: '0 0',
-        left: `${offsetX}px`,
-        top: `${offsetY}px`,
-        bottom: 'auto',
-        right: 'auto',
-      }
-    }
-
-    @Watch('mobileMagnified')
-    @Watch('magnifyW')
-    @Watch('magnifyH')
-    onMagnifyChanged() {
-      this.onResize()
-    }
-
     @Watch('iframeOffset')
     onIframeOffsetChanged(offset: number) {
       if (!this._player) return
@@ -622,111 +768,6 @@
       // the on-screen keyboard. Offset is negative when lifting.
       this._player.style.transform = offset !== 0 ? `translateY(${offset}px)` : ''
       this._player.style.transition = 'transform 0.3s ease-out'
-    }
-
-    // Pick the CDP device-emulation profile for the current viewer. Returns
-    // null on non-touch devices (= no override; remote renders desktop).
-    //
-    // The framebuffer stays at its native size; `scale` upsamples the mobile
-    // page to fill the chromium window so the streamed frame isn't a tiny
-    // mobile viewport in a corner of empty wallpaper.
-    private pickDeviceProfile(): {
-      width: number
-      height: number
-      mobile: boolean
-      userAgent: string
-      maxTouchPoints: number
-    } | null {
-      if (!this.is_touch_device) return null
-      const w = window.innerWidth
-      const h = window.innerHeight
-      const portrait = h >= w
-      // iPhone-class portrait phone.
-      if (portrait && w <= 500) {
-        return {
-          width: 390,
-          height: 844,
-          mobile: true,
-          userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-          maxTouchPoints: 5,
-        }
-      }
-      // Tablet portrait.
-      if (portrait) {
-        return {
-          width: 768,
-          height: 1024,
-          mobile: true,
-          userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-          maxTouchPoints: 5,
-        }
-      }
-      // Touch device in landscape (rotated tablet).
-      return {
-        width: 1024,
-        height: 768,
-        mobile: true,
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        maxTouchPoints: 5,
-      }
-    }
-
-    // Same URL resolution rule as getActiveElementUrl: route through the API
-    // gateway in prod, direct to :9222 in local dev.
-    private getEmulateDeviceUrl(): string {
-      const params = new URLSearchParams(window.location.search)
-      const sessionId = params.get('session_id')
-      const token = params.get('token')
-      if (sessionId && token) {
-        return `${window.location.origin}/api/${sessionId}/${token}/cdp/emulate-device`
-      }
-      return `http://${window.location.hostname}:9222/cdp/emulate-device`
-    }
-
-    private remoteEmulationSynced = false
-
-    @Watch('connected')
-    onConnectedForRemoteResize(connected: boolean) {
-      if (!connected || this.remoteEmulationSynced) return
-      const profile = this.pickDeviceProfile()
-      if (!profile) return
-      this.remoteEmulationSynced = true
-
-      // Activate the CSS magnify hack: visually zoom into the top-left
-      // profile.width x profile.height region of the streamed framebuffer
-      // and route taps into that region. Triggers a reactive onResize.
-      this.magnifyW = profile.width
-      this.magnifyH = profile.height
-      this.mobileMagnified = true
-
-      // Pick scale so the mobile page fills the remote framebuffer width.
-      // Falls back to 1 if we don't yet know the framebuffer dimensions.
-      const fbWidth = this.width || profile.width
-      const scale = Math.max(1, fbWidth / profile.width)
-
-      fetch(this.getEmulateDeviceUrl(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          width: profile.width,
-          height: profile.height,
-          mobile: profile.mobile,
-          scale,
-          userAgent: profile.userAgent,
-          touch: true,
-          maxTouchPoints: profile.maxTouchPoints,
-        }),
-      })
-        .then((res) => {
-          if (!res.ok) {
-            // Don't unsync — the server isn't going to start working mid-session.
-            // Logging only; the rest of the client still works.
-            console.warn('[CDP] emulate-device returned', res.status)
-          }
-        })
-        .catch((err) => {
-          console.warn('[CDP] emulate-device failed', err)
-        })
     }
 
     @Watch('width')
@@ -829,7 +870,9 @@
 
       this.observer.observe(this._component)
 
-      this.connectCDP()
+      // Open the persistent input WebSocket. Falls back transparently to HTTP
+      // POSTs in postCDPInput when the WS isn't connected yet or has died.
+      this.connectInputWS()
 
       // Mobile keyboard detection via visualViewport (ported from
       // keyboard.ts:214-253). When the visual viewport shrinks by >50px the
@@ -837,12 +880,6 @@
       if (this.is_touch_device && window.visualViewport) {
         window.visualViewport.addEventListener('resize', this.handleViewportResize)
       }
-
-      // Android auto-focus poller: if the remote page focuses an input on
-      // its own (autofocus, programmatic .focus(), form-flow advance), pop
-      // the keyboard automatically. iOS is excluded because Safari requires
-      // focus calls inside user gestures.
-      this.startAndroidAutoFocusPoller()
 
       // Inbound postMessage listener — portal → popcorn replies for the
       // select-dropdown bridge. Listening unconditionally so portals can
@@ -931,10 +968,6 @@
     }
 
     beforeDestroy() {
-      if (this.cdpSocket) {
-        this.cdpSocket.close()
-        this.cdpSocket = null
-      }
       this.cancelLongPress()
       if (this.pendingBackspaceTimer !== null) {
         window.clearTimeout(this.pendingBackspaceTimer)
@@ -944,9 +977,9 @@
         window.visualViewport.removeEventListener('resize', this.handleViewportResize)
       }
       window.removeEventListener('message', this.onPortalMessage)
-      this.stopAndroidAutoFocusPoller()
+      this.disconnectInputWS()
+      this.stopStuckStatePoller()
       this.observer.disconnect()
-      this.pendingCDPCommands.clear()
       this.$accessor.video.setPlayable(false)
       /* Guacamole Keyboard does not provide destroy functions */
     }
@@ -997,177 +1030,645 @@
     }
 
     // --- CDP Logic ---
-    // Detect production (behind gateway) vs local dev and return the correct
-    // URL for the active-element endpoint.
-    // Production path: /<browser_pod_id>/<session_id>/<token>/...
-    // Production API:  /api/<session_id>/<token>/cdp/active-element
-    // Local:           http://<hostname>:9222/cdp/active-element
-    getActiveElementUrl(): string {
-      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/);
+    // Resolve the URL for a /cdp/<endpoint> call across all three deployment
+    // shapes:
+    //   1. Production (path /<browser_pod_id>/<session_id>/<token>/...)
+    //      → routed through the gateway at /api/<sid>/<tok>/cdp/<endpoint>.
+    //   2. HTTPS without that path prefix (cloudflared quick-tunnel, any
+    //      reverse-proxy that exposes both neko and kernel-images-api on the
+    //      same origin) → use same-origin /cdp/<endpoint>. The proxy is
+    //      responsible for path-routing /cdp/* to the kernel-images-api.
+    //      Hitting `http://host:9222` from an HTTPS page would be blocked as
+    //      mixed content even if the port were reachable, which it isn't
+    //      through cloudflared.
+    //   3. HTTP local dev → hit the kernel-images-api directly on :9222.
+    private resolveCDPUrl(endpoint: string): string {
+      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/)
       if (match) {
-        const sessionId = match[2];
-        const token = match[3];
-        return `${window.location.origin}/api/${sessionId}/${token}/cdp/active-element`;
+        return `${window.location.origin}/api/${match[2]}/${match[3]}/cdp/${endpoint}`
       }
-      // Local dev: hit the kernel-images-api directly
-      return `http://${window.location.hostname}:9222/cdp/active-element`;
+      if (window.location.protocol === 'https:') {
+        return `${window.location.origin}/cdp/${endpoint}`
+      }
+      return `http://${window.location.hostname}:9222/cdp/${endpoint}`
     }
 
-    // Open a page-scoped CDP WebSocket so mobile keystrokes can be injected
-    // via Input.insertText / Input.dispatchKeyEvent (which bypass xdotool/X11
-    // and handle Unicode trivially). The kernel-images-api filter on :9222
-    // already whitelists Input.* methods, so commands go straight through.
-    //
-    // Connection is page-scoped (ws://.../devtools/page/<id>), which means no
-    // Target.attachToTarget dance is needed and commands omit sessionId.
-    // On same-tab navigation the targetId is stable; on cross-tab navigation
-    // a reconnect would be needed (not handled here — first-iteration scope).
-    async connectCDP() {
+    getActiveElementUrl(): string {
+      return this.resolveCDPUrl('active-element')
+    }
+
+    private getCDPInputUrl(): string {
+      return this.resolveCDPUrl('input')
+    }
+
+    // Outbox for /cdp/input. Single in-flight POST at a time + retry-with-
+    // backoff gives us ordering and resilience on lossy networks without
+    // needing server-side dedup. The previous fire-and-forget approach lost
+    // keystrokes silently on transient failures and could reorder bursts
+    // when two POSTs were in flight and the network reordered packets.
+    private cdpInputOutbox: Array<{
+      seq: number
+      body: { text?: string; key?: string; count?: number }
+      attempts: number
+    }> = []
+    private cdpInputInFlight = false
+    private cdpInputSeq = 0
+    // Outbox queue: bound size, max retries per entry, per-request timeout.
+    // Overflow drops the oldest because the user is actively typing newer
+    // chars; nobody cares about a 5-second-stale keystroke.
+    private readonly CDP_OUTBOX_MAX = 128
+    private readonly CDP_MAX_ATTEMPTS = 5
+    // Tuned for cellular networks where a single POST can easily take >10 s
+    // through Cloudflare under packet loss. 5 s was too aggressive — we were
+    // aborting requests that would have succeeded a few hundred ms later,
+    // then paying backoff on top.
+    private readonly CDP_REQUEST_TIMEOUT_MS = 20000
+    // Soft cap per coalesced POST so a stuck connection doesn't accumulate a
+    // 10 KB payload that takes even longer to push through. 256 chars is well
+    // under any URL/keepalive limit and still big enough that a fast typist
+    // collapses ~5 s of input into a single POST.
+    private readonly CDP_TEXT_BATCH_MAX = 256
+
+    // Persistent WebSocket to /cdp/input-ws. When connected we send keystroke
+    // frames over it instead of POSTing to /cdp/input — on high-RTT cellular
+    // links this skips per-request TCP/TLS setup and cuts the per-keystroke
+    // round-trips roughly in half. On WS close/failure we transparently fall
+    // back to the HTTP outbox.
+    private cdpInputWS: WebSocket | null = null
+    private cdpInputWSReady = false
+    private cdpInputWSReconnect: number | null = null
+    private cdpInputWSReconnectAttempts = 0
+    // Outstanding hit-test requests, keyed by seq. Resolves when the
+    // matching {type:"hitTest", seq} reply arrives on the WS.
+    private cdpHitTestPending: Map<number, (r: HitTestReply | null) => void> = new Map()
+
+    // Tap-time bookkeeping for the focus-driven keyboard:
+    //  - pendingTapAt: timestamp of the most recent tap (touchend → click).
+    //  - pendingTapPreFocusKey: focusKey snapshot at tap time.
+    //  - postTapTimer: scheduled check that runs after enough wall-time has
+    //    passed for a focus event to reach us from the remote. If focus
+    //    DIDN'T change but it was previously on an input, the tap must have
+    //    landed on a non-focusable area — dismiss the keyboard.
+    private pendingTapAt = 0
+    private pendingTapPreFocusKey: string | null = null
+    private postTapTimer: number | null = null
+
+    // Tier-1 input-rects cache. Populated from each WS focus push (which on
+    // the server runs every 200 ms and pushes whenever rects change or on a
+    // 600 ms heartbeat). Tap-time hit-test is O(N) local — *no* network
+    // round-trip — so the decision works identically at 50 ms or 5 s RTT.
+    // Cache freshness ≈ RTT; on a fast network rects are ~250 ms stale, on
+    // a 3 s RTT cellular link they're up to ~3 s stale. Tap handler treats
+    // "cache not yet populated" as "unknown" and falls back to leaving the
+    // keyboard state alone (user can use the toolbar keyboard icon).
+    private inputRectsCache: InputRect[] = []
+    private inputRectsReady = false
+    // Last time the user scrolled. The remote moves rects under our cached
+    // positions when it processes the scroll, but on a 3 s RTT cellular link
+    // we don't get the corrected snapshot back for ~one round-trip. During
+    // that window the cache is wrong; treat it as 'unknown' to avoid
+    // false dismisses while the user is mid-flick.
+    private lastScrollAt = 0
+    private readonly SCROLL_CACHE_INVALID_MS = 1500
+
+    // Stuck-state poller bookkeeping: when the WS-pushed focus snapshot
+    // shows the remote activeElement is NOT a text input for N consecutive
+    // ticks while our keyboard is up, the remote page must have moved
+    // focus off the input (route change, modal close, blur'd by JS). Force
+    // the local keyboard down so the user isn't stuck typing into a void.
+    private stuckTimer: number | null = null
+    private stuckMissCount = 0
+
+    private getCDPInputWSUrl(): string {
+      // Mirror the HTTPS-aware logic of resolveCDPUrl, but swap http→ws.
+      const match = window.location.pathname.match(/^\/(browser[^/]+)\/([^/]+)\/([^/]+)/)
+      const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const wsOrigin = `${wsScheme}//${window.location.host}`
+      if (match) {
+        return `${wsOrigin}/api/${match[2]}/${match[3]}/cdp/input-ws`
+      }
+      if (window.location.protocol === 'https:') {
+        return `${wsOrigin}/cdp/input-ws`
+      }
+      return `${wsScheme}//${window.location.hostname}:9222/cdp/input-ws`
+    }
+
+    private connectInputWS() {
+      if (this.cdpInputWS) return
+      const url = this.getCDPInputWSUrl()
+      let ws: WebSocket
       try {
-        const jsonUrl = `http://${window.location.hostname}:9222/json`
-        const res = await fetch(jsonUrl)
-        const targets = await res.json()
-        const page = Array.isArray(targets)
-          ? targets.find((t: any) => t.type === 'page' && !String(t.url || '').startsWith('devtools://'))
-          : null
-        if (!page || !page.webSocketDebuggerUrl) {
-          console.warn('[CDP] no page target available')
-          return
-        }
-        console.log('[CDP] connecting to', page.webSocketDebuggerUrl)
-        this.cdpSocket = new WebSocket(page.webSocketDebuggerUrl)
-        this.cdpSocket.addEventListener('open', () => {
-          console.log('[CDP] socket open — enabling Input domain')
-          this.sendCDPCommand('Input.enable', {})
-          // Note: we intentionally do NOT enable Runtime here. Runtime.evaluate
-          // isn't in the WSS proxy allowlist (proxy.go:564) — calls would be
-          // rejected with "Command not allowed". Any place that needs eval
-          // goes via a server-side endpoint (/cdp/active-element, /cdp/
-          // set-select-value) which uses the unfiltered upstream socket.
-        })
-        this.cdpSocket.addEventListener('message', (e) => {
-          // Dispatch responses to any awaiting sendCDPCommandWithResult call.
-          try {
-            const msg = JSON.parse(e.data as string)
-            if (msg && typeof msg.id === 'number') {
-              const pending = this.pendingCDPCommands.get(msg.id)
-              if (pending) {
-                this.pendingCDPCommands.delete(msg.id)
-                if (msg.error) pending.reject(msg.error)
-                else pending.resolve(msg.result)
+        ws = new WebSocket(url)
+      } catch (err) {
+        console.warn('[CDP-WS] construct failed, will retry:', err)
+        this.scheduleInputWSReconnect()
+        return
+      }
+      this.cdpInputWS = ws
+
+      ws.onopen = () => {
+        this.cdpInputWSReady = true
+        this.cdpInputWSReconnectAttempts = 0
+        console.log('[CDP-WS] connected')
+      }
+      ws.onclose = () => {
+        const wasReady = this.cdpInputWSReady
+        this.cdpInputWS = null
+        this.cdpInputWSReady = false
+        if (wasReady) console.warn('[CDP-WS] closed; falling back to HTTP outbox')
+        this.scheduleInputWSReconnect()
+      }
+      ws.onerror = (e) => {
+        console.warn('[CDP-WS] error', e)
+        // onclose follows automatically.
+      }
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data)
+          if (msg?.type === 'hitTest' && typeof msg.seq === 'number') {
+            const cb = this.cdpHitTestPending.get(msg.seq)
+            if (cb) {
+              this.cdpHitTestPending.delete(msg.seq)
+              if (msg.err) {
+                cb(null)
+              } else {
+                cb({
+                  isInput: !!msg.isInput,
+                  tag: msg.tag,
+                  readonly: !!msg.readonly,
+                  disabled: !!msg.disabled,
+                  isEditable: !!msg.isEditable,
+                  focusKey: msg.focusKey,
+                })
               }
             }
-          } catch { /* ignore parse errors */ }
-        })
-        this.cdpSocket.addEventListener('error', (e) => {
-          console.warn('[CDP] socket error', e)
-        })
-        this.cdpSocket.addEventListener('close', () => {
-          console.log('[CDP] socket closed')
-          this.cdpSocket = null
-        })
-      } catch (err) {
-        console.warn('[CDP] connect failed', err)
-      }
-    }
-
-    private sendCDPCommand(method: string, params: unknown = {}): number | null {
-      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) return null
-      const id = this.cdpCommandId++
-      this.cdpSocket.send(JSON.stringify({ id, method, params }))
-      return id
-    }
-
-    // Fire a CDP command and await its response. Used for Runtime.evaluate
-    // calls where we need the returned value (e.g., applying a select value).
-    private sendCDPCommandWithResult(method: string, params: unknown = {}): Promise<any> {
-      if (!this.cdpSocket || this.cdpSocket.readyState !== WebSocket.OPEN) {
-        return Promise.reject(new Error('CDP socket not open'))
-      }
-      const id = this.cdpCommandId++
-      return new Promise((resolve, reject) => {
-        this.pendingCDPCommands.set(id, { resolve, reject })
-        this.cdpSocket!.send(JSON.stringify({ id, method, params }))
-        // Safety timeout so we don't leak entries on dropped responses.
-        window.setTimeout(() => {
-          if (this.pendingCDPCommands.has(id)) {
-            this.pendingCDPCommands.delete(id)
-            reject(new Error(`CDP command ${method} timed out`))
+            return
           }
-        }, 5000)
+          if (msg?.type === 'focus' && msg.info) {
+            const prev = this.cdpFocusCache
+            const rects = Array.isArray(msg.info.inputRects) ? msg.info.inputRects : []
+            this.cdpFocusCache = {
+              isInput: !!msg.info.isInput,
+              tag: msg.info.tag || 'unknown',
+              type: msg.info.type,
+              isEditable: msg.info.isEditable,
+              readonly: !!msg.info.readonly,
+              disabled: !!msg.info.disabled,
+              focusKey: msg.info.focusKey,
+              elementTop: msg.info.elementTop,
+              elementHeight: msg.info.elementHeight,
+              elementLeft: msg.info.elementLeft,
+              elementWidth: msg.info.elementWidth,
+              selectInfo: msg.info.selectInfo,
+              inputRects: rects,
+              viewportWidth: msg.info.viewportWidth,
+              viewportHeight: msg.info.viewportHeight,
+              inputType: msg.info.inputType,
+              inputMode: msg.info.inputMode,
+              autoComplete: msg.info.autoComplete,
+              enterKeyHint: msg.info.enterKeyHint,
+            }
+            this.cdpFocusCacheAt = Date.now()
+            this.inputRectsCache = rects
+            this.inputRectsReady = true
+            this.onFocusSnapshotUpdated(prev)
+            return
+          }
+          // Ack — informational. Order is preserved by TCP.
+          if (msg?.ok === false) {
+            console.warn('[CDP-WS] server rejected frame:', msg.err)
+          }
+        } catch { /* malformed frame, ignore */ }
+      }
+    }
+
+    private scheduleInputWSReconnect() {
+      if (this.cdpInputWSReconnect !== null) return
+      const attempt = ++this.cdpInputWSReconnectAttempts
+      // Backoff: 500ms, 1s, 2s, 4s, capped at 8s.
+      const delay = Math.min(500 * (1 << Math.min(attempt - 1, 4)), 8000)
+      this.cdpInputWSReconnect = window.setTimeout(() => {
+        this.cdpInputWSReconnect = null
+        this.connectInputWS()
+      }, delay)
+    }
+
+    // Send a hit-test query over the WS asking "what element is under
+    // (remoteX, remoteY)?". Returns null on timeout / WS not ready.
+    // This bypasses the activeElement-staleness problem entirely: clicks
+    // on non-focusable areas don't blur the previous input, so isInput
+    // stays true; elementFromPoint asks the only question that matters.
+    private hitTestAtRemote(remoteX: number, remoteY: number): Promise<HitTestReply | null> {
+      return new Promise((resolve) => {
+        if (!this.cdpInputWSReady || !this.cdpInputWS || this.cdpInputWS.readyState !== WebSocket.OPEN) {
+          resolve(null)
+          return
+        }
+        this.cdpInputSeq++
+        const seq = this.cdpInputSeq
+        const timeout = window.setTimeout(() => {
+          this.cdpHitTestPending.delete(seq)
+          resolve(null)
+        }, 6000)
+        this.cdpHitTestPending.set(seq, (r) => {
+          window.clearTimeout(timeout)
+          resolve(r)
+        })
+        try {
+          this.cdpInputWS.send(JSON.stringify({ seq, hitTest: { x: remoteX, y: remoteY } }))
+        } catch {
+          window.clearTimeout(timeout)
+          this.cdpHitTestPending.delete(seq)
+          resolve(null)
+        }
       })
     }
 
-    // Insert plain text via CDP. Goes directly into chromium's input pipeline
-    // — no xdotool, no keysym translation, full Unicode support.
+    // Called whenever a fresh focus snapshot arrives over the WS (or via
+    // the HTTP fetch fallback). This is the BACKUP path — the tap handler
+    // already made an instant decision via the input-rects cache. This
+    // catches:
+    //   - Remote programmatic focus changes (form submit advances cursor,
+    //     route change focuses a new field, etc.) where no tap happened.
+    //   - Stuck-state recovery: focus moved off any input → dismiss.
+    private onFocusSnapshotUpdated(prev: ActiveElementInfo | null) {
+      if (!this.is_touch_device) return
+      const cur = this.cdpFocusCache
+      const prevIsInput = !!(prev && prev.isInput && !prev.readonly && !prev.disabled)
+      const curIsInput = !!(cur && cur.isInput && !cur.readonly && !cur.disabled)
+      const prevKey = prev?.focusKey || null
+      const curKey = cur?.focusKey || null
+
+      // Remote focus moved to a new text input *without* a recent tap →
+      // programmatic focus on the remote. Pop the keyboard.
+      const recentTap = Date.now() - this.pendingTapAt < 4000
+      if (curIsInput && curKey !== prevKey && !this.keyboardActive &&
+          !this.keyboardJustDismissed && !recentTap) {
+        this.focusProxyInputForIOS()
+        this.stuckMissCount = 0
+        return
+      }
+
+      // Focus moved between inputs (e.g. form-tab) while kbd is up:
+      // keep kbd open but re-apply the IME shaping for the new field.
+      // Without this, tabbing from a text field to a number field
+      // leaves Gboard on QWERTY when the user expects a numeric pad.
+      if (curIsInput && this.keyboardActive && curKey !== prevKey) {
+        this.applyProxyImeHints()
+      }
+
+      // Focus moved off any input while kbd is up → dismiss.
+      if (prevIsInput && !curIsInput && this.keyboardActive) {
+        this.dismissKeyboard('remote-focus-lost')
+        this.stuckMissCount = 0
+      }
+    }
+
+    // Stuck-state poller: when kbd is up, watch the WS-pushed focus
+    // snapshot for "no input focused on remote" — if that holds for 2
+    // consecutive checks, the remote moved focus and we missed the
+    // transition (or the WS reconnected mid-flight). Force the kbd down.
+    private startStuckStatePoller() {
+      if (this.stuckTimer !== null) return
+      this.stuckMissCount = 0
+      this.stuckTimer = window.setInterval(() => {
+        if (!this.keyboardActive) return
+        if (this.keyboardOpening) return
+        if (this.keyboardJustDismissed) return
+        const cur = this.cdpFocusCache
+        if (!cur) return
+        const curIsInput = cur.isInput && !cur.readonly && !cur.disabled
+        if (curIsInput) {
+          this.stuckMissCount = 0
+          return
+        }
+        this.stuckMissCount++
+        if (this.stuckMissCount >= 2) {
+          this.stuckMissCount = 0
+          this.dismissKeyboard('stuck-state')
+        }
+      }, 1000)
+    }
+
+    private stopStuckStatePoller() {
+      if (this.stuckTimer !== null) {
+        window.clearInterval(this.stuckTimer)
+        this.stuckTimer = null
+      }
+      this.stuckMissCount = 0
+    }
+
+    // Bulletproof keyboard dismiss. iOS Safari sometimes keeps the system
+    // keyboard visible after a bare `.blur()` — the cure is to unwind every
+    // piece of state at once (mirrors reclaim-portal's
+    // dismissKeyboardFromViewport):
+    //   - flip our local keyboardActive immediately so subsequent checks
+    //     see "down"
+    //   - stop the stuck-state poller (no point polling once we're down)
+    //   - clear allowBlur+keyboardJustDismissed guards so the next tap
+    //     can decide cleanly
+    //   - blur the proxy AND clear its value (Samsung Keyboard treats
+    //     residual proxy.value as "current word" and commits it on next
+    //     keystroke, corrupting the next field)
+    //   - window.scrollTo(0, 0) to undo any iOS scroll-to-focused-input
+    //     dance
+    //   - briefly remove `readonly` if it was set, then re-blur — some
+    //     iOS builds need the round trip to actually hide the IME
+    private dismissKeyboard(reason: string) {
+      if (this.debugRects) console.log('[kbd] dismiss', reason)
+      this.allowBlur = true
+      this.keyboardActive = false
+      this.stopStuckStatePoller()
+      this.iframeOffset = 0
+      window.scrollTo(0, 0)
+      this.keyboardJustDismissed = true
+      window.setTimeout(() => { this.keyboardJustDismissed = false }, 150)
+      const proxy = this._proxyInput
+      if (proxy) {
+        proxy.value = ''
+        proxy.blur()
+        // iOS-only hammer: setAttribute('readonly') + re-blur shakes the
+        // system out of "keyboard visible but no focus" states that arise
+        // when the user dismisses via swipe-down then taps elsewhere.
+        if (this.isIOS) {
+          try { proxy.setAttribute('readonly', 'readonly') } catch { /* SSR */ }
+          window.setTimeout(() => {
+            try { proxy.removeAttribute('readonly') } catch { /* SSR */ }
+          }, 0)
+        }
+        // Android hammer: Gboard / Samsung Keyboard often keep the IME
+        // visible after bare blur() — they only re-evaluate "should the
+        // kbd hide?" on a *focus change*, not on blur alone. Force one
+        // by briefly setting inputmode=none (HTML spec: explicitly
+        // suppresses the virtual keyboard for this input) and focusing a
+        // hidden off-screen input, then blurring + removing it. After
+        // this round-trip the IME has seen "focused input that doesn't
+        // want a kbd → hide", which sticks.
+        if (this.isAndroid) {
+          try { proxy.setAttribute('inputmode', 'none') } catch { /* noop */ }
+          const tempInput = document.createElement('input')
+          tempInput.type = 'text'
+          tempInput.setAttribute('inputmode', 'none')
+          tempInput.setAttribute('readonly', 'readonly')
+          tempInput.style.cssText = 'position:fixed;top:-1000px;left:-1000px;width:1px;height:1px;opacity:0;font-size:16px;'
+          document.body.appendChild(tempInput)
+          tempInput.focus()
+          window.setTimeout(() => {
+            try { tempInput.blur() } catch { /* noop */ }
+            if (tempInput.parentNode) tempInput.parentNode.removeChild(tempInput)
+            try { proxy.removeAttribute('inputmode') } catch { /* noop */ }
+          }, 50)
+        }
+      }
+      try {
+        window.parent.postMessage({
+          type: 'POPCORN_VIEWPORT',
+          visibleHeight: window.visualViewport ? window.visualViewport.height : window.innerHeight,
+          occludedBottom: 0,
+        }, '*')
+      } catch { /* no parent */ }
+      window.setTimeout(() => { this.allowBlur = false }, 150)
+    }
+
+    // Post-tap check. We don't know at tap time whether the user tapped an
+    // input, a button, or empty space. The remote will tell us via a
+    // focusin/focusout/no-event, but on cellular networks that takes
+    // multiple seconds. Approach: poll on a short interval until we
+    // observe a focus snapshot received AFTER the tap. Once we have a
+    // post-tap snapshot, decide:
+    //   - focusKey changed → handled by onFocusSnapshotUpdated (no-op here)
+    //   - focusKey unchanged → user tapped a non-focusable area → dismiss
+    //     the keyboard (browsers don't fire focusout for these cases).
+    // Give up after MAX_WAIT_MS so we don't sit in this loop forever.
+    private schedulePostTapDismissCheck() {
+      if (this.postTapTimer !== null) {
+        window.clearTimeout(this.postTapTimer)
+      }
+      const tapAt = this.pendingTapAt
+      const preKey = this.pendingTapPreFocusKey
+      const MAX_WAIT_MS = 8000
+      const POLL_MS = 250
+      const tick = () => {
+        this.postTapTimer = null
+        if (this.pendingTapAt !== tapAt) return // superseded by newer tap
+        const elapsed = Date.now() - tapAt
+        const gotPostTapUpdate = this.cdpFocusCacheAt > tapAt
+        if (gotPostTapUpdate) {
+          if (!this.keyboardActive) return
+          const curKey = this.cdpFocusCache?.focusKey || null
+          if (curKey === preKey) {
+            // Focus didn't change → non-focusable tap → dismiss.
+            this.allowBlur = true
+            if (this._proxyInput) this._proxyInput.blur()
+            window.setTimeout(() => { this.allowBlur = false }, 100)
+          }
+          return
+        }
+        if (elapsed >= MAX_WAIT_MS) return // give up
+        this.postTapTimer = window.setTimeout(tick, POLL_MS)
+      }
+      this.postTapTimer = window.setTimeout(tick, POLL_MS)
+    }
+
+    private disconnectInputWS() {
+      if (this.cdpInputWSReconnect !== null) {
+        window.clearTimeout(this.cdpInputWSReconnect)
+        this.cdpInputWSReconnect = null
+      }
+      if (this.cdpInputWS) {
+        try { this.cdpInputWS.close() } catch { /* already closed */ }
+        this.cdpInputWS = null
+      }
+      this.cdpInputWSReady = false
+    }
+
+    // Enqueue a single input payload. Coalesces consecutive text/key entries
+    // into the queued tail so a fast typist on a slow link sends ONE large
+    // POST instead of dozens of small ones — the bottleneck is RTT per
+    // request, not chromium's ability to ingest characters. Ordering is
+    // preserved: the outbox drains one POST at a time.
+    private postCDPInput(body: { text?: string; key?: string; count?: number }) {
+      // Fast path: when the persistent WS is open, send a single frame and
+      // return. TCP guarantees ordering on a single socket, so we don't need
+      // the single-in-flight outbox here. Coalescing happens upstream at the
+      // call site (IME composition end already batches into one Text call).
+      if (this.cdpInputWSReady && this.cdpInputWS && this.cdpInputWS.readyState === WebSocket.OPEN) {
+        try {
+          this.cdpInputSeq++
+          this.cdpInputWS.send(JSON.stringify({ seq: this.cdpInputSeq, ...body }))
+          return
+        } catch (err) {
+          console.warn('[CDP-WS] send failed, falling back to HTTP:', err)
+          // fall through to HTTP outbox path
+        }
+      }
+
+      const tail = this.cdpInputOutbox[this.cdpInputOutbox.length - 1]
+      // Only coalesce into entries that aren't already on the wire (the head
+      // when in-flight). Modifying an in-flight body would change the bytes
+      // chromium sees mid-request.
+      const tailIsQueued = tail && !(this.cdpInputInFlight && tail === this.cdpInputOutbox[0])
+
+      if (tailIsQueued && tail && body.text && tail.body.text != null && tail.body.key == null) {
+        // Merge consecutive text fragments while we stay under the soft cap.
+        const merged = tail.body.text + body.text
+        if (merged.length <= this.CDP_TEXT_BATCH_MAX) {
+          tail.body.text = merged
+          return
+        }
+      } else if (
+        tailIsQueued && tail && body.key && body.key === tail.body.key &&
+        tail.body.text == null
+      ) {
+        // Same special key (Backspace/Enter/Tab) — bump count instead of
+        // queuing a sibling entry. Cap matches the server's per-request limit.
+        const inc = body.count || 1
+        const nextCount = (tail.body.count || 1) + inc
+        if (nextCount <= 64) {
+          tail.body.count = nextCount
+          return
+        }
+      }
+
+      this.cdpInputSeq++
+      this.cdpInputOutbox.push({ seq: this.cdpInputSeq, body: { ...body }, attempts: 0 })
+      if (this.cdpInputOutbox.length > this.CDP_OUTBOX_MAX) {
+        const dropped = this.cdpInputOutbox.shift()
+        console.warn('[CDP] /cdp/input outbox overflow, dropped seq', dropped?.seq)
+      }
+      this.drainCDPInputOutbox()
+    }
+
+    private drainCDPInputOutbox() {
+      if (this.cdpInputInFlight) return
+      const head = this.cdpInputOutbox[0]
+      if (!head) return
+      this.cdpInputInFlight = true
+
+      const ctrl = new AbortController()
+      const timeoutId = window.setTimeout(
+        () => ctrl.abort(),
+        this.CDP_REQUEST_TIMEOUT_MS,
+      )
+
+      fetch(this.getCDPInputUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(head.body),
+        keepalive: true,
+        signal: ctrl.signal,
+      }).then((res) => {
+        window.clearTimeout(timeoutId)
+        if (res.ok) {
+          this.cdpInputOutbox.shift()
+          this.cdpInputInFlight = false
+          this.drainCDPInputOutbox()
+          return
+        }
+        // 4xx is a permanent client error — retrying won't help, drop.
+        if (res.status >= 400 && res.status < 500) {
+          console.warn('[CDP] /cdp/input', res.status, 'seq', head.seq, '— dropping')
+          this.cdpInputOutbox.shift()
+          this.cdpInputInFlight = false
+          this.drainCDPInputOutbox()
+          return
+        }
+        // 5xx — server hiccup, retry with backoff.
+        this.retryCDPInput(head)
+      }).catch((err) => {
+        window.clearTimeout(timeoutId)
+        // Network error / timeout / abort — retry with backoff.
+        console.warn('[CDP] /cdp/input attempt', head.attempts + 1, 'failed:', err?.message || err)
+        this.retryCDPInput(head)
+      })
+    }
+
+    private retryCDPInput(head: { seq: number; attempts: number }) {
+      head.attempts++
+      if (head.attempts >= this.CDP_MAX_ATTEMPTS) {
+        console.warn('[CDP] /cdp/input giving up seq', head.seq, 'after', head.attempts, 'attempts')
+        this.cdpInputOutbox.shift()
+        this.cdpInputInFlight = false
+        this.drainCDPInputOutbox()
+        return
+      }
+      // Exponential backoff: 250ms, 500ms, 1s, 2s, capped at 4s.
+      const delay = Math.min(250 * (1 << (head.attempts - 1)), 4000)
+      this.cdpInputInFlight = false
+      window.setTimeout(() => this.drainCDPInputOutbox(), delay)
+    }
+
+    // Insert plain text via the server-side persistent CDP session. Full
+    // Unicode passthrough; batches multiple chars into one request when the
+    // IME hands us a chunk (autocorrect replacement, voice input, swipe-type).
     private sendCDPText(text: string) {
       if (!text) return
-      this.sendCDPCommand('Input.insertText', { text })
+      this.postCDPInput({ text })
     }
 
-    // Dispatch a synthetic key event (Backspace/Enter/Tab/etc). Three-event
-    // sequence (keyDown + char + keyUp) matches what a real keyboard produces,
-    // so chromium handlers that listen for any phase still fire.
-    private sendCDPSpecialKey(name: 'Backspace' | 'Enter' | 'Tab') {
-      const map: Record<string, { key: string; code: string; keyCode: number; text: string }> = {
-        Enter:     { key: 'Enter',     code: 'Enter',     keyCode: 13, text: '\r' },
-        Backspace: { key: 'Backspace', code: 'Backspace', keyCode: 8,  text: '\b' },
-        Tab:       { key: 'Tab',       code: 'Tab',       keyCode: 9,  text: '\t' },
-      }
-      const m = map[name]
-      if (!m) return
-      this.sendCDPCommand('Input.dispatchKeyEvent', {
-        type: 'keyDown', key: m.key, code: m.code,
-        windowsVirtualKeyCode: m.keyCode, nativeVirtualKeyCode: m.keyCode, text: m.text,
-      })
-      this.sendCDPCommand('Input.dispatchKeyEvent', {
-        type: 'char', key: m.key, code: m.code,
-        windowsVirtualKeyCode: m.keyCode, nativeVirtualKeyCode: m.keyCode, text: m.text,
-      })
-      this.sendCDPCommand('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: m.key, code: m.code,
-        windowsVirtualKeyCode: m.keyCode, nativeVirtualKeyCode: m.keyCode,
-      })
+    // Dispatch one or more synthetic special keys. `count` lets the IME
+    // backspace-loop logic flush N deletes in a single request instead of N
+    // round-trips.
+    private sendCDPSpecialKey(name: 'Backspace' | 'Enter' | 'Tab', count: number = 1) {
+      if (count <= 0) return
+      this.postCDPInput({ key: name, count })
     }
 
-    // Async version of checkElementHasFocusSync. Used by the Android
-    // auto-focus poller — async because polling doesn't need to stay in
-    // the iOS gesture chain. Returns null on transport error.
-    async checkElementHasFocus(): Promise<{
-      isInput: boolean
-      tag: string
-      type?: string
-      isEditable?: boolean
-      readonly?: boolean
-      disabled?: boolean
-      focusKey?: string
-      elementTop?: number
-      elementHeight?: number
-      selectInfo?: {
-        multiple: boolean
-        rect: { x: number; y: number; width: number; height: number }
-        options: Array<{ value: string; text: string; selected: boolean; disabled: boolean; groupLabel?: string }>
+    // Active-element fetch state: deduplicates concurrent callers and caches
+    // the last-good result for a short TTL. Each tap fires three logical
+    // callers (touchstart prefetch, touchend post-tap check, select bridge);
+    // on a 3 s RTT link three independent fetches all race, the wrong one
+    // wins, and the keyboard pops on non-input taps. Sharing one in-flight
+    // promise and reusing its result for ~750 ms collapses those three into
+    // a single round-trip per tap.
+    private cdpFocusCache: ActiveElementInfo | null = null
+    private cdpFocusCacheAt = 0
+    private cdpFocusInFlight: Promise<ActiveElementInfo | null> | null = null
+    // When the WS is connected, focus snapshots stream in every ~200 ms, so
+    // any cached value is at most a tick stale. Long TTL lets tap handlers
+    // skip the HTTP fetch entirely. If the WS is down, the next /cdp/active-
+    // element call goes out and refreshes naturally on the slow path.
+    private readonly CDP_FOCUS_TTL_MS = 5000
+
+    async checkElementHasFocus(): Promise<ActiveElementInfo | null> {
+      // 1) Recent cached result — return synchronously.
+      if (this.cdpFocusCache && Date.now() - this.cdpFocusCacheAt < this.CDP_FOCUS_TTL_MS) {
+        return this.cdpFocusCache
       }
-    } | null> {
-      try {
-        const res = await fetch(this.getActiveElementUrl())
-        if (!res.ok) return null
-        const data = await res.json()
-        return {
-          isInput: !!data.isInput,
-          tag: data.tag || 'unknown',
-          type: data.type,
-          isEditable: data.isEditable,
-          readonly: !!data.readonly,
-          disabled: !!data.disabled,
-          focusKey: data.focusKey,
-          elementTop: data.elementTop,
-          elementHeight: data.elementHeight,
-          selectInfo: data.selectInfo,
+      // 2) In-flight fetch — every concurrent caller awaits the same promise.
+      if (this.cdpFocusInFlight) {
+        return this.cdpFocusInFlight
+      }
+      // 3) Fire a fresh one.
+      this.cdpFocusInFlight = (async () => {
+        try {
+          const res = await fetch(this.getActiveElementUrl())
+          if (!res.ok) return null
+          const data = await res.json()
+          const info: ActiveElementInfo = {
+            isInput: !!data.isInput,
+            tag: data.tag || 'unknown',
+            type: data.type,
+            isEditable: data.isEditable,
+            readonly: !!data.readonly,
+            disabled: !!data.disabled,
+            focusKey: data.focusKey,
+            elementTop: data.elementTop,
+            elementHeight: data.elementHeight,
+            elementLeft: data.elementLeft,
+            elementWidth: data.elementWidth,
+            selectInfo: data.selectInfo,
+          }
+          this.cdpFocusCache = info
+          this.cdpFocusCacheAt = Date.now()
+          return info
+        } catch {
+          return null
+        } finally {
+          this.cdpFocusInFlight = null
         }
-      } catch {
-        return null
-      }
+      })()
+      return this.cdpFocusInFlight
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1239,7 +1740,7 @@
       if (sessionId && token) {
         return `${window.location.origin}/api/${sessionId}/${token}/cdp/set-select-value`
       }
-      return `http://${window.location.hostname}:9222/cdp/set-select-value`
+      return this.resolveCDPUrl('set-select-value')
     }
 
     async applySelectValue(values: string[]) {
@@ -1259,65 +1760,25 @@
       }
     }
 
-    // Android auto-focus poller (ported from keyboard.ts/useMobileKeyboard.ts:
-    // 249-319). Every 800 ms while the keyboard is closed, peek at the remote
-    // active element. If it's a focusable text input the user didn't just
-    // dismiss, pop the keyboard automatically — matches the UX of typing on
-    // the remote site directly. iOS is excluded because Safari only honors
-    // .focus() inside user gestures, not setInterval ticks.
-    startAndroidAutoFocusPoller() {
-      if (this.autoFocusPoll !== null) return
-      if (!this.isAndroid || !this.is_touch_device) return
-
-      let consecutiveErrors = 0
-      const tick = async () => {
-        if (this.keyboardActive) return
-        if (this.keyboardOpening) return
-        if (this.keyboardJustDismissed) return
-        if (document.hidden) return
-
-        const info = await this.checkElementHasFocus()
-        if (info === null) {
-          if (++consecutiveErrors >= 5) {
-            console.warn('[auto-focus poller] too many errors, stopping')
-            this.stopAndroidAutoFocusPoller()
-          }
-          return
-        }
-        consecutiveErrors = 0
-        if (!info.isInput) {
-          // Focus moved off any input — clear the suppression so a future
-          // return to a previously-dismissed element re-triggers.
-          this.suppressedFocusKey = null
-          return
-        }
-        if (info.readonly || info.disabled) return
-        // Skip if user explicitly dismissed the keyboard on this exact element.
-        if (info.focusKey && this.suppressedFocusKey === info.focusKey) return
-        this.suppressedFocusKey = null
-        this.focusProxyInputForIOS()
-      }
-
-      this.autoFocusPoll = window.setInterval(tick, 800)
-      // Fire once immediately so an existing autofocus is caught without
-      // waiting a full interval.
-      tick()
-    }
-
-    stopAndroidAutoFocusPoller() {
-      if (this.autoFocusPoll !== null) {
-        window.clearInterval(this.autoFocusPoll)
-        this.autoFocusPoll = null
-      }
-    }
-
     /**
      * Synchronous check using XMLHttpRequest.
      * Blocks the main thread until the response arrives, which is acceptable
      * here because: (a) it's hitting localhost (~1-5ms), and (b) we MUST know
      * the result before deciding to focus (Safari keyboard limitation).
      */
-    checkElementHasFocusSync(): { isInput: boolean, tag: string, rawOuterHTML?: string, type?: string, isEditable?: boolean } {
+    checkElementHasFocusSync(): {
+      isInput: boolean
+      tag: string
+      rawOuterHTML?: string
+      type?: string
+      isEditable?: boolean
+      readonly?: boolean
+      disabled?: boolean
+      elementTop?: number
+      elementHeight?: number
+      elementLeft?: number
+      elementWidth?: number
+    } {
       const url = this.getActiveElementUrl();
       try {
         const xhr = new XMLHttpRequest();
@@ -1332,6 +1793,12 @@
             type: data.type,
             isEditable: data.isEditable,
             rawOuterHTML: data.rawOuterHTML,
+            readonly: !!data.readonly,
+            disabled: !!data.disabled,
+            elementTop: data.elementTop,
+            elementHeight: data.elementHeight,
+            elementLeft: data.elementLeft,
+            elementWidth: data.elementWidth,
           };
         }
         console.error('[CDP] active-element sync non-200:', xhr.status);
@@ -1441,16 +1908,21 @@
     }
 
     sendMousePos(e: MouseEvent) {
-      // In magnify mode the iframe only shows the top-left magnifyW x magnifyH
-      // region of the framebuffer; tap coords must map onto that region, not
-      // onto the full 1920x1080 framebuffer.
-      const w = this.mobileMagnified && this.magnifyW > 0
-        ? this.magnifyW
-        : this.$accessor.video.resolution.w
-      const h = this.mobileMagnified && this.magnifyH > 0
-        ? this.magnifyH
-        : this.$accessor.video.resolution.h
       const rect = this._overlay.getBoundingClientRect()
+      // In CSS-crop mode (mobileViewportActive), object-fit:none +
+      // object-position:0 0 maps one client pixel to one framebuffer
+      // pixel to one remote-viewport pixel — strict 1:1, NO scaling.
+      // In non-crop mode the video is scaled to fit the overlay, so we
+      // map client px → remote-viewport px via the server-pushed layout
+      // viewport (or the stream resolution as fallback).
+      const vw = this.cdpFocusCache?.viewportWidth
+      const vh = this.cdpFocusCache?.viewportHeight
+      const w = this.mobileViewportActive
+        ? rect.width
+        : (vw && vw > 0 ? vw : this.$accessor.video.resolution.w)
+      const h = this.mobileViewportActive
+        ? rect.height
+        : (vh && vh > 0 ? vh : this.$accessor.video.resolution.h)
 
       this.$client.sendData('mousemove', {
         x: Math.round((w / rect.width) * (e.clientX - rect.left)),
@@ -1494,6 +1966,7 @@
       if (!this.wheelThrottle) {
         this.wheelThrottle = true
         this.$client.sendData('wheel', { x, y })
+        this.lastScrollAt = Date.now()
 
         window.setTimeout(() => {
           this.wheelThrottle = false
@@ -1525,6 +1998,25 @@
           this.touchLastX = touch.clientX
           this.touchLastY = touch.clientY
           this.touchLastWheelEmit = 0
+
+          // Mobile-viewport mode: dispatch a real touchstart over the
+          // data channel. Chromium gets a native TouchEvent, which is
+          // what mobile-only captchas (Cloudflare Turnstile press-and-
+          // hold, hCaptcha, reCAPTCHA "slide to verify") look for, and
+          // what triggers native momentum scrolling.
+          if (this.mobileViewportActive) {
+            this.sendTouchFromTouch(touch, 'touchstart')
+          }
+
+          // iOS: kick off the focus-state fetch now so it's in flight while
+          // the user is still completing the tap. Skipped on Android — the
+          // Android branch already runs async 150 ms after touchend.
+          if (this.isIOS && this.is_touch_device && !this.keyboardJustDismissed) {
+            this.touchstartFocusResult = undefined
+            this.checkElementHasFocus()
+              .then((info) => { this.touchstartFocusResult = info })
+              .catch(() => { this.touchstartFocusResult = null })
+          }
 
           this.cancelLongPress()
           this.longPressTimer = window.setTimeout(() => {
@@ -1558,8 +2050,18 @@
           if (now - this.touchLastWheelEmit < 60) return
           this.touchLastWheelEmit = now
 
-          // Native feel: swiping the finger UP scrolls content UP (= positive
-          // wheel deltaY). The remote interprets +y as scroll-down lines.
+          // Mobile-viewport mode: also emit a real touchmove on top of
+          // the wheel — pages that listen specifically for touchmove
+          // (captcha swipes, drag-handles) get the right event. Wheel
+          // stays so the existing scroll-via-wheel path keeps working
+          // on neko builds without the touch opcodes wired in.
+          if (this.mobileViewportActive) {
+            this.sendTouchFromTouch(touch, 'touchmove')
+          }
+
+          // Wheel path: native feel: swiping UP scrolls content UP
+          // (positive wheel deltaY). The remote interprets +y as
+          // scroll-down lines.
           let wheelX = -Math.round(moveDx / 6)
           let wheelY = -Math.round(moveDy / 6)
           wheelX = Math.min(Math.max(wheelX, -this.scroll), this.scroll)
@@ -1568,6 +2070,7 @@
           if (wheelX || wheelY) {
             this.sendMousePosFromTouch(touch)
             this.$client.sendData('wheel', { x: wheelX, y: wheelY })
+            this.lastScrollAt = Date.now()
           }
           break
         }
@@ -1579,28 +2082,55 @@
           const duration = Date.now() - this.touchStartTime
           this.touchMode = 'idle'
 
+          // Always send a touchend if we sent a touchstart on this gesture
+          // (mobile mode). Even for cancels — chromium expects touch
+          // events to balance, else its internal touch-tracking leaks.
+          if (this.mobileViewportActive) {
+            this.sendTouchFromTouch(touch, 'touchend')
+          }
+
           if (e.type === 'touchcancel') return
 
           if (mode === 'pending' && duration < 300) {
-            // Tap: synthesize click at touch coords, then run the existing
-            // soft-keyboard focus check (synchronous XHR → CDP active element).
+            // Tap: always synthesize the mouse click — this is what
+            // makes taps work on neko builds that don't yet handle the
+            // new touch opcodes. The touchstart/touchend pair we sent
+            // earlier (if mobileViewportActive) is purely additive so
+            // captcha-style pages can see real TouchEvents.
             this.sendMousePosFromTouch(touch)
             this.$client.sendData('mousedown', { key: 1 })
             this.$client.sendData('mouseup', { key: 1 })
 
             if (this.is_touch_device && !this.keyboardJustDismissed) {
-              const elementResult = this.checkElementHasFocusSync()
-              if (elementResult.isInput) {
-                // Synchronous focus inside touch gesture so iOS pops the
-                // keyboard. Goes through the iOS temp-input bridge when
-                // standalone, direct focus otherwise.
-                this.focusProxyInputForIOS()
-              } else if (this.keyboardActive) {
-                // Tapped a non-input while keyboard is up → dismiss.
-                this.allowBlur = true
-                if (this._proxyInput) this._proxyInput.blur()
-                window.setTimeout(() => { this.allowBlur = false }, 100)
+              const remote = this.touchToRemoteCoords(touch)
+              // Synchronous tap-time decision using the input-rects cache.
+              // O(N) local lookup, no network round-trip — identical
+              // behavior at 50 ms or 5 s RTT.
+              const hit = this.hitTestInputRect(remote.x, remote.y)
+              if (hit === 'hit') {
+                if (!this.keyboardActive) {
+                  this.focusProxyInputForIOS()
+                } else if (this.isAndroid && this._proxyInput) {
+                  // Already up — clear the proxy's buffered text so the next
+                  // keystroke doesn't merge with the previous field's word,
+                  // then re-focus to nudge Samsung Keyboard if it minimized.
+                  this._proxyInput.value = ''
+                  this._proxyInput.blur()
+                  this._proxyInput.focus()
+                }
+              } else if (hit === 'miss' && this.keyboardActive) {
+                this.dismissKeyboard('tap-miss')
               }
+              // hit === 'unknown' (cache cold): leave keyboard state alone.
+              // The user can use the toolbar keyboard icon, and any focus
+              // event the remote eventually pushes via WS will pop or
+              // dismiss correctly via onFocusSnapshotUpdated.
+
+              // Mark this tap for the post-tap stuck-state poller / select
+              // bridge. Record the pre-tap focusKey so the focus-event
+              // watcher can detect re-taps on the same input.
+              this.pendingTapAt = Date.now()
+              this.pendingTapPreFocusKey = this.cdpFocusCache?.focusKey || null
               // If the tap landed on a <select>, surface it to the embedding
               // portal so it can render its own dropdown. Delayed a tick to
               // give chromium time to set document.activeElement to the select.
@@ -1625,13 +2155,151 @@
     }
 
     private sendMousePosFromTouch(t: Touch) {
-      const w = this.effectiveW
-      const h = this.effectiveH
+      const { x, y } = this.touchToRemoteCoords(t)
+      this.$client.sendData('mousemove', { x, y })
+    }
+
+    // Mirror the focused remote input's IME-shaping attributes onto our
+    // proxy. Called from focusProxyInputForIOS (when popping the kbd)
+    // and from onFocusSnapshotUpdated (when focus transitions on the
+    // remote while the kbd is already up). Falls back to plain text +
+    // off-autocomplete when the remote isn't on an input.
+    private applyProxyImeHints() {
+      const proxy = this._proxyInput
+      if (!proxy) return
+      const info = this.cdpFocusCache
+      const tag = (info?.tag || '').toLowerCase()
+      const remoteInputType = (info?.inputType || '').toLowerCase()
+      const remoteInputMode = (info?.inputMode || '').toLowerCase()
+      const remoteAC = info?.autoComplete || ''
+      const remoteEKH = (info?.enterKeyHint || '').toLowerCase()
+
+      // type: prefer remote's type for <input>. textarea / contenteditable
+      // stay 'text' (HTML <input> doesn't support type=textarea).
+      let proxyType = 'text'
+      if (tag === 'input' && remoteInputType) {
+        // Only forward types the IME treats specially. Filter unsafe ones
+        // (file/submit/checkbox/etc.) — those would change <input>
+        // behavior in ways unrelated to the kbd layout.
+        const allowed = new Set(['text', 'email', 'tel', 'url', 'password', 'search', 'number'])
+        if (allowed.has(remoteInputType)) proxyType = remoteInputType
+      }
+      try { proxy.type = proxyType } catch { /* noop */ }
+
+      // inputmode: overrides type for kbd layout when set.
+      if (remoteInputMode) {
+        try { proxy.setAttribute('inputmode', remoteInputMode) } catch { /* noop */ }
+      } else {
+        try { proxy.removeAttribute('inputmode') } catch { /* noop */ }
+      }
+
+      // autocomplete: 'one-time-code' triggers iOS / Gboard SMS-code
+      // autofill suggestion bar. Forward all autocomplete tokens —
+      // platforms know which ones they understand.
+      if (remoteAC) {
+        try { proxy.setAttribute('autocomplete', remoteAC) } catch { /* noop */ }
+      } else {
+        try { proxy.setAttribute('autocomplete', 'off') } catch { /* noop */ }
+      }
+
+      // enterkeyhint: labels the Enter key (send / search / go / done /
+      // next / previous). Helps the user know what Enter will do.
+      if (remoteEKH) {
+        try { proxy.setAttribute('enterkeyhint', remoteEKH) } catch { /* noop */ }
+      } else {
+        try { proxy.removeAttribute('enterkeyhint') } catch { /* noop */ }
+      }
+    }
+
+    // Dispatch a real touch event over the neko data channel. The fork's
+    // xf86-input-neko driver already registers as XI_TOUCHSCREEN with up
+    // to 10 slots; on the server side this opcode forwards to that
+    // driver's touch slot API and chromium sees a native TouchEvent.
+    // Used in mobile-viewport mode for taps, scrolls, and captcha
+    // gestures — pages that listen for touchstart/move/end (almost every
+    // modern mobile site) get the real thing instead of synthesized
+    // mouse events. Slot id is fixed to 0 for single-finger; multi-touch
+    // (pinch zoom etc.) would extend this to track per-touch ids.
+    private sendTouchFromTouch(t: Touch, event: 'touchstart' | 'touchmove' | 'touchend') {
+      const { x, y } = this.touchToRemoteCoords(t)
+      this.$client.sendData(event, { id: 0, x, y })
+    }
+
+    // Map a Touch event to the equivalent coordinate inside the remote
+    // page's layout viewport. Two regimes:
+    //   - CSS-crop mode (mobileViewportActive): object-fit:none + object-
+    //     position:0 0 paints one client pixel per framebuffer pixel per
+    //     remote-viewport pixel. 1:1 mapping, NO scaling.
+    //   - Scaled mode (full-page video): map via the server-pushed remote
+    //     viewport (or fall back to the stream resolution).
+    private touchToRemoteCoords(t: Touch): { x: number; y: number } {
       const rect = this._overlay.getBoundingClientRect()
-      this.$client.sendData('mousemove', {
+      const vw = this.cdpFocusCache?.viewportWidth
+      const vh = this.cdpFocusCache?.viewportHeight
+      const w = this.mobileViewportActive
+        ? rect.width
+        : (vw && vw > 0 ? vw : this.width)
+      const h = this.mobileViewportActive
+        ? rect.height
+        : (vh && vh > 0 ? vh : this.height)
+      return {
         x: Math.round((w / rect.width) * (t.clientX - rect.left)),
         y: Math.round((h / rect.height) * (t.clientY - rect.top)),
-      })
+      }
+    }
+
+    // Tier-1 sync hit-test. Returns 'hit' / 'miss' / 'unknown'. 'unknown'
+    // means the cache hasn't received its first push yet (page just loaded,
+    // WS not connected, or 3 s RTT before the first push arrives). Caller
+    // treats 'unknown' as "leave keyboard state alone" — neither pop nor
+    // dismiss — so we never misfire on a cold cache.
+    // Most recent hit-test verdict, used by the debug overlay to surface
+    // what the system decided.
+    private lastHitResult: 'hit' | 'miss' | 'unknown' = 'unknown'
+
+    private hitTestInputRect(x: number, y: number): 'hit' | 'miss' | 'unknown' {
+      const result = this._hitTestInputRect(x, y)
+      this.lastHitResult = result
+      if (this.debugRects) {
+        console.log('[hit-test]', { x, y, result, rects: this.inputRectsCache.length, ready: this.inputRectsReady, scrollAgo: Date.now() - this.lastScrollAt })
+      }
+      return result
+    }
+
+    private _hitTestInputRect(x: number, y: number): 'hit' | 'miss' | 'unknown' {
+      if (!this.inputRectsReady) return 'unknown'
+      // Recent scroll invalidates the cache (rects haven't refreshed yet
+      // for the new scroll offset). Defer the tap decision rather than
+      // false-positive into a dismiss while the user is mid-flick.
+      if (this.lastScrollAt && Date.now() - this.lastScrollAt < this.SCROLL_CACHE_INVALID_MS) {
+        return 'unknown'
+      }
+      const SLOP = 4 // px, accommodates antialiased edges + emulator rounding
+      const rects = this.inputRectsCache
+      for (let i = 0; i < rects.length; i++) {
+        const r = rects[i]
+        if (x >= r.x - SLOP && x <= r.x + r.width + SLOP &&
+            y >= r.y - SLOP && y <= r.y + r.height + SLOP) {
+          return 'hit'
+        }
+      }
+      return 'miss'
+    }
+
+    // True iff the tap landed inside the focused element's bounding rect.
+    // Used to gate keyboard popup: activeElement may still report the
+    // previously-focused input after the user tapped a non-input area (clicks
+    // on non-focusable regions don't blur), so just checking isInput would
+    // wrongly re-pop the keyboard.
+    private tapHitFocusedElement(
+      info: { elementLeft?: number; elementTop?: number; elementWidth?: number; elementHeight?: number },
+      remoteX: number,
+      remoteY: number,
+    ): boolean {
+      const l = info.elementLeft, t = info.elementTop
+      const w = info.elementWidth, h = info.elementHeight
+      if (l === undefined || t === undefined || !w || !h) return false
+      return remoteX >= l && remoteX <= l + w && remoteY >= t && remoteY <= t + h
     }
 
     // iOS Safari autocomplete, Android Gboard swipe-typing, and CJK IMEs deliver
@@ -1746,7 +2414,7 @@
         // then re-type any divergent remainder (autocorrect mid-word delete).
         if (currentValue.length < this.lastSentValue.length) {
           const deletedCount = this.lastSentValue.length - currentValue.length
-          for (let i = 0; i < deletedCount; i++) this.sendCDPSpecialKey('Backspace')
+          this.sendCDPSpecialKey('Backspace', deletedCount)
           if (currentValue && !this.lastSentValue.startsWith(currentValue)) {
             this.sendCDPText(currentValue)
           }
@@ -1770,7 +2438,7 @@
               }
             } else {
               // Autocorrect mid-word: delete old, retype new.
-              for (let i = 0; i < this.lastSentValue.length; i++) this.sendCDPSpecialKey('Backspace')
+              this.sendCDPSpecialKey('Backspace', this.lastSentValue.length)
               const filtered = this.filterAutoSpace(currentValue)
               if (filtered) this.sendCDPText(filtered)
               if (filtered !== currentValue) {
@@ -1781,7 +2449,7 @@
             }
           } else if (currentValue !== this.lastSentValue && currentValue.length > 0) {
             // Same length, different content (whole-word autocorrect).
-            for (let i = 0; i < this.lastSentValue.length; i++) this.sendCDPSpecialKey('Backspace')
+            this.sendCDPSpecialKey('Backspace', this.lastSentValue.length)
             const filtered = this.filterAutoSpace(currentValue)
             if (filtered) this.sendCDPText(filtered)
             if (filtered !== currentValue) {
@@ -1853,11 +2521,15 @@
     }
 
     onProxyBlur() {
-      // If the user dismissed the keyboard via the system back button (not
-      // via our toggleMobileKeyboard which sets allowBlur=true first), record
-      // a 100ms grace window so a touchend that immediately follows doesn't
-      // re-pop the keyboard.
+      // When the user dismissed the keyboard via the system back button or
+      // Gboard's swipe-down gesture (not via our own blur flow which sets
+      // allowBlur=true first), the proxy blurs without our state knowing.
+      // Flip keyboardActive=false here so subsequent tap decisions don't
+      // think the kbd is still up — and record a 100ms grace window so a
+      // touchend that immediately follows doesn't re-pop the kbd.
       if (this.keyboardActive && !this.allowBlur && !document.hidden) {
+        this.keyboardActive = false
+        this.stopStuckStatePoller()
         this.keyboardJustDismissed = true
         window.setTimeout(() => { this.keyboardJustDismissed = false }, 100)
       }
@@ -1886,6 +2558,33 @@
     focusProxyInputForIOS() {
       const proxy = this._proxyInput
       if (!proxy) return
+
+      // Clear any leftover dismiss-time attributes (the Android dismiss
+      // hammer briefly sets inputmode=none to force Gboard to hide; if
+      // the user re-taps inside that 50 ms window we'd attach the proxy
+      // with the kbd-suppress attribute still on).
+      try { proxy.removeAttribute('inputmode') } catch { /* noop */ }
+      try { proxy.removeAttribute('readonly') } catch { /* noop */ }
+
+      // Shape the proxy to match the focused remote input. Platform IMEs
+      // pick a layout from type / inputmode / autocomplete:
+      //   type=email      → '@' key + .com shortcuts
+      //   type=tel        → dial-pad
+      //   type=number     → numeric keyboard
+      //   inputmode=decimal → decimal pad (Stripe / numeric forms)
+      //   autocomplete=one-time-code → SMS code autofill on iOS / Gboard
+      //   enterkeyhint=send|go|search → action-labeled Enter key
+      this.applyProxyImeHints()
+
+      // Mark the keyboard as active synchronously. visualViewport.resize
+      // is the *backup* signal — some Android browsers (Brave, some
+      // Samsung firmwares) don't fire it reliably when the IME slides
+      // up, leaving keyboardActive=false despite a visible kbd. Setting
+      // it here is the canonical "we just opened it" marker.
+      if (!this.keyboardActive) {
+        this.keyboardActive = true
+        this.startStuckStatePoller()
+      }
 
       // If embedded in a parent iframe, claim iframe focus inside the gesture
       // so subsequent physical keystrokes route to this window. Async refocus
@@ -1953,12 +2652,19 @@
       if (!window.visualViewport) return
       const viewportHeight = window.visualViewport.height
       const windowHeight = window.innerHeight
-      if (this.keyboardOpening) return
 
       const shrunk = (windowHeight - viewportHeight) > 50
       if (shrunk) {
+        // ALWAYS update keyboardActive on shrink — even mid-opening. The
+        // previous "if (keyboardOpening) return" at the top of this handler
+        // blocked the resize events that fire while the kbd is animating
+        // up, so keyboardActive stayed false even after the kbd was fully
+        // visible. Now we only guard the *dismiss* branch with
+        // keyboardOpening (further down).
         this.lastViewportShrink = true
+        const wasActive = this.keyboardActive
         this.keyboardActive = true
+        if (!wasActive) this.startStuckStatePoller()
         // Notify any embedding portal so it can mirror our keyboard state.
         try {
           window.parent.postMessage({
@@ -1973,6 +2679,12 @@
       if (!this.lastViewportShrink) return
       this.lastViewportShrink = false
 
+      // Don't fire dismiss during the kbd-open animation — iOS Safari
+      // briefly reports "viewport restored" mid-open before the kbd lands.
+      // Only the dismiss branch gets this guard; the activation branch
+      // above ran unconditionally so we caught the actual shrink.
+      if (this.keyboardOpening) return
+
       // iOS sometimes fires a transient resize during the keyboard show
       // animation that looks like "viewport restored" — guard via active
       // element identity. If our proxy is still focused, the keyboard
@@ -1980,19 +2692,12 @@
       const proxyStillFocused = document.activeElement === this._proxyInput
       if (Math.abs(viewportHeight - windowHeight) < 50 && this.keyboardActive && !proxyStillFocused) {
         this.keyboardActive = false
+        this.stopStuckStatePoller()
         this.iframeOffset = 0
         window.scrollTo(0, 0)
         this.keyboardJustDismissed = true
         window.setTimeout(() => { this.keyboardJustDismissed = false }, 100)
         if (this._proxyInput) this._proxyInput.blur()
-        // Record which remote element the user was on so the auto-focus
-        // poller (Android only) doesn't re-pop the keyboard on the same
-        // field. iOS doesn't run the poller, so skip the CDP roundtrip there.
-        if (this.isAndroid) {
-          this.checkElementHasFocus().then(info => {
-            if (info?.focusKey) this.suppressedFocusKey = info.focusKey
-          }).catch(() => { /* best-effort */ })
-        }
         try {
           window.parent.postMessage({
             type: 'POPCORN_VIEWPORT',
@@ -2077,24 +2782,11 @@
       this._player.style.width = `${offsetWidth}px`
       this._player.style.height = `${offsetHeight}px`
 
-      // In magnify mode, target the *emulated* viewport's aspect ratio (e.g.
-      // 9:19.5 phone) so the visible region of the framebuffer fills the
-      // container with no letterbox. Otherwise stick to the framebuffer's
-      // native aspect (16:9 desktop).
-      const aspectW = this.mobileMagnified && this.magnifyW > 0 ? this.magnifyW : this.horizontal
-      const aspectH = this.mobileMagnified && this.magnifyH > 0 ? this.magnifyH : this.vertical
-
-      const aspectPreservingMaxWidth = (aspectW / aspectH) * offsetHeight
-      const ceiling = this.mobileMagnified && this.magnifyW > 0 ? offsetWidth : this.width
+      const aspectPreservingMaxWidth = (this.horizontal / this.vertical) * offsetHeight
       this._container.style.maxWidth = `${
-        !this.fullscreen ? Math.min(ceiling, aspectPreservingMaxWidth) : aspectPreservingMaxWidth
+        !this.fullscreen ? Math.min(this.width, aspectPreservingMaxWidth) : aspectPreservingMaxWidth
       }px`
-      this._aspect.style.paddingBottom = `${(aspectH / aspectW) * 100}%`
-
-      // Publish the resolved container dims for overlayInfo / magnifyStyle.
-      // Read after the aspect/maxWidth assignments so we see the final layout.
-      this.containerW = this._container.offsetWidth
-      this.containerH = this._container.offsetHeight
+      this._aspect.style.paddingBottom = `${(this.vertical / this.horizontal) * 100}%`
     }
 
     @Watch('focused')

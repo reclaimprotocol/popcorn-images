@@ -154,6 +154,12 @@ func main() {
 	focusTracker := devtoolsproxy.NewFocusTracker(upstreamMgr, slogger)
 	defer focusTracker.Stop()
 
+	// Persistent CDP session for mobile-keyboard input. Keeps one upstream
+	// WebSocket attached so each /cdp/input request only pays the network
+	// RTT — no per-keystroke CDP attach handshake.
+	inputDispatcher := devtoolsproxy.NewInputDispatcher(upstreamMgr, slogger)
+	defer inputDispatcher.Stop()
+
 	// Expose active-element cache on the primary API router so the gateway
 	// can route to it via the standard `/api/...` path.
 	// CORS is needed so the neko client (port 8080) can sync-XHR to this endpoint.
@@ -198,6 +204,26 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// Mobile/IME text and special-key input. Routed through the gateway-
+	// reachable API so deployments without direct :9222 exposure still get
+	// working soft-keyboard typing.
+	r.Post("/cdp/input", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.InputHandler(inputDispatcher).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/input", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+	// Persistent WebSocket version of /cdp/input. Same payload shape on
+	// each frame; the client uses this on high-RTT links to avoid paying
+	// per-request TCP/TLS setup on every keystroke.
+	r.Get("/cdp/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker).ServeHTTP)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
@@ -253,6 +279,8 @@ func main() {
 		r.Get("/active-element", devtoolsproxy.ActiveElementHandler(focusTracker).ServeHTTP)
 		r.Post("/emulate-device", devtoolsproxy.EmulateDeviceHandler(upstreamMgr, slogger).ServeHTTP)
 		r.Post("/set-select-value", devtoolsproxy.SetSelectValueHandler(upstreamMgr, slogger).ServeHTTP)
+		r.Post("/input", devtoolsproxy.InputHandler(inputDispatcher).ServeHTTP)
+		r.Get("/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker).ServeHTTP)
 	})
 
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {

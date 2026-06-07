@@ -20,7 +20,25 @@ if [[ -z "$UBUNTU_SNAPSHOT" ]]; then
     exit 1
 fi
 
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --pretty=%ct)}"
+# FAST_BUILD=1 pins SOURCE_DATE_EPOCH to a constant so the timestamp-derived
+# layers stop invalidating on every commit. Combine with BUILD_CACHE_DIR for
+# layer reuse across runs — the two together turn a clean rebuild into a
+# cache-hit walk for everything that hasn't actually changed.
+if [[ "$FAST_BUILD" == "1" ]]; then
+    SOURCE_DATE_EPOCH=0
+    echo "FAST_BUILD=1: SOURCE_DATE_EPOCH=0 for layer reuse."
+else
+    SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --pretty=%ct)}"
+fi
+
+# Persist BuildKit's internal cache to disk when BUILD_CACHE_DIR is set.
+# Survives daemon restarts and cleans pulls of the dev image.
+CACHE_ARGS=()
+if [[ -n "$BUILD_CACHE_DIR" ]]; then
+    mkdir -p "$BUILD_CACHE_DIR"
+    CACHE_ARGS=(--cache-from "type=local,src=$BUILD_CACHE_DIR" --cache-to "type=local,dest=$BUILD_CACHE_DIR,mode=max")
+    echo "Using local build cache: $BUILD_CACHE_DIR"
+fi
 
 # Build (or reuse) the artifact-mirror image. This produces a scratch image
 # containing /artifacts/{debs,archives,bin}, which the main Dockerfile mounts
@@ -42,6 +60,7 @@ SKIP_CHROMIUM="${SKIP_CHROMIUM:-1}"
     --platform "$TARGET_PLATFORM" \
     --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
     --build-arg "SKIP_CHROMIUM=$SKIP_CHROMIUM" \
+    "${CACHE_ARGS[@]}" \
     -f images/chromium-headful/artifact-mirror.Dockerfile \
     -t "$ARTIFACT_MIRROR_IMAGE" \
     --load \
@@ -52,6 +71,7 @@ SKIP_CHROMIUM="${SKIP_CHROMIUM:-1}"
     --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
     --build-arg "UBUNTU_SNAPSHOT=$UBUNTU_SNAPSHOT" \
     --build-arg "ARTIFACT_MIRROR_IMAGE=$ARTIFACT_MIRROR_IMAGE" \
+    "${CACHE_ARGS[@]}" \
     -f images/chromium-headful/Dockerfile \
     -t "$IMAGE" \
     --load \

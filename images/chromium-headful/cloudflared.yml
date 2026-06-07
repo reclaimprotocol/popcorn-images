@@ -1,0 +1,19 @@
+# Path-based ingress so neko (8080) and kernel-images-api (host:444 → container:10001)
+# both reach the public tunnel URL on a single HTTPS origin. Avoids mixed-content
+# blocks and lets the mobile keyboard / focus checks (/cdp/*) work end-to-end.
+#
+# Used by run-with-tunnel.sh; you do not need a named tunnel — this works with
+# the free `--url` quick-tunnel flow.
+#
+# If you switch to a named tunnel, add `tunnel: <id>` and
+# `credentials-file: ~/.cloudflared/<id>.json` above `ingress:`.
+
+ingress:
+  # /cdp/* — active-element check, input dispatcher.
+  - path: ^/cdp/.*
+    service: http://localhost:444
+  # /api/* — gateway-style routes used in production deployments.
+  - path: ^/api/.*
+    service: http://localhost:444
+  # Everything else → neko (UI + WebRTC signalling).
+  - service: http://localhost:8080
