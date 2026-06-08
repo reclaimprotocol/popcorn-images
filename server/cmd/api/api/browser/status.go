@@ -45,13 +45,6 @@ func (m *Manager) Status() *SessionStatus {
 	if sess.Config != nil && sess.Config.ProviderConfig != nil {
 		st.Proofs.Expected = len(sess.Config.ProviderConfig.RequestData)
 	}
-	for _, c := range claims {
-		if c.Error != "" {
-			st.Proofs.Failed++
-		} else {
-			st.Proofs.Succeeded++
-		}
-	}
 
 	indicator := "unknown"
 	if capture != nil {
@@ -59,10 +52,11 @@ func (m *Manager) Status() *SessionStatus {
 		if li := capture.LoginIndicator(); li != "" {
 			indicator = li
 		}
-		inProgress := capture.ProvenCount() - (st.Proofs.Succeeded + st.Proofs.Failed)
-		if inProgress > 0 {
-			st.Proofs.InProgress = inProgress
-		}
+		// Succeeded = distinct matchers proved; InProgress = attempts running.
+		// Failed stays 0: a failed attempt is retried on a later matching
+		// request, not counted as a terminal session failure.
+		st.Proofs.Succeeded = capture.SucceededCount()
+		st.Proofs.InProgress = capture.InFlight()
 	}
 	st.Login.Indicator = indicator
 	st.Login.RequiresInteraction = indicator == "url" || indicator == "element"

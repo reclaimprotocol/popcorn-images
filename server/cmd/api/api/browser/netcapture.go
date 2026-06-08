@@ -2,7 +2,9 @@ package browser
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -45,7 +47,10 @@ type pendingRequest struct {
 	RespHeaders map[string]string
 	MimeType    string
 	FetchBody   bool
-	MatcherIdx  int // index into matchers, or -1 if not a proof candidate
+	// ProofCandidate is set when the URL+method match a matcher, so the body is
+	// fetched and re-evaluated (URL+method+body) once available. URL match alone
+	// never triggers a proof — the body gate decides.
+	ProofCandidate bool
 }
 
 // NetCapture maintains a dedicated CDP connection that subscribes to Network and
@@ -72,19 +77,21 @@ type NetCapture struct {
 	// no reporter is configured).
 	report reportFunc
 
-	// proven dedups proof attempts: each matcher is proved at most once per
-	// session (the same URL is often captured by more than one CDP request).
-	provenMu sync.Mutex
-	proven   map[int]bool
+	// proofMu guards proof dedup + outcome tracking. Dedup is per-REQUEST (a hash
+	// of method+url+cookie+body), NOT per-matcher: a failed attempt on one
+	// response (e.g. a logged-out page) must not block a later, different request
+	// (e.g. the same API after login) from proving the same matcher. A matcher is
+	// "done" only once it has a SUCCESSFUL proof; failures are never terminal.
+	proofMu       sync.Mutex
+	attemptedReq  map[string]bool // request hashes already attempted (identical request not retried)
+	provenMatcher map[int]bool    // matchers with a successful proof
+	inFlight      int             // proof attempts currently running (drives in_progress)
 
-	// statusMu guards the one-shot status latches + proof outcome counters used
-	// to drive LOGIN/PROOF_GENERATION_* reporting.
+	// statusMu guards the one-shot status latches used to drive
+	// LOGIN/USER_LOGGED_IN/PROOF_GENERATION_STARTED reporting.
 	statusMu           sync.Mutex
 	loginReported      bool
 	proofStartReported bool
-	failedReported     bool
-	succeeded          int
-	failed             int
 
 	// meta holds page-derived state surfaced via status: the latest
 	// window.Reclaim publicData payload, the login interaction indicator, and
@@ -118,11 +125,18 @@ func (nc *NetCapture) CurrentURL() string {
 	return nc.currentURL
 }
 
-// ProvenCount returns how many matchers have had a proof attempted.
-func (nc *NetCapture) ProvenCount() int {
-	nc.provenMu.Lock()
-	defer nc.provenMu.Unlock()
-	return len(nc.proven)
+// SucceededCount returns how many distinct matchers have a successful proof.
+func (nc *NetCapture) SucceededCount() int {
+	nc.proofMu.Lock()
+	defer nc.proofMu.Unlock()
+	return len(nc.provenMatcher)
+}
+
+// InFlight returns how many proof attempts are currently running.
+func (nc *NetCapture) InFlight() int {
+	nc.proofMu.Lock()
+	defer nc.proofMu.Unlock()
+	return nc.inFlight
 }
 
 // waitPublicData returns publicData, waiting up to timeout for it to appear when
@@ -149,19 +163,56 @@ func (nc *NetCapture) waitPublicData(ctx context.Context, timeout time.Duration)
 	}
 }
 
-// markProven returns true if this matcher index hadn't been proved yet (and
-// marks it). Subsequent calls for the same index return false.
-func (nc *NetCapture) markProven(idx int) bool {
-	nc.provenMu.Lock()
-	defer nc.provenMu.Unlock()
-	if nc.proven == nil {
-		nc.proven = map[int]bool{}
+// requestHash identifies a captured request for dedup. It folds in the cookie
+// header and post body so the same endpoint before and after login (different
+// cookies) hashes differently and is therefore allowed a fresh proof attempt.
+func requestHash(pr *pendingRequest) string {
+	cookie := headerLookup(pr.ReqHeaders, "cookie")
+	sum := sha256.Sum256([]byte(pr.Method + "\x00" + pr.URL + "\x00" + cookie + "\x00" + pr.PostData))
+	return hex.EncodeToString(sum[:])
+}
+
+// beginAttempt decides whether to run a proof for matcher idx on this request.
+// It returns false when the matcher already succeeded, or this exact request was
+// already attempted. On true it records the attempt and increments in-flight.
+func (nc *NetCapture) beginAttempt(idx int, reqHash string) bool {
+	nc.proofMu.Lock()
+	defer nc.proofMu.Unlock()
+	if nc.provenMatcher[idx] {
+		return false // matcher already proved successfully
 	}
-	if nc.proven[idx] {
-		return false
+	if nc.attemptedReq == nil {
+		nc.attemptedReq = map[string]bool{}
 	}
-	nc.proven[idx] = true
+	if nc.attemptedReq[reqHash] {
+		return false // identical request already attempted
+	}
+	nc.attemptedReq[reqHash] = true
+	nc.inFlight++
 	return true
+}
+
+// finishAttempt records a proof outcome. Success marks the matcher proved (and
+// reports PROOF_GENERATION_SUCCESS once every matcher has succeeded). Failure
+// leaves the matcher open so a later matching request can retry — failures are
+// never terminal for the session.
+func (nc *NetCapture) finishAttempt(idx int, success bool) {
+	nc.proofMu.Lock()
+	if nc.provenMatcher == nil {
+		nc.provenMatcher = map[int]bool{}
+	}
+	if success {
+		nc.provenMatcher[idx] = true
+	}
+	if nc.inFlight > 0 {
+		nc.inFlight--
+	}
+	done := len(nc.provenMatcher)
+	nc.proofMu.Unlock()
+
+	if success && len(nc.matchers) > 0 && done >= len(nc.matchers) {
+		nc.report(statusProofGenerationSuccess, map[string]any{"totalProofsGenerated": done})
+	}
 }
 
 func newNetCapture(upstream UpstreamCurrenter, logger *slog.Logger, sessionID string, publish func(StreamEvent), matchers []RequestMatcher, prove Prover, onClaim func(*ClaimResult), expectPublicData bool, report reportFunc) *NetCapture {
@@ -451,7 +502,6 @@ func (nc *NetCapture) onRequestWillBeSent(params json.RawMessage, inflight map[s
 		Method:     p.Request.Method,
 		ReqHeaders: p.Request.Headers,
 		PostData:   p.Request.PostData,
-		MatcherIdx: -1,
 	}
 	nc.publish(newEvent(EvNetworkRequest, nc.sessionID, NetworkRequestData{
 		ID:     p.RequestID,
@@ -483,15 +533,32 @@ func (nc *NetCapture) onResponseReceived(params json.RawMessage, inflight map[st
 	pr.MimeType = p.Response.MimeType
 	pr.FetchBody = isCapturableMime(p.Response.MimeType)
 
-	// Mark proof candidates and force body capture for them (the body is
-	// needed to assemble the proof, regardless of the mime gate).
+	// Flag proof candidates and force body capture for them (the body is needed
+	// both to evaluate the response-body gate and to assemble the proof). The
+	// final URL+method+body decision is made in onLoadingFinished once the body
+	// is available.
 	for i := range nc.matchers {
-		if matchesURL(nc.matchers[i], pr.URL, nil) {
-			pr.MatcherIdx = i
+		if matchesURL(nc.matchers[i], pr.URL, nil) && matchesMethod(nc.matchers[i], pr.Method) {
+			pr.ProofCandidate = true
 			pr.FetchBody = true
 			break
 		}
 	}
+}
+
+// matchProof returns the index of the first matcher fully satisfied by this
+// request (URL + method + response body), or -1 if none. A URL/method match
+// whose body does not satisfy the matcher returns -1 — the caller then leaves
+// the matcher unproven and waits for a later, matching response (e.g. the same
+// API after login), rather than failing.
+func (nc *NetCapture) matchProof(pr *pendingRequest, body string) int {
+	for i := range nc.matchers {
+		m := nc.matchers[i]
+		if matchesURL(m, pr.URL, nil) && matchesMethod(m, pr.Method) && responseBodyMatches(m, body) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (nc *NetCapture) onLoadingFinished(params json.RawMessage, inflight map[string]*pendingRequest, pageSessionID string, call func(string, any, string) (json.RawMessage, error)) {
@@ -546,12 +613,52 @@ func (nc *NetCapture) onLoadingFinished(params json.RawMessage, inflight map[str
 		data.ResponseBody = body
 		nc.publish(newEvent(EvNetworkResponse, nc.sessionID, data))
 
-		if pr.MatcherIdx >= 0 && pr.MatcherIdx < len(nc.matchers) && nc.prove != nil {
-			if nc.markProven(pr.MatcherIdx) {
-				nc.runProof(nc.matchers[pr.MatcherIdx], pr, body)
+		if pr.ProofCandidate && nc.prove != nil {
+			idx := nc.matchProof(pr, body)
+			if idx < 0 {
+				// URL/method matched but the body didn't satisfy the matcher
+				// (e.g. logged-out response). Not a failure — wait for a later
+				// response that does match.
+				nc.logger.Debug("[netcapture] response body did not match matcher — waiting",
+					"url", pr.URL, "method", pr.Method)
+			} else if nc.beginAttempt(idx, requestHash(pr)) {
+				// Resolve the cookie for the attestor replay. CDP's
+				// requestWillBeSent headers omit the cookie (esp. httpOnly
+				// session cookies), so fall back to the browser cookie jar for
+				// the request URL (mirrors the portal's getCookiesFromBrowser).
+				cookie := headerLookup(pr.ReqHeaders, "cookie")
+				if cookie == "" {
+					cookie = nc.fetchCookieString(call, pageSessionID, pr.URL)
+				}
+				nc.runProof(idx, nc.matchers[idx], pr, body, cookie)
 			}
 		}
 	}()
+}
+
+// fetchCookieString returns the cookies the browser would send for url, as a
+// "name=value; ..." header string. Uses CDP Network.getCookies, which reads the
+// cookie jar (including httpOnly cookies the page's JS can't see). Returns "" on
+// any error.
+func (nc *NetCapture) fetchCookieString(call func(string, any, string) (json.RawMessage, error), sessionID, url string) string {
+	raw, err := call("Network.getCookies", map[string]any{"urls": []string{url}}, sessionID)
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Cookies []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"cookies"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(r.Cookies))
+	for _, c := range r.Cookies {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
 }
 
 const maxProofAttempts = 3
@@ -579,8 +686,8 @@ func isRetryableProofError(err error) bool {
 
 // runProof runs the reclaim-tee proof for a matched request (the Prover extracts
 // response variables + assembles params), retrying transient failures, then
-// emitting a sanitized claim event and recording the result.
-func (nc *NetCapture) runProof(m RequestMatcher, pr *pendingRequest, body string) {
+// emitting a sanitized claim event and recording the result for matcher idx.
+func (nc *NetCapture) runProof(idx int, m RequestMatcher, pr *pendingRequest, body, cookie string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
@@ -598,7 +705,7 @@ func (nc *NetCapture) runProof(m RequestMatcher, pr *pendingRequest, body string
 	captured := CapturedForProof{
 		URL:         pr.URL,
 		Method:      pr.Method,
-		Cookie:      headerLookup(pr.ReqHeaders, "cookie"),
+		Cookie:      cookie,
 		Body:        body,
 		RequestBody: pr.PostData,
 		Headers:     pr.ReqHeaders,
@@ -621,21 +728,19 @@ retryLoop:
 		}
 	}
 	if err != nil {
-		nc.logger.Error("[netcapture] proof failed", "url", pr.URL, "err", err)
-		// The prover returns the full assembled (public) claim on failure — record
-		// it so /session/claim shows what was attempted, not just the error.
-		failed := result
-		if failed == nil {
-			failed = &ClaimResult{}
+		// A failed attempt is NOT terminal: the same matcher can still prove on a
+		// later request (e.g. the same API after login). Surface the error as an
+		// event for visibility, but don't persist a failed claim into
+		// /session/claim (which feeds proof submission) and don't fail the
+		// session — leave the matcher open for retry.
+		nc.logger.Warn("[netcapture] proof failed — leaving matcher open for retry",
+			"url", pr.URL, "matcher", idx, "err", err)
+		identifier := ""
+		if result != nil {
+			identifier = result.Identifier
 		}
-		if failed.Error == "" {
-			failed.Error = err.Error()
-		}
-		if nc.onClaim != nil {
-			nc.onClaim(failed)
-		}
-		nc.publish(newEvent(EvClaim, nc.sessionID, ClaimEventData{Identifier: failed.Identifier, Error: failed.Error}))
-		nc.recordProofOutcome(false)
+		nc.publish(newEvent(EvClaim, nc.sessionID, ClaimEventData{Identifier: identifier, Error: err.Error()}))
+		nc.finishAttempt(idx, false)
 		return
 	}
 	if nc.onClaim != nil {
@@ -649,37 +754,7 @@ retryLoop:
 		Identifier: result.Identifier,
 		Provider:   provider,
 	}))
-	nc.recordProofOutcome(true)
-}
-
-// recordProofOutcome tracks per-proof success/failure and reports the aggregate
-// session status: PROOF_GENERATION_FAILED on the first failure (once), and
-// PROOF_GENERATION_SUCCESS once every configured matcher has proved successfully.
-func (nc *NetCapture) recordProofOutcome(success bool) {
-	expected := len(nc.matchers)
-
-	nc.statusMu.Lock()
-	if success {
-		nc.succeeded++
-	} else {
-		nc.failed++
-	}
-	emitFailed := !success && !nc.failedReported
-	if emitFailed {
-		nc.failedReported = true
-	}
-	// All matchers proved successfully (and none failed) → overall success.
-	emitSuccess := expected > 0 && nc.succeeded >= expected && nc.failed == 0
-	succeeded := nc.succeeded
-	nc.statusMu.Unlock()
-
-	if emitFailed {
-		nc.report(statusProofGenerationFailed, nil)
-		return
-	}
-	if emitSuccess {
-		nc.report(statusProofGenerationSuccess, map[string]any{"totalProofsGenerated": succeeded})
-	}
+	nc.finishAttempt(idx, true)
 }
 
 // pollPublicData periodically drains window.Reclaim's outbox and records the

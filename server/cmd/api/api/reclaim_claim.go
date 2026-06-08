@@ -161,12 +161,13 @@ func (s *ApiService) buildBrowserProviderParams(m browser.RequestMatcher, captur
 		fullParams["writeRedactionMode"] = m.WriteRedactionMode
 	}
 
-	// Secret headers + cookie (folded into headers.cookie, as the portal does at
-	// prove time) + any secret param values.
-	if captured.Cookie != "" {
-		secretHdrs["cookie"] = captured.Cookie
-	}
+	// Secret headers + cookie + any secret param values. The cookie goes in
+	// secretParams.cookieStr (reclaim-tee's canonical field; it emits
+	// "Cookie: <cookieStr>") rather than headers.cookie, matching the portal.
 	secretParams := map[string]any{"headers": secretHdrs}
+	if captured.Cookie != "" {
+		secretParams["cookieStr"] = captured.Cookie
+	}
 	if len(secretParamValues) > 0 {
 		secretParams["paramValues"] = secretParamValues
 	}
