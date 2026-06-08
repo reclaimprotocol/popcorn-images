@@ -89,11 +89,19 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 	}
 	m.current = sess
 	m.claims = nil
+	report := m.boundReporter(sess)
+	// Browser attached + session created → report USER_INIT_VERIFICATION.
+	report(statusUserInitVerification, nil)
+	// When usePortalTEE resolved false, run capture-only (no Prover).
+	prover := m.prover
+	if cfg.ProofsDisabled {
+		prover = nil
+	}
 	// Start network/event capture on its own CDP connection. Proof matchers
 	// come from provider_config.requestData (empty == capture-only).
 	m.capture = newNetCapture(m.upstream, log, sess.SessionID, m.bus.publish,
-		cfg.ProviderConfig.RequestData, m.prover, m.AddClaim,
-		cfg.ProviderConfig.CustomInjection != "")
+		cfg.ProviderConfig.RequestData, prover, m.AddClaim,
+		cfg.ProviderConfig.CustomInjection != "", report)
 	m.capture.Start()
 	m.mu.Unlock()
 
@@ -107,6 +115,9 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 			log.Warn("loadLoginPage failed (non-fatal)", "err", err, "url", lu)
 		}
 	}
+
+	// Live page available → report USER_STARTED_VERIFICATION.
+	report(statusUserStartedVerification, nil)
 
 	log.Info("browser session started", "session_id", sid, "ws_endpoint", url)
 	return sess, nil

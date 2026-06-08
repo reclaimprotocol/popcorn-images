@@ -39,6 +39,11 @@ type Config struct {
 	TEEKUrl     string `envconfig:"TEE_K_URL" default:"wss://tk.reclaimprotocol.org/ws"`
 	TEETUrl     string `envconfig:"TEE_T_URL" default:"wss://tt.reclaimprotocol.org/ws"`
 	AttestorUrl string `envconfig:"ATTESTOR_URL" default:"wss://attestor.reclaimprotocol.org:444/ws"`
+
+	// Reclaim backend (api.reclaimprotocol.org): session bootstrap, status
+	// updates, feature flags, and proof callback submission. Auth is via the
+	// X-Reclaim-Session-Id header only (no app secret in the image).
+	ReclaimBackendURL string `envconfig:"RECLAIM_BACKEND_URL" default:"https://api.reclaimprotocol.org"`
 }
 
 // Load loads configuration from environment variables

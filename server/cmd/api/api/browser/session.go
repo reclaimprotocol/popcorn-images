@@ -85,12 +85,14 @@ type Manager struct {
 	dial     DialFunc
 	prover   Prover
 	bus      *eventBus
+	reporter StatusReporter // optional; nil disables backend status reporting
 }
 
-// NewManager constructs a Manager over a DevTools upstream, a CDP dialer, and an
-// optional Prover (nil disables proofs).
-func NewManager(upstream UpstreamCurrenter, dial DialFunc, prover Prover) *Manager {
-	return &Manager{upstream: upstream, dial: dial, prover: prover, bus: newEventBus()}
+// NewManager constructs a Manager over a DevTools upstream, a CDP dialer, an
+// optional Prover (nil disables proofs), and an optional StatusReporter (nil
+// disables backend session-status reporting).
+func NewManager(upstream UpstreamCurrenter, dial DialFunc, prover Prover, reporter StatusReporter) *Manager {
+	return &Manager{upstream: upstream, dial: dial, prover: prover, bus: newEventBus(), reporter: reporter}
 }
 
 // AddClaim records a completed proof result.

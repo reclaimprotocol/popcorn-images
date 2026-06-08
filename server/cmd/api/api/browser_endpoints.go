@@ -36,6 +36,12 @@ type providerConfigDTO struct {
 	CustomInjection string       `json:"customInjection"`
 	LogLevel        string       `json:"logLevel"`
 	GeoLocation     string       `json:"geoLocation"`
+	// Device descriptors (the gateway merges these into provider config from the
+	// client request; present on a backend-fetched config too when set).
+	DeviceID        string `json:"deviceId"`
+	DeviceType      string `json:"deviceType"`
+	OSVersion       string `json:"osVersion"`
+	PublicIPAddress string `json:"publicIpAddress"`
 	// RequestData decodes directly into the browser matcher types.
 	RequestData []browser.RequestMatcher `json:"requestData"`
 }
@@ -75,35 +81,44 @@ type sessionCloseResult struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
+// toProviderConfig maps the wire DTO into the browser provider config.
+func (dto *providerConfigDTO) toProviderConfig() *browser.ProviderConfig {
+	pc := &browser.ProviderConfig{
+		ProviderID:      dto.ProviderID,
+		AppID:           dto.AppID,
+		LoginURL:        dto.LoginURL,
+		InjectionType:   dto.InjectionType,
+		CustomInjection: dto.CustomInjection,
+		LogLevel:        dto.LogLevel,
+		GeoLocation:     dto.GeoLocation,
+		RequestData:     dto.RequestData,
+	}
+	// Propagate provider-level geoLocation to matchers that don't set one.
+	for i := range pc.RequestData {
+		if pc.RequestData[i].GeoLocation == "" {
+			pc.RequestData[i].GeoLocation = pc.GeoLocation
+		}
+	}
+	// userAgent is intentionally not applied yet (accepted but ignored).
+	if v := dto.Viewport; v != nil {
+		pc.Viewport = &browser.Viewport{Width: v.Width, Height: v.Height}
+	}
+	return pc
+}
+
 func (b sessionStartRequest) toConfig() *browser.SessionConfig {
 	cfg := &browser.SessionConfig{
 		SessionID:  b.SessionID,
 		Parameters: b.Parameters,
 	}
 	if b.ProviderConfig != nil {
-		pc := &browser.ProviderConfig{
-			ProviderID:      b.ProviderConfig.ProviderID,
-			AppID:           b.ProviderConfig.AppID,
-			LoginURL:        b.ProviderConfig.LoginURL,
-			InjectionType:   b.ProviderConfig.InjectionType,
-			CustomInjection: b.ProviderConfig.CustomInjection,
-			LogLevel:        b.ProviderConfig.LogLevel,
-			GeoLocation:     b.ProviderConfig.GeoLocation,
-			RequestData:     b.ProviderConfig.RequestData,
-		}
-		// Propagate provider-level geoLocation to matchers that don't set one.
-		for i := range pc.RequestData {
-			if pc.RequestData[i].GeoLocation == "" {
-				pc.RequestData[i].GeoLocation = pc.GeoLocation
-			}
-		}
-		// userAgent is intentionally not applied yet (accepted but ignored).
-		if v := b.ProviderConfig.Viewport; v != nil {
-			pc.Viewport = &browser.Viewport{Width: v.Width, Height: v.Height}
-		}
-		cfg.ProviderConfig = pc
+		cfg.ProviderConfig = b.ProviderConfig.toProviderConfig()
 		cfg.ProviderID = b.ProviderConfig.ProviderID
 		cfg.AppID = b.ProviderConfig.AppID
+		cfg.DeviceID = b.ProviderConfig.DeviceID
+		cfg.DeviceType = b.ProviderConfig.DeviceType
+		cfg.OSVersion = b.ProviderConfig.OSVersion
+		cfg.PublicIP = b.ProviderConfig.PublicIPAddress
 	}
 	return cfg
 }
@@ -128,12 +143,22 @@ func (s *ApiService) HandleSessionStart(w http.ResponseWriter, r *http.Request) 
 		respondJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if body.ProviderConfig == nil {
-		respondJSONError(w, http.StatusBadRequest, "provider_config is required")
+
+	cfg, err := s.resolveSessionConfig(ctx, body)
+	if err != nil {
+		switch {
+		case errors.Is(err, errProviderConfigRequired):
+			respondJSONError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, errSessionTerminated):
+			respondJSONError(w, http.StatusConflict, err.Error())
+		default:
+			log.Error("session config resolution failed", "err", err)
+			respondJSONError(w, http.StatusBadGateway, err.Error())
+		}
 		return
 	}
 
-	sess, err := s.browser.Start(ctx, body.toConfig())
+	sess, err := s.browser.Start(ctx, cfg)
 	if err != nil {
 		if errors.Is(err, browser.ErrSessionExists) {
 			respondJSONError(w, http.StatusConflict, err.Error())

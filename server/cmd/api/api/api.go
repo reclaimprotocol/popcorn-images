@@ -16,6 +16,7 @@ import (
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	"github.com/onkernel/kernel-images/server/lib/nekoclient"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
+	"github.com/onkernel/kernel-images/server/lib/reclaimbackend"
 	"github.com/onkernel/kernel-images/server/lib/policy"
 	"github.com/onkernel/kernel-images/server/lib/recorder"
 	"github.com/onkernel/kernel-images/server/lib/scaletozero"
@@ -48,6 +49,10 @@ type ApiService struct {
 	// browser is the in-image browser-events session manager. It attaches to
 	// the local Chromium over CDP and drives a single session per image.
 	browser *browser.Manager
+
+	// backend talks to the Reclaim backend (api.reclaimprotocol.org): session
+	// bootstrap, status updates, feature flags, proof callback submission.
+	backend *reclaimbackend.Client
 
 	// inputMu serializes input-related operations (mouse, keyboard, screenshot)
 	inputMu sync.Mutex
@@ -107,10 +112,34 @@ func New(cfg *config.Config, recordManager recorder.RecordManager, factory recor
 		stz:               stz,
 		nekoAuthClient:    nekoAuthClient,
 		policy:            &policy.Policy{},
+		backend:           reclaimbackend.New(cfg.ReclaimBackendURL),
 	}
-	// browserProver is a method on svc, so wire the manager after construction.
-	svc.browser = browser.NewManager(upstreamMgr, cdpclient.Dial, svc.browserProver)
+	// browserProver + reporter are bound to svc, so wire the manager after
+	// construction. The reporter forwards browser status transitions to the
+	// backend's updateSession (best-effort; never blocks the session).
+	svc.browser = browser.NewManager(upstreamMgr, cdpclient.Dial, svc.browserProver, svc.reportSessionStatus)
 	return svc, nil
+}
+
+// reportSessionStatus forwards a browser session-status transition to the
+// Reclaim backend. It is best-effort: failures are logged and swallowed so the
+// session is never blocked by backend availability.
+func (s *ApiService) reportSessionStatus(ctx context.Context, args browser.StatusArgs) {
+	if s.backend == nil || args.SessionID == "" {
+		return
+	}
+	err := s.backend.UpdateSession(ctx, reclaimbackend.UpdateSessionRequest{
+		SessionID:       args.SessionID,
+		Status:          args.Status,
+		DeviceID:        args.DeviceID,
+		DeviceType:      args.DeviceType,
+		OSVersion:       args.OSVersion,
+		PublicIPAddress: args.PublicIP,
+		Metadata:        args.Metadata,
+	})
+	if err != nil {
+		logger.FromContext(ctx).Warn("updateSession failed (non-fatal)", "status", args.Status, "session_id", args.SessionID, "err", err)
+	}
 }
 
 func (s *ApiService) StartRecording(ctx context.Context, req oapi.StartRecordingRequestObject) (oapi.StartRecordingResponseObject, error) {

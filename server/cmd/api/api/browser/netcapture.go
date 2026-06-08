@@ -68,10 +68,23 @@ type NetCapture struct {
 	// carries publicData, not just the ones after it first appears.
 	expectPublicData bool
 
+	// report emits backend session-status transitions (session-bound; no-op when
+	// no reporter is configured).
+	report reportFunc
+
 	// proven dedups proof attempts: each matcher is proved at most once per
 	// session (the same URL is often captured by more than one CDP request).
 	provenMu sync.Mutex
 	proven   map[int]bool
+
+	// statusMu guards the one-shot status latches + proof outcome counters used
+	// to drive LOGIN/PROOF_GENERATION_* reporting.
+	statusMu           sync.Mutex
+	loginReported      bool
+	proofStartReported bool
+	failedReported     bool
+	succeeded          int
+	failed             int
 
 	// meta holds page-derived state surfaced via status: the latest
 	// window.Reclaim publicData payload, the login interaction indicator, and
@@ -151,7 +164,10 @@ func (nc *NetCapture) markProven(idx int) bool {
 	return true
 }
 
-func newNetCapture(upstream UpstreamCurrenter, logger *slog.Logger, sessionID string, publish func(StreamEvent), matchers []RequestMatcher, prove Prover, onClaim func(*ClaimResult), expectPublicData bool) *NetCapture {
+func newNetCapture(upstream UpstreamCurrenter, logger *slog.Logger, sessionID string, publish func(StreamEvent), matchers []RequestMatcher, prove Prover, onClaim func(*ClaimResult), expectPublicData bool, report reportFunc) *NetCapture {
+	if report == nil {
+		report = func(string, map[string]any) {}
+	}
 	return &NetCapture{
 		upstream:         upstream,
 		logger:           logger,
@@ -161,6 +177,7 @@ func newNetCapture(upstream UpstreamCurrenter, logger *slog.Logger, sessionID st
 		prove:            prove,
 		onClaim:          onClaim,
 		expectPublicData: expectPublicData,
+		report:           report,
 	}
 }
 
@@ -567,6 +584,17 @@ func (nc *NetCapture) runProof(m RequestMatcher, pr *pendingRequest, body string
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
+	// First proof-generating request implies the user has logged in and proof
+	// generation is starting — report both, once.
+	nc.statusMu.Lock()
+	firstProof := !nc.proofStartReported
+	nc.proofStartReported = true
+	nc.statusMu.Unlock()
+	if firstProof {
+		nc.report(statusUserLoggedIn, nil)
+		nc.report(statusProofGenerationStarted, nil)
+	}
+
 	captured := CapturedForProof{
 		URL:         pr.URL,
 		Method:      pr.Method,
@@ -607,6 +635,7 @@ retryLoop:
 			nc.onClaim(failed)
 		}
 		nc.publish(newEvent(EvClaim, nc.sessionID, ClaimEventData{Identifier: failed.Identifier, Error: failed.Error}))
+		nc.recordProofOutcome(false)
 		return
 	}
 	if nc.onClaim != nil {
@@ -620,6 +649,37 @@ retryLoop:
 		Identifier: result.Identifier,
 		Provider:   provider,
 	}))
+	nc.recordProofOutcome(true)
+}
+
+// recordProofOutcome tracks per-proof success/failure and reports the aggregate
+// session status: PROOF_GENERATION_FAILED on the first failure (once), and
+// PROOF_GENERATION_SUCCESS once every configured matcher has proved successfully.
+func (nc *NetCapture) recordProofOutcome(success bool) {
+	expected := len(nc.matchers)
+
+	nc.statusMu.Lock()
+	if success {
+		nc.succeeded++
+	} else {
+		nc.failed++
+	}
+	emitFailed := !success && !nc.failedReported
+	if emitFailed {
+		nc.failedReported = true
+	}
+	// All matchers proved successfully (and none failed) → overall success.
+	emitSuccess := expected > 0 && nc.succeeded >= expected && nc.failed == 0
+	succeeded := nc.succeeded
+	nc.statusMu.Unlock()
+
+	if emitFailed {
+		nc.report(statusProofGenerationFailed, nil)
+		return
+	}
+	if emitSuccess {
+		nc.report(statusProofGenerationSuccess, map[string]any{"totalProofsGenerated": succeeded})
+	}
 }
 
 // pollPublicData periodically drains window.Reclaim's outbox and records the
@@ -670,6 +730,17 @@ func (nc *NetCapture) pollPublicData(ctx context.Context, sessionID string, call
 					nc.metaMu.Lock()
 					nc.loginIndicator = li.Indicator
 					nc.metaMu.Unlock()
+					// First time the page signals a login interaction is needed,
+					// report LOGIN_INDICATORS_FOUND (once).
+					if li.Indicator == "url" || li.Indicator == "element" {
+						nc.statusMu.Lock()
+						first := !nc.loginReported
+						nc.loginReported = true
+						nc.statusMu.Unlock()
+						if first {
+							nc.report(statusLoginIndicatorsFound, nil)
+						}
+					}
 				}
 			}
 		}

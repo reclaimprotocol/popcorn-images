@@ -15,6 +15,17 @@ type SessionConfig struct {
 	ProviderConfig *ProviderConfig
 	// Parameters are session-level parameters passed through from the gateway.
 	Parameters map[string]string
+
+	// Device descriptors sent on every backend session-status update. Empty
+	// fields fall back to sessionId / "Web" / "Web" / "NA".
+	DeviceID   string
+	DeviceType string
+	OSVersion  string
+	PublicIP   string
+
+	// ProofsDisabled is set when the usePortalTEE feature flag resolves false:
+	// capture continues but no reclaim-tee proofs are attempted.
+	ProofsDisabled bool
 }
 
 // ProviderConfig holds only the fields the foundation reads. Launch/claim/AI
