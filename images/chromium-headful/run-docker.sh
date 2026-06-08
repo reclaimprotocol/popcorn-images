@@ -142,26 +142,9 @@ if [[ -n "${PLAYWRIGHT_ENGINE:-}" ]]; then
   RUN_ARGS+=( -e PLAYWRIGHT_ENGINE="$PLAYWRIGHT_ENGINE" )
 fi
 
-
-# TURN is only needed when the WebRTC client and the Neko server can't reach
-# each other directly (they're behind separate NATs, on different networks).
-# For local docker, both ends are on the host so the NAT1TO1=127.0.0.1
-# fallback below works without any external TURN allocation.
-#
-# When TURN_KEY_ID is set, the script fetches Cloudflare TURN credentials
-# and forces ICE to use them — if the container's network can't reach
-# turn.cloudflare.com (firewall, ISP routing quirks, rate-limit), every
-# allocation times out and the WebRTC peer connection drops, looking like
-# a "server crash" in the Neko logs (read udp4 i/o timeout, "all
-# retransmissions failed for ..."). Default to off; set TURN_KEY_ID +
-# TURN_API_TOKEN explicitly only when deploying to a routed setup that
-# genuinely needs it.
-#
-# These were previously hardcoded credentials committed to the repo. If you
-# need them for cluster deployments, source them from your secrets manager
-# rather than defaulting them in this script.
-TURN_KEY_ID="${TURN_KEY_ID:-}"
-TURN_API_TOKEN="${TURN_API_TOKEN:-}"
+if [[ -n "${REPLACE_DEFAULT_PAGE:-}" ]]; then
+  RUN_ARGS+=( -e REPLACE_DEFAULT_PAGE="$REPLACE_DEFAULT_PAGE" )
+fi
 
 if [ ! -z "$TURN_KEY_ID" ] && [ ! -z "$TURN_API_TOKEN" ]; then
     echo "🔄 Fetching TURN credentials from Cloudflare..."

@@ -92,7 +92,8 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 	// Start network/event capture on its own CDP connection. Proof matchers
 	// come from provider_config.requestData (empty == capture-only).
 	m.capture = newNetCapture(m.upstream, log, sess.SessionID, m.bus.publish,
-		cfg.ProviderConfig.RequestData, m.prover, m.AddClaim)
+		cfg.ProviderConfig.RequestData, m.prover, m.AddClaim,
+		cfg.ProviderConfig.CustomInjection != "")
 	m.capture.Start()
 	m.mu.Unlock()
 

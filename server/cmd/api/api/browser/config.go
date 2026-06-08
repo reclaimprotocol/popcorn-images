@@ -30,6 +30,7 @@ type ProviderConfig struct {
 	InjectionType   string    `json:"injectionType,omitempty"`   // HAWKEYE|NONE|CDP — read in Phase 5
 	CustomInjection string    `json:"customInjection,omitempty"` // Phase 5
 	LogLevel        string    `json:"logLevel,omitempty"`
+	GeoLocation     string    `json:"geoLocation,omitempty"` // provider-level geo (proxy region for the proof fetch)
 
 	// RequestData lists the requests to match + prove. Empty means no proof
 	// attempts (capture-only) — the default, so existing flows are unaffected.
@@ -56,5 +57,17 @@ type RequestMatcher struct {
 	Method             string          `json:"method,omitempty"`
 	ResponseMatches    json.RawMessage `json:"responseMatches,omitempty"`
 	ResponseRedactions json.RawMessage `json:"responseRedactions,omitempty"`
-	GeoLocation        string          `json:"geoLocation,omitempty"`
+	// ResponseVariables names the variables (in redaction order) for redactions
+	// whose regex has no named group — used to key extracted paramValues.
+	ResponseVariables  []string   `json:"responseVariables,omitempty"`
+	GeoLocation        string     `json:"geoLocation,omitempty"`
+	WriteRedactionMode string     `json:"writeRedactionMode,omitempty"` // zk|keyUpdate
+	Context            string     `json:"context,omitempty"`            // provider-supplied context string
+	BodySniff          *BodySniff `json:"bodySniff,omitempty"`
+}
+
+// BodySniff lets a matcher supply a request-body template for the claim.
+type BodySniff struct {
+	Enabled  bool   `json:"enabled,omitempty"`
+	Template string `json:"template,omitempty"`
 }

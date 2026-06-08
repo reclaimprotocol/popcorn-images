@@ -233,6 +233,7 @@ func main() {
 	r.Post("/session/close", apiService.HandleSessionClose)
 	r.Get("/session/events", apiService.HandleSessionEvents)
 	r.Get("/session/claim", apiService.HandleSessionClaim)
+	r.Get("/session/status", apiService.HandleSessionStatus)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),

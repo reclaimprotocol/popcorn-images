@@ -67,10 +67,11 @@ type UpstreamCurrenter interface {
 // satisfies this directly.
 type DialFunc func(ctx context.Context, url string) (*cdpclient.Client, error)
 
-// Prover runs a reclaim-tee proof for an assembled provider_params_json,
-// labeled by requestID. Injected by package api to avoid an import cycle. A nil
-// Prover disables proof generation.
-type Prover func(ctx context.Context, providerParamsJSON, requestID string) (*ClaimResult, error)
+// Prover runs a reclaim-tee proof for a matched request: it extracts the
+// response variables, assembles provider_params_json, and proves. Injected by
+// package api (where reclaim-tee lives) to avoid an import cycle. A nil Prover
+// disables proof generation.
+type Prover func(ctx context.Context, m RequestMatcher, cap CapturedForProof, requestID string) (*ClaimResult, error)
 
 // Manager owns the single session for this image (one image = one browser =
 // one session).

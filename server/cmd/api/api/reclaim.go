@@ -5,11 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/onkernel/kernel-images/server/cmd/api/api/browser"
 	"github.com/onkernel/kernel-images/server/cmd/api/circuits"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
@@ -136,10 +136,16 @@ func (s *ApiService) executeReclaimProve(ctx context.Context, providerParamsJSON
 		err   error
 	}
 	resultCh := make(chan result, 1)
+	log := logger.FromContext(ctx)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				resultCh <- result{err: fmt.Errorf("internal error: protocol execution panicked")}
+				// Surface the panic reason (the recovered value) and log the full
+				// stack so the failure is diagnosable instead of opaque.
+				log.Error("ExecuteCompleteProtocol panicked",
+					"panic", fmt.Sprintf("%v", r),
+					"stack", string(debug.Stack()))
+				resultCh <- result{err: fmt.Errorf("protocol execution panicked: %v", r)}
 			}
 		}()
 		claim, err := reclaimClient.ExecuteCompleteProtocol(&providerData)
@@ -177,52 +183,6 @@ func (s *ApiService) buildReclaimClientConfigJSON(requestID string) (string, err
 		RequestID:   requestID,
 	})
 	return string(b), err
-}
-
-// browserProver is the browser.Prover injected into the session manager. It
-// runs an in-process reclaim-tee proof and maps the result to a sanitized
-// browser.ClaimResult.
-func (s *ApiService) browserProver(ctx context.Context, providerParamsJSON, requestID string) (*browser.ClaimResult, error) {
-	cfgJSON, err := s.buildReclaimClientConfigJSON(requestID)
-	if err != nil {
-		return nil, err
-	}
-	claim, err := s.executeReclaimProve(ctx, providerParamsJSON, cfgJSON)
-	if err != nil {
-		return nil, err
-	}
-	return mapClaimToBrowserResult(claim), nil
-}
-
-func mapClaimToBrowserResult(c *client.ClaimWithSignatures) *browser.ClaimResult {
-	res := &browser.ClaimResult{}
-	type providerClaimData interface {
-		GetProvider() string
-		GetParameters() string
-		GetOwner() string
-		GetTimestampS() uint32
-		GetContext() string
-		GetIdentifier() string
-		GetEpoch() uint32
-	}
-	if cd, ok := any(c.Claim).(providerClaimData); ok {
-		res.Provider = cd.GetProvider()
-		res.Parameters = cd.GetParameters()
-		res.Owner = cd.GetOwner()
-		res.Context = cd.GetContext()
-		res.Identifier = cd.GetIdentifier()
-		res.Epoch = int(cd.GetEpoch())
-		res.TimestampS = int(cd.GetTimestampS())
-	}
-	type claimSignature interface {
-		GetAttestorAddress() string
-		GetClaimSignature() []byte
-	}
-	if sg, ok := any(c.Signature).(claimSignature); ok {
-		res.AttestorAddress = sg.GetAttestorAddress()
-		res.ClaimSignature = base64.StdEncoding.EncodeToString(sg.GetClaimSignature())
-	}
-	return res
 }
 
 func mapClaimToOapi(claim interface{}) oapi.ReclaimClaim {

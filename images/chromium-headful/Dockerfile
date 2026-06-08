@@ -370,8 +370,9 @@ ARG PATCHRIGHT_VERSION=1.59.4
 ARG ESBUILD_VERSION=0.28.0
 ARG CLOAKBROWSER_NPM_VERSION=0.3.26
 # Copy Chromium policy configuration
-RUN mkdir -p /etc/chromium/policies/managed
+RUN mkdir -p /etc/chromium/policies/managed /etc/chromium/policy-variants
 COPY shared/chromium-policies/managed/policy.json /etc/chromium/policies/managed/policy.json
+COPY shared/chromium-policies/variants/policy.reclaim-portal.json /etc/chromium/policy-variants/policy.reclaim-portal.json
 
 # install Node.js 22.x by copying from the node:22-bullseye-slim stage
 COPY --from=node-22 /usr/local/bin/node /usr/local/bin/node

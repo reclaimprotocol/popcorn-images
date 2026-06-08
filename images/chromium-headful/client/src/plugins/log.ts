@@ -20,7 +20,7 @@ declare module 'vue/types/vue' {
 }
 
 const noop = () => {}
-const noopError = (_: Error) => {}
+const noopError = () => {}
 
 const realLoggers: Logger = {
   error: (error: Error) => console.error('[%cNEKO%c] %cERR', 'color: #498ad8;', '', 'color: #d84949;', error),
@@ -61,9 +61,7 @@ function getLogLevel(): string {
 
 const plugin: PluginObject<undefined> = {
   install(Vue) {
-    const baseLoggers = createLoggerForLevel(getLogLevel())
-
-    window.$log = baseLoggers
+    window.$log = createLoggerForLevel(getLogLevel())
     Vue.prototype.$log = window.$log
   },
 }

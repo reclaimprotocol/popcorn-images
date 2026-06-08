@@ -35,6 +35,7 @@ type providerConfigDTO struct {
 	InjectionType   string       `json:"injectionType"`
 	CustomInjection string       `json:"customInjection"`
 	LogLevel        string       `json:"logLevel"`
+	GeoLocation     string       `json:"geoLocation"`
 	// RequestData decodes directly into the browser matcher types.
 	RequestData []browser.RequestMatcher `json:"requestData"`
 }
@@ -87,7 +88,14 @@ func (b sessionStartRequest) toConfig() *browser.SessionConfig {
 			InjectionType:   b.ProviderConfig.InjectionType,
 			CustomInjection: b.ProviderConfig.CustomInjection,
 			LogLevel:        b.ProviderConfig.LogLevel,
+			GeoLocation:     b.ProviderConfig.GeoLocation,
 			RequestData:     b.ProviderConfig.RequestData,
+		}
+		// Propagate provider-level geoLocation to matchers that don't set one.
+		for i := range pc.RequestData {
+			if pc.RequestData[i].GeoLocation == "" {
+				pc.RequestData[i].GeoLocation = pc.GeoLocation
+			}
 		}
 		// userAgent is intentionally not applied yet (accepted but ignored).
 		if v := b.ProviderConfig.Viewport; v != nil {
@@ -204,6 +212,17 @@ func (s *ApiService) HandleSessionClose(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	respondJSON(w, http.StatusOK, sessionCloseResult{Closed: true, SessionID: sessionID})
+}
+
+// HandleSessionStatus returns the active session's login-detection and
+// proof-generation status.
+func (s *ApiService) HandleSessionStatus(w http.ResponseWriter, r *http.Request) {
+	st := s.browser.Status()
+	if st == nil {
+		respondJSONError(w, http.StatusNotFound, "no active session")
+		return
+	}
+	respondJSON(w, http.StatusOK, st)
 }
 
 // HandleSessionClaim returns the proofs accumulated for the active session.
