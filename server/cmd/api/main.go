@@ -114,6 +114,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Hide the cursor at boot (session-independent) when HIDE_CURSOR_DEFAULT is set.
+	apiService.StartCursorHide(ctx)
+
 	strictHandler := oapi.NewStrictHandler(apiService, nil)
 	oapi.HandlerFromMux(strictHandler, r)
 

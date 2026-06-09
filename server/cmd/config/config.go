@@ -17,6 +17,12 @@ type Config struct {
 	MaxSizeInMB int    `envconfig:"MAX_SIZE_MB" default:"500"`
 	OutputDir   string `envconfig:"OUTPUT_DIR" default:"."`
 
+	// HideCursorDefault hides the mouse cursor automatically — at server boot
+	// (session-independent, covers the neko live view) and again on each
+	// /session/start. Defaults to true; set HIDE_CURSOR_DEFAULT=false to keep
+	// the cursor visible until /computer/cursor is called explicitly.
+	HideCursorDefault bool `envconfig:"HIDE_CURSOR_DEFAULT" default:"true"`
+
 	// Absolute or relative path to the ffmpeg binary. If empty the code falls back to "ffmpeg" on $PATH.
 	PathToFFmpeg string `envconfig:"FFMPEG_PATH" default:"ffmpeg"`
 

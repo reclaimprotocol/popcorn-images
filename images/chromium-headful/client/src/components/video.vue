@@ -440,6 +440,16 @@
     // CDP emulation at the viewer's actual screen size).
     isMagnified = true
 
+    // Debounce handle for re-applying mobile emulation when the iframe/visual
+    // viewport changes (orientation flip, embed resize).
+    private deviceExperienceTimer: number | null = null
+
+
+    // Last visible height pushed to the remote while the soft keyboard is up
+    // (0 = full viewport / no keyboard). Used to shrink the remote viewport so
+    // the focused field scrolls above the keyboard and content stays reachable.
+    private lastEmulatedVisibleHeight = 0
+
     // IME composition state. Only used on iOS — Android (Samsung Keyboard
     // especially) treats every word as a composition session, so suppressing
     // during composition would drop all typing. Android handles intermediate
@@ -721,34 +731,106 @@
       return this.resolveCDPUrl('emulate-device')
     }
 
-    // Sync the remote chromium's emulated viewport with the magnify state.
-    // When the CSS crop is active (mobileViewportActive), tell chromium to
-    // lay out at the viewer's window size into the top-left of the frame so
-    // the visible region matches what the CSS shows. When magnified, clear
-    // the override so chromium renders desktop into the full 1920×1080.
-    private applyViewportEmulation() {
+    // Sync the remote chromium's emulated viewport. Mobile (mobileViewport-
+    // Active): lay out at the viewer's window size into the top-left of the
+    // frame so the visible region matches the CSS crop. Desktop: emulate the
+    // full 1920×1080 stream (shown letterboxed).
+    private applyViewportEmulation(opts?: { visibleHeight?: number }) {
       const url = this.getEmulateDeviceUrl()
-      const body = this.mobileViewportActive
-        ? {
-            width: Math.max(1, Math.round(window.innerWidth)),
-            height: Math.max(1, Math.round(Math.min(window.innerHeight, this.height || 1080))),
-            mobile: true,
-            // deviceScaleFactor: 1 — DPR>1 makes chromium render at 2× and
-            // overflow the 1920×1080 stream, then the CSS crop misses the
-            // bottom rows.
-            deviceScaleFactor: 1,
-            touch: true,
-            maxTouchPoints: 5,
-            // Pass the viewer's real UA through so Cloudflare/bot detection
-            // sees a consistent UA + TLS fingerprint.
-            userAgent: navigator.userAgent,
-          }
-        : { width: this.width || 1920, height: this.height || 1080, mobile: false, deviceScaleFactor: 1, touch: false }
+      const physW = this.width || 1920
+      const physH = this.height || 1080
+
+      let body: Record<string, unknown>
+      if (this.mobileViewportActive) {
+        // When the soft keyboard is up, opts.visibleHeight is the area above
+        // the keyboard — emulate the remote at that height so it reflows,
+        // scrolls the focused field into view, and stays scrollable.
+        const mobileH = opts?.visibleHeight ?? window.innerHeight
+        body = {
+          width: Math.max(1, Math.round(window.innerWidth)),
+          height: Math.max(1, Math.round(Math.min(mobileH, physH))),
+          mobile: true,
+          // deviceScaleFactor: 1 — DPR>1 makes chromium render at 2× and
+          // overflow the 1920×1080 stream, then the CSS crop misses the
+          // bottom rows.
+          deviceScaleFactor: 1,
+          touch: true,
+          maxTouchPoints: 5,
+          // Pass the viewer's real UA through so Cloudflare/bot detection
+          // sees a consistent UA + TLS fingerprint.
+          userAgent: navigator.userAgent,
+        }
+      } else {
+        // Desktop: emulate at the full stream size (the remote stays 1920×1080
+        // and is shown letterboxed — no client-side scaling/crop).
+        body = { width: physW, height: physH, mobile: false, deviceScaleFactor: 1, touch: false }
+      }
+
       fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }).catch((err) => console.warn('[CDP] emulate-device failed', err))
+    }
+
+    // Auto-select the browsing experience for the connecting viewer's device:
+    // touch devices get a native mobile-like layout (mobile viewport + touch +
+    // the viewer's real UA). Desktop keeps the native letterboxed view. Runs on
+    // connect and after viewport/orientation changes. iframe-safe:
+    // is_touch_device and navigator.userAgent both propagate into embedded
+    // frames, and the emulated size is the iframe's own box.
+    private autoApplyDeviceExperience() {
+      if (!this.hosting) return
+      if (this.is_touch_device) {
+        // Mobile-like: activate the CSS crop, which flips mobileViewportActive
+        // true so applyViewportEmulation pushes the mobile override.
+        this.isMagnified = false
+      }
+      if (this.mobileViewportActive) {
+        this.applyViewportEmulation()
+      }
+    }
+
+    // Debounced re-apply of mobile emulation on viewport/orientation change
+    // (phone rotation, embed resize).
+    private scheduleDeviceExperience() {
+      if (!this.is_touch_device) return
+      if (this.deviceExperienceTimer !== null) {
+        window.clearTimeout(this.deviceExperienceTimer)
+      }
+      this.deviceExperienceTimer = window.setTimeout(() => {
+        this.deviceExperienceTimer = null
+        if (this.hosting && this.mobileViewportActive) {
+          this.applyViewportEmulation()
+        }
+      }, 250)
+    }
+
+    @Watch('hosting')
+    onHostingChangedForDevice(now: boolean) {
+      if (now) this.autoApplyDeviceExperience()
+    }
+
+    // Shrink the remote viewport to the area above the soft keyboard so the
+    // remote page reflows, scrolls the focused field into view, and the content
+    // behind the keyboard becomes reachable by scrolling. The mobile crop shows
+    // the stream 1:1 from the top-left, so the reduced render lands exactly in
+    // the visible area. No-op unless the mobile layout is active.
+    private applyKeyboardViewport(visibleHeight: number) {
+      if (!this.mobileViewportActive) return
+      const vh = Math.round(visibleHeight)
+      // Skip churn while the keyboard animates — only re-emulate on a real
+      // height change.
+      if (Math.abs(vh - this.lastEmulatedVisibleHeight) <= 20) return
+      this.lastEmulatedVisibleHeight = vh
+      this.applyViewportEmulation({ visibleHeight: vh })
+    }
+
+    // Restore the full remote viewport after the keyboard is dismissed.
+    private restoreViewportAfterKeyboard() {
+      if (this.lastEmulatedVisibleHeight === 0) return
+      this.lastEmulatedVisibleHeight = 0
+      if (this.mobileViewportActive) this.applyViewportEmulation()
     }
 
     get is_touch_device() {
@@ -874,6 +956,12 @@
       // POSTs in postCDPInput when the WS isn't connected yet or has died.
       this.connectInputWS()
 
+      // If already hosting at mount (e.g. reconnect), pick the device
+      // experience now; otherwise the hosting watcher handles the transition.
+      if (this.hosting) {
+        this.autoApplyDeviceExperience()
+      }
+
       // Mobile keyboard detection via visualViewport (ported from
       // keyboard.ts:214-253). When the visual viewport shrinks by >50px the
       // soft keyboard is up; when it grows back the user dismissed it.
@@ -977,6 +1065,10 @@
         window.visualViewport.removeEventListener('resize', this.handleViewportResize)
       }
       window.removeEventListener('message', this.onPortalMessage)
+      if (this.deviceExperienceTimer !== null) {
+        window.clearTimeout(this.deviceExperienceTimer)
+        this.deviceExperienceTimer = null
+      }
       this.disconnectInputWS()
       this.stopStuckStatePoller()
       this.observer.disconnect()
@@ -1381,6 +1473,7 @@
       this.stopStuckStatePoller()
       this.iframeOffset = 0
       window.scrollTo(0, 0)
+      this.restoreViewportAfterKeyboard()
       this.keyboardJustDismissed = true
       window.setTimeout(() => { this.keyboardJustDismissed = false }, 150)
       const proxy = this._proxyInput
@@ -2041,6 +2134,23 @@
             this.cancelLongPress()
           }
 
+          // Native touch path (mobile): stream real touchmoves at ~frame rate
+          // and let the remote's touchscreen driver do native scrolling — the
+          // close-spaced moves let Chromium track the finger smoothly and
+          // compute fling velocity at touchend, giving real momentum. NO wheel
+          // here: sending both double-scrolls, and wheel has no inertia. (Wheel
+          // remains the fallback for desktop / neko builds without touch.)
+          if (this.mobileViewportActive) {
+            const now = Date.now()
+            if (now - this.touchLastWheelEmit < 16) return
+            this.touchLastWheelEmit = now
+            this.touchLastX = touch.clientX
+            this.touchLastY = touch.clientY
+            this.sendTouchFromTouch(touch, 'touchmove')
+            this.lastScrollAt = Date.now()
+            break
+          }
+
           const moveDx = touch.clientX - this.touchLastX
           const moveDy = touch.clientY - this.touchLastY
           this.touchLastX = touch.clientX
@@ -2050,17 +2160,8 @@
           if (now - this.touchLastWheelEmit < 60) return
           this.touchLastWheelEmit = now
 
-          // Mobile-viewport mode: also emit a real touchmove on top of
-          // the wheel — pages that listen specifically for touchmove
-          // (captcha swipes, drag-handles) get the right event. Wheel
-          // stays so the existing scroll-via-wheel path keeps working
-          // on neko builds without the touch opcodes wired in.
-          if (this.mobileViewportActive) {
-            this.sendTouchFromTouch(touch, 'touchmove')
-          }
-
-          // Wheel path: native feel: swiping UP scrolls content UP
-          // (positive wheel deltaY). The remote interprets +y as
+          // Wheel path (desktop / non-touch fallback): swiping UP scrolls
+          // content UP (positive wheel deltaY). The remote interprets +y as
           // scroll-down lines.
           let wheelX = -Math.round(moveDx / 6)
           let wheelY = -Math.round(moveDy / 6)
@@ -2636,6 +2737,7 @@
         this.allowBlur = true
         if (this._proxyInput) this._proxyInput.blur()
         this.iframeOffset = 0
+        this.restoreViewportAfterKeyboard()
         window.setTimeout(() => { this.allowBlur = false }, 100)
       } else {
         this.focusProxyInputForIOS()
@@ -2665,6 +2767,9 @@
         const wasActive = this.keyboardActive
         this.keyboardActive = true
         if (!wasActive) this.startStuckStatePoller()
+        // Shrink the remote viewport to the visible area so the focused field
+        // scrolls above the keyboard and occluded content stays reachable.
+        this.applyKeyboardViewport(viewportHeight)
         // Notify any embedding portal so it can mirror our keyboard state.
         try {
           window.parent.postMessage({
@@ -2695,6 +2800,7 @@
         this.stopStuckStatePoller()
         this.iframeOffset = 0
         window.scrollTo(0, 0)
+        this.restoreViewportAfterKeyboard()
         this.keyboardJustDismissed = true
         window.setTimeout(() => { this.keyboardJustDismissed = false }, 100)
         if (this._proxyInput) this._proxyInput.blur()
@@ -2787,6 +2893,10 @@
         !this.fullscreen ? Math.min(this.width, aspectPreservingMaxWidth) : aspectPreservingMaxWidth
       }px`
       this._aspect.style.paddingBottom = `${(this.vertical / this.horizontal) * 100}%`
+
+      // Re-apply mobile emulation (debounced) so rotating the phone or resizing
+      // the embed re-lays-out the remote page to the new iframe box.
+      this.scheduleDeviceExperience()
     }
 
     @Watch('focused')

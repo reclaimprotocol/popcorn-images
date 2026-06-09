@@ -33,6 +33,12 @@ type UpstreamManager struct {
 
 	currentURL atomic.Value // string
 
+	// touchEmulated tracks whether mobile/touch emulation is currently active.
+	// Set by EmulateDeviceHandler when /cdp/emulate-device is called; read by
+	// /computer/scroll to choose a touch-drag swipe over wheel ticks without a
+	// per-scroll CDP probe.
+	touchEmulated atomic.Bool
+
 	startOnce  sync.Once
 	stopOnce   sync.Once
 	cancelTail context.CancelFunc
@@ -84,6 +90,14 @@ func (u *UpstreamManager) Current() string {
 	val, _ := u.currentURL.Load().(string)
 	return val
 }
+
+// SetTouchEmulated records whether touch/mobile emulation is active. Called by
+// EmulateDeviceHandler after applying the Emulation.* overrides.
+func (u *UpstreamManager) SetTouchEmulated(on bool) { u.touchEmulated.Store(on) }
+
+// TouchEmulated reports the last touch-emulation state recorded via
+// SetTouchEmulated. False until the first /cdp/emulate-device call.
+func (u *UpstreamManager) TouchEmulated() bool { return u.touchEmulated.Load() }
 
 func (u *UpstreamManager) setCurrent(url string) {
 	prev := u.Current()

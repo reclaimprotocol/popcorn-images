@@ -8,6 +8,7 @@ import (
 
 	"github.com/onkernel/kernel-images/server/cmd/api/api/browser"
 	"github.com/onkernel/kernel-images/server/lib/logger"
+	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
 )
 
 // Browser-events HTTP endpoints. These are registered directly on the chi
@@ -167,6 +168,16 @@ func (s *ApiService) HandleSessionStart(w http.ResponseWriter, r *http.Request) 
 		log.Error("session start failed", "err", err)
 		respondJSONError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// Hide the cursor by default unless disabled via config. Best-effort:
+	// a failure here must not fail session start.
+	if s.config.HideCursorDefault {
+		s.inputMu.Lock()
+		if err := s.doSetCursor(ctx, oapi.SetCursorRequest{Hidden: true}); err != nil {
+			log.Warn("hide cursor on session start failed", "err", err)
+		}
+		s.inputMu.Unlock()
 	}
 
 	// Best-effort current url/title snapshot.

@@ -56,6 +56,18 @@ func (s *Session) CurrentTitle(ctx context.Context) (string, error) {
 	return s.cdp.EvaluateString(ctx, "document.title")
 }
 
+// TouchEmulated reports whether the page currently has touch emulation active
+// (navigator.maxTouchPoints > 0). The magnify script (cdp-magnify.sh) and the
+// /cdp/emulate-device handler both enable it via Emulation.setTouchEmulation-
+// Enabled when switching the page to a mobile viewport. Best-effort: returns
+// false when no CDP session is attached.
+func (s *Session) TouchEmulated(ctx context.Context) (bool, error) {
+	if s.cdp == nil {
+		return false, nil
+	}
+	return s.cdp.EvaluateBool(ctx, "navigator.maxTouchPoints > 0")
+}
+
 // UpstreamCurrenter is the subset of *devtoolsproxy.UpstreamManager the manager
 // needs to find the live CDP URL.
 type UpstreamCurrenter interface {

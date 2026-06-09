@@ -130,18 +130,31 @@ func EmulateDeviceHandler(mgr *UpstreamManager, logger *slog.Logger) http.Handle
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
+		// CDP's setDeviceMetricsOverride defaults deviceScaleFactor and scale to
+		// 1. Sending 0 (the zero value when the client omits them) mis-scales
+		// the render — the page lays out at the right viewport but paints at the
+		// wrong size, so the client crop shows only a fraction of it. Default
+		// both to 1 and only include scale when explicitly set (>0), matching
+		// the known-good cdp-magnify.sh which omits scale entirely.
+		dsf := req.DeviceScaleFactor
+		if dsf <= 0 {
+			dsf = 1
+		}
+		metrics := map[string]any{
+			"width":             req.Width,
+			"height":            req.Height,
+			"deviceScaleFactor": dsf,
+			"mobile":            req.Mobile,
+			"screenWidth":       req.Width,
+			"screenHeight":      req.Height,
+		}
+		if req.Scale > 0 {
+			metrics["scale"] = req.Scale
+		}
 		commands := []cdpCommand{
 			{
 				Method: "Emulation.setDeviceMetricsOverride",
-				Params: map[string]any{
-					"width":             req.Width,
-					"height":            req.Height,
-					"deviceScaleFactor": req.DeviceScaleFactor,
-					"mobile":            req.Mobile,
-					"scale":             req.Scale,
-					"screenWidth":       req.Width,
-					"screenHeight":      req.Height,
-				},
+				Params: metrics,
 			},
 			{
 				Method: "Emulation.setTouchEmulationEnabled",
@@ -163,6 +176,10 @@ func EmulateDeviceHandler(mgr *UpstreamManager, logger *slog.Logger) http.Handle
 			http.Error(w, "emulation failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		// Record touch state so /computer/scroll can pick a touch-drag swipe
+		// over wheel ticks without probing the page on every scroll.
+		mgr.SetTouchEmulated(req.Touch)
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))

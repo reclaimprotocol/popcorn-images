@@ -559,6 +559,43 @@ func (s *ApiService) SetCursor(ctx context.Context, request oapi.SetCursorReques
 	return oapi.SetCursor200JSONResponse{Ok: true}, nil
 }
 
+// StartCursorHide hides the cursor at boot when HIDE_CURSOR_DEFAULT is set,
+// independent of any browser session — the neko live view never calls
+// /session/start, so the per-session hide wouldn't cover it. Runs in the
+// background: waits for the X display to come up, then starts unclutter once.
+func (s *ApiService) StartCursorHide(ctx context.Context) {
+	if !s.config.HideCursorDefault {
+		return
+	}
+	go func() {
+		log := logger.FromContext(ctx)
+		// unclutter needs a live DISPLAY — wait for the X server before hiding.
+		ready := false
+		for i := 0; i < 30; i++ {
+			if _, _, _, err := s.getCurrentResolution(ctx); err == nil {
+				ready = true
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+		if !ready {
+			log.Warn("startup cursor hide skipped: X display not ready")
+			return
+		}
+		s.inputMu.Lock()
+		defer s.inputMu.Unlock()
+		if err := s.doSetCursor(ctx, oapi.SetCursorRequest{Hidden: true}); err != nil {
+			log.Warn("startup cursor hide failed", "err", err)
+			return
+		}
+		log.Info("cursor hidden at startup (HIDE_CURSOR_DEFAULT)")
+	}()
+}
+
 // parseMousePosition parses xdotool getmouselocation --shell output.
 // Expected format:
 //
@@ -748,6 +785,61 @@ func (s *ApiService) PressKey(ctx context.Context, request oapi.PressKeyRequestO
 	return oapi.PressKey200Response{}, nil
 }
 
+const (
+	// touchScrollPixelsPerUnit converts a scroll-request delta (a wheel-tick
+	// count) into pixels of swipe travel when scrolling a touch/mobile page.
+	touchScrollPixelsPerUnit = 100
+
+	// touchScrollStepPixels caps the distance of each intermediate move so the
+	// gesture registers as a smooth swipe rather than a fling or a tap.
+	touchScrollStepPixels = 20
+
+	// touchScrollStepDelay is the pause (xdotool sleep, in seconds) between
+	// intermediate moves of the swipe.
+	touchScrollStepDelay = "0.008"
+)
+
+// appendTouchDrag appends an xdotool command chain that performs a single
+// press-drag-release swipe starting at (startX,startY) and travelling
+// (dxTotal,dyTotal) screen pixels. The travel is broken into ~touchScrollStep-
+// Pixels steps with a short sleep between each so Chromium's touch emulation
+// reads it as a touchmove sequence. With touch emulation enabled the OS-level
+// pointer drag is converted into touchstart/touchmove/touchend events.
+func appendTouchDrag(args []string, startX, startY, dxTotal, dyTotal int) []string {
+	args = append(args, "mousemove", strconv.Itoa(startX), strconv.Itoa(startY), "mousedown", "1")
+
+	mag := dyTotal
+	if mag < 0 {
+		mag = -mag
+	}
+	if mx := dxTotal; mx < 0 && -mx > mag {
+		mag = -mx
+	} else if mx > mag {
+		mag = mx
+	}
+	steps := mag / touchScrollStepPixels
+	if steps < 1 {
+		steps = 1
+	}
+
+	// Distribute travel evenly across steps using cumulative rounding so the
+	// increments sum exactly to (dxTotal,dyTotal) with no drift.
+	for i := 1; i <= steps; i++ {
+		prevX := dxTotal * (i - 1) / steps
+		prevY := dyTotal * (i - 1) / steps
+		curX := dxTotal * i / steps
+		curY := dyTotal * i / steps
+		args = append(args,
+			"mousemove_relative", "--sync", "--",
+			strconv.Itoa(curX-prevX), strconv.Itoa(curY-prevY),
+			"sleep", touchScrollStepDelay,
+		)
+	}
+
+	args = append(args, "mouseup", "1")
+	return args
+}
+
 func (s *ApiService) doScroll(ctx context.Context, body oapi.ScrollRequest) error {
 	log := logger.FromContext(ctx)
 
@@ -769,33 +861,68 @@ func (s *ApiService) doScroll(ctx context.Context, body oapi.ScrollRequest) erro
 		return &validationError{msg: fmt.Sprintf("coordinates exceed screen bounds (max: %dx%d)", screenWidth-1, screenHeight-1)}
 	}
 
+	// On mobile/touch-emulated pages wheel events are usually ignored — the
+	// page only scrolls in response to touch. Detect that and emit an xdotool
+	// touch-drag swipe instead of wheel ticks; Chromium's touch emulation turns
+	// the OS pointer drag into touchstart/touchmove/touchend. The scroll itself
+	// always stays on the xdotool/X11 path.
+	//
+	// Primary signal is the cached state set when /cdp/emulate-device ran (no
+	// per-scroll CDP round-trip). Fallback to a one-off page probe for magnify
+	// applied out-of-band — cdp-magnify.sh talks to the internal CDP router
+	// directly and bypasses /cdp/emulate-device.
+	touch := s.upstreamMgr.TouchEmulated()
+	if !touch {
+		if sess := s.browser.Get(); sess != nil {
+			if t, err := sess.TouchEmulated(ctx); err != nil {
+				log.Warn("touch-emulation probe failed; using wheel scroll", "err", err)
+			} else {
+				touch = t
+			}
+		}
+	}
+
 	args := []string{}
 	if body.HoldKeys != nil {
 		for _, key := range *body.HoldKeys {
 			args = append(args, "keydown", key)
 		}
 	}
-	args = append(args, "mousemove", strconv.Itoa(body.X), strconv.Itoa(body.Y))
 
-	// Apply vertical ticks first (sequential as specified)
-	if body.DeltaY != nil && *body.DeltaY != 0 {
-		count := *body.DeltaY
-		btn := "5" // down
-		if count < 0 {
-			btn = "4" // up
-			count = -count
+	if touch {
+		// Direction is inverted vs. a wheel: to scroll content down
+		// (delta_y>0) the finger swipes up (negative screen dy); to scroll
+		// right (delta_x>0) the finger swipes left (negative screen dx).
+		// Vertical first, then horizontal — matching the wheel ordering.
+		if body.DeltaY != nil && *body.DeltaY != 0 {
+			args = appendTouchDrag(args, body.X, body.Y, 0, -*body.DeltaY*touchScrollPixelsPerUnit)
 		}
-		args = append(args, "click", "--repeat", strconv.Itoa(count), "--delay", "0", btn)
-	}
-	// Then horizontal ticks
-	if body.DeltaX != nil && *body.DeltaX != 0 {
-		count := *body.DeltaX
-		btn := "7" // right
-		if count < 0 {
-			btn = "6" // left
-			count = -count
+		if body.DeltaX != nil && *body.DeltaX != 0 {
+			args = appendTouchDrag(args, body.X, body.Y, -*body.DeltaX*touchScrollPixelsPerUnit, 0)
 		}
-		args = append(args, "click", "--repeat", strconv.Itoa(count), "--delay", "0", btn)
+	} else {
+		args = append(args, "mousemove", strconv.Itoa(body.X), strconv.Itoa(body.Y))
+
+		// Apply vertical ticks first (sequential as specified)
+		if body.DeltaY != nil && *body.DeltaY != 0 {
+			count := *body.DeltaY
+			btn := "5" // down
+			if count < 0 {
+				btn = "4" // up
+				count = -count
+			}
+			args = append(args, "click", "--repeat", strconv.Itoa(count), "--delay", "0", btn)
+		}
+		// Then horizontal ticks
+		if body.DeltaX != nil && *body.DeltaX != 0 {
+			count := *body.DeltaX
+			btn := "7" // right
+			if count < 0 {
+				btn = "6" // left
+				count = -count
+			}
+			args = append(args, "click", "--repeat", strconv.Itoa(count), "--delay", "0", btn)
+		}
 	}
 
 	if body.HoldKeys != nil {
