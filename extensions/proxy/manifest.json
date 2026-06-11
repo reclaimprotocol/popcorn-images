@@ -16,15 +16,17 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
+      "js": ["injected.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_start",
-      "all_frames": true
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["injected.js"],
-      "matches": ["<all_urls>"]
+      "all_frames": true,
+      "world": "ISOLATED"
     }
   ]
 }

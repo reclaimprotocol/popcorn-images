@@ -4,13 +4,14 @@
 (function() {
   'use strict';
 
-  // Inject the page-level script
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('injected.js');
-  script.onload = function() {
-    this.remove();
-  };
-  (document.head || document.documentElement).appendChild(script);
+  // injected.js runs as a MAIN-world content script (see manifest.json), so
+  // there's no script-tag injection here. Injecting via
+  // <script src="chrome-extension://<id>/injected.js"> + a web_accessible_
+  // resource is a stealth leak: an early MutationObserver sees the
+  // chrome-extension:// URL, and any page can fetch the resource to confirm
+  // the extension and its ID. The MAIN-world content-script path leaves no
+  // such trace. This ISOLATED-world script is just the message bridge to the
+  // background service worker (MAIN world has no chrome.runtime access).
 
   // Listen for messages from the injected script
   window.addEventListener('message', async (event) => {

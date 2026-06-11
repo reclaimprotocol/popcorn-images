@@ -128,7 +128,15 @@ func (s *ApiService) executeReclaimProve(ctx context.Context, providerParamsJSON
 		return nil, fmt.Errorf("invalid provider parameters: %w", err)
 	}
 
-	proofCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// Cap the attempt at TEEProofTimeout (default 30s). reclaim-tee's own core
+	// timeout is a hardcoded 60s it can stall against (e.g. a proxied fetch that
+	// captures the response but never finalizes); we give up sooner so a stuck
+	// proof returns a FAILED claim fast instead of blocking the session ~60s.
+	proofTimeout := s.config.TEEProofTimeout
+	if proofTimeout <= 0 {
+		proofTimeout = 30 * time.Second
+	}
+	proofCtx, cancel := context.WithTimeout(ctx, proofTimeout)
 	defer cancel()
 
 	type result struct {
@@ -163,7 +171,7 @@ func (s *ApiService) executeReclaimProve(ctx context.Context, providerParamsJSON
 			}
 			reclaimClient.Close()
 		}()
-		return nil, fmt.Errorf("proof execution timed out")
+		return nil, fmt.Errorf("proof execution timed out after %s", proofTimeout)
 	case res := <-resultCh:
 		reclaimClient.Close()
 		if res.err != nil {

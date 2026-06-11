@@ -13,11 +13,12 @@ import (
 	"github.com/onkernel/kernel-images/server/cmd/config"
 	"github.com/onkernel/kernel-images/server/lib/cdpclient"
 	"github.com/onkernel/kernel-images/server/lib/devtoolsproxy"
+	"github.com/onkernel/kernel-images/server/lib/egressproxy"
 	"github.com/onkernel/kernel-images/server/lib/logger"
 	"github.com/onkernel/kernel-images/server/lib/nekoclient"
 	oapi "github.com/onkernel/kernel-images/server/lib/oapi"
-	"github.com/onkernel/kernel-images/server/lib/reclaimbackend"
 	"github.com/onkernel/kernel-images/server/lib/policy"
+	"github.com/onkernel/kernel-images/server/lib/reclaimbackend"
 	"github.com/onkernel/kernel-images/server/lib/recorder"
 	"github.com/onkernel/kernel-images/server/lib/scaletozero"
 )
@@ -118,7 +119,37 @@ func New(cfg *config.Config, recordManager recorder.RecordManager, factory recor
 	// construction. The reporter forwards browser status transitions to the
 	// backend's updateSession (best-effort; never blocks the session).
 	svc.browser = browser.NewManager(upstreamMgr, cdpclient.Dial, svc.browserProver, svc.reportSessionStatus)
+	svc.browser.SetProxyResolver(svc.resolveEgressProxy)
 	return svc, nil
+}
+
+// resolveEgressProxy resolves the per-session egress proxy from the shared
+// HTTPS_PROXY_URL template (the same env reclaim-tee reads), composing the
+// sticky-session username keyed by sessionID so the browser shares the TEE
+// proof's exit IP. Returns nil when no proxy is configured. geoLocation falls
+// back to the portal default "IN" (matching reclaim_claim.go) so the
+// {{geoLocation}} placeholder always resolves to a valid ISO-2 code.
+func (s *ApiService) resolveEgressProxy(geoLocation, sessionID string) *browser.ProxyConfig {
+	// Resolve geoLocation to a real country. Providers ship unresolved
+	// placeholders like "{{DYNAMIC_GEO}}" (the TEE/proxy can't expand them);
+	// anything that isn't a valid ISO-2 code falls back to ProxyDefaultCountry,
+	// which is empty by default → skip the proxy (egress direct) rather than
+	// guess a country.
+	geo := egressproxy.NormalizeCountry(geoLocation, s.config.ProxyDefaultCountry)
+	if geo == "" {
+		return nil
+	}
+	p, err := egressproxy.Parse(s.config.HTTPSProxyURL, geo)
+	if err != nil || p == nil {
+		return nil
+	}
+	return &browser.ProxyConfig{
+		Scheme:   p.Scheme,
+		Host:     p.Host,
+		Port:     p.Port,
+		Username: p.SessionUsername(sessionID),
+		Password: p.Password,
+	}
 }
 
 // reportSessionStatus forwards a browser session-status transition to the

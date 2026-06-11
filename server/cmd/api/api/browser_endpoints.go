@@ -33,10 +33,14 @@ type providerConfigDTO struct {
 	// accept either and ignore it for now (not yet applied in-image).
 	UserAgent       json.RawMessage `json:"userAgent"`
 	Viewport        *viewportDTO    `json:"viewport"`
-	InjectionType   string       `json:"injectionType"`
-	CustomInjection string       `json:"customInjection"`
-	LogLevel        string       `json:"logLevel"`
-	GeoLocation     string       `json:"geoLocation"`
+	InjectionType   string          `json:"injectionType"`
+	CustomInjection string          `json:"customInjection"`
+	LogLevel        string          `json:"logLevel"`
+	GeoLocation     string          `json:"geoLocation"`
+	// UseProxy toggles egress proxying for the session. Independent of
+	// GeoLocation (a config can set useProxy=true with geoLocation="" → proxy
+	// on, default region). When false the browser egresses directly.
+	UseProxy bool `json:"useProxy"`
 	// Device descriptors (the gateway merges these into provider config from the
 	// client request; present on a backend-fetched config too when set).
 	DeviceID        string `json:"deviceId"`
@@ -62,8 +66,8 @@ type sessionStartResult struct {
 // sessionActionRequest accepts both the nested {type, payload:{...}} form and a
 // flat {type, ...fields} form (the portal worker read `action.payload || action`).
 type sessionActionRequest struct {
-	Type    string             `json:"type"`
-	Payload *actionPayloadDTO  `json:"payload"`
+	Type    string            `json:"type"`
+	Payload *actionPayloadDTO `json:"payload"`
 	actionPayloadDTO
 }
 
@@ -92,13 +96,16 @@ func (dto *providerConfigDTO) toProviderConfig() *browser.ProviderConfig {
 		CustomInjection: dto.CustomInjection,
 		LogLevel:        dto.LogLevel,
 		GeoLocation:     dto.GeoLocation,
+		UseProxy:        dto.UseProxy,
 		RequestData:     dto.RequestData,
 	}
-	// Propagate provider-level geoLocation to matchers that don't set one.
+	// Propagate provider-level geoLocation + useProxy down to each matcher so
+	// the proof path can decide attestor proxy egress per request.
 	for i := range pc.RequestData {
 		if pc.RequestData[i].GeoLocation == "" {
 			pc.RequestData[i].GeoLocation = pc.GeoLocation
 		}
+		pc.RequestData[i].UseProxy = pc.UseProxy
 	}
 	// userAgent is intentionally not applied yet (accepted but ignored).
 	if v := dto.Viewport; v != nil {

@@ -86,6 +86,9 @@ type Manager struct {
 	prover   Prover
 	bus      *eventBus
 	reporter StatusReporter // optional; nil disables backend status reporting
+	// resolveProxy resolves the per-session egress proxy (nil => direct egress).
+	// Optional; a nil resolver disables browser-side proxying entirely.
+	resolveProxy ProxyResolver
 }
 
 // NewManager constructs a Manager over a DevTools upstream, a CDP dialer, an
@@ -94,6 +97,10 @@ type Manager struct {
 func NewManager(upstream UpstreamCurrenter, dial DialFunc, prover Prover, reporter StatusReporter) *Manager {
 	return &Manager{upstream: upstream, dial: dial, prover: prover, bus: newEventBus(), reporter: reporter}
 }
+
+// SetProxyResolver injects the egress-proxy resolver (package api owns it, since
+// it needs config.HTTPSProxyURL + lib/egressproxy). Call once at startup.
+func (m *Manager) SetProxyResolver(r ProxyResolver) { m.resolveProxy = r }
 
 // AddClaim records a completed proof result.
 func (m *Manager) AddClaim(c *ClaimResult) {

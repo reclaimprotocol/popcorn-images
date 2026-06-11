@@ -24,7 +24,9 @@
 #   -t <seconds>       max time to wait for proofs (env TIMEOUT, default 180)
 #   --skip-tests       skip the docker unit tests
 #   --skip-preview     skip the docker backend preview
+#   --skip-proxy-check skip the post-proof egress IP check
 #   --keep             do NOT close the session on exit
+#   PROXY_CHECK_URL    IP-echo for the egress check (env, default geo.brdtest.com/mygeo.json)
 #
 # Requires: curl, jq. (docker only for the test/preview steps.)
 set -uo pipefail
@@ -32,9 +34,13 @@ set -uo pipefail
 BASE_URL="${BASE_URL:-http://127.0.0.1:444}"
 BACKEND_URL="${RECLAIM_BACKEND_URL:-}"
 TIMEOUT="${TIMEOUT:-180}"
+# IP-echo used by the proxy egress check. Defaults to BrightData's geo endpoint
+# (returns country/city/asn); any JSON IP-echo works.
+PROXY_CHECK_URL="${PROXY_CHECK_URL:-https://geo.brdtest.com/mygeo.json}"
 SESSION_ID=""
 SKIP_TESTS=0
 SKIP_PREVIEW=0
+SKIP_PROXY_CHECK=0
 KEEP=0
 
 # --- arg parsing (supports long flags + a bare positional session id) --------
@@ -47,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     -t) TIMEOUT="$2"; shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-preview) SKIP_PREVIEW=1; shift ;;
+    --skip-proxy-check) SKIP_PROXY_CHECK=1; shift ;;
     --keep) KEEP=1; shift ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
@@ -66,6 +73,48 @@ DOCKER_RUN=(docker run --rm
   -w /src golang:1.26)
 
 hr() { printf '\n=== %s ===\n' "$*"; }
+
+# proxy_egress_check drives the LIVE session to an IP-echo URL and prints the
+# exit IP/geo the browser actually used, next to the host's direct IP. If they
+# differ, the session is proxied; if identical, it egressed direct (proxy off,
+# or useProxy=true but the proxy failed to apply — check the container logs for
+# "egress proxy" / "Fetch enabled for proxy auth"). Provider-agnostic ground
+# truth — does not trust cf-ray (cached) or any header.
+proxy_egress_check() {
+  local url="$1"
+  hr "4.5/5 proxy egress check ($url)"
+  local body_file; body_file="$(mktemp)"
+  # Capture the network-response body for the echo URL off a short-lived stream.
+  ( curl -N --max-time 25 "$BASE_URL/session/events" 2>/dev/null \
+    | while IFS= read -r line; do
+        [[ "$line" == data:* ]] || continue
+        b=$(printf '%s' "${line#data: }" \
+          | jq -r --arg u "$url" 'select(.event=="network-response" and (.data.url|startswith($u))) | .data.response_body // empty' 2>/dev/null)
+        [[ -n "$b" ]] && { printf '%s' "$b" > "$body_file"; break; }
+      done ) &
+  local cap=$!
+  sleep 1
+  curl -sS -m 30 -X POST "$BASE_URL/session/action" -H 'Content-Type: application/json' \
+    -d "{\"type\":\"navigate\",\"url\":\"$url\"}" >/dev/null 2>&1
+  for _ in $(seq 1 20); do [[ -s "$body_file" ]] && break; sleep 1; done
+  kill "$cap" 2>/dev/null; wait "$cap" 2>/dev/null || true
+
+  local summarize='{country: (.country // .country_code), city: (.geo.city // .city), asn: (.asn.org_name // .org // .asn), ip: (.ip // .ip_address // .origin)}'
+  if [[ -s "$body_file" ]]; then
+    echo "  session egress (through the browser):"
+    jq -c "$summarize" "$body_file" 2>/dev/null | sed 's/^/    /' || sed 's/^/    (raw) /' "$body_file"
+  else
+    echo "  (no response captured for $url within timeout — is the session still open?)"
+  fi
+  rm -f "$body_file"
+
+  local host_body; host_body="$(curl -s -m 10 "$url" 2>/dev/null)"
+  if [[ -n "$host_body" ]]; then
+    echo "  host egress (direct, for comparison):"
+    printf '%s' "$host_body" | jq -c "$summarize" 2>/dev/null | sed 's/^/    /'
+  fi
+  echo "  → differ ⇒ proxied; identical ⇒ direct."
+}
 
 # --- 1. unit tests -----------------------------------------------------------
 if [[ "$SKIP_TESTS" == "0" ]]; then
@@ -160,4 +209,10 @@ done
 
 kill "$STREAM_PID" 2>/dev/null
 wait "$STREAM_PID" 2>/dev/null || true
+
+# --- 4.5 proxy egress check (ground-truth the exit IP) -----------------------
+if [[ "$SKIP_PROXY_CHECK" == "0" ]]; then
+  proxy_egress_check "$PROXY_CHECK_URL"
+fi
+
 # finish() runs on EXIT (prints claims + closes).

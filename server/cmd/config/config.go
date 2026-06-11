@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 )
@@ -50,6 +51,32 @@ type Config struct {
 	// updates, feature flags, and proof callback submission. Auth is via the
 	// X-Reclaim-Session-Id header only (no app secret in the image).
 	ReclaimBackendURL string `envconfig:"RECLAIM_BACKEND_URL" default:"https://api.reclaimprotocol.org"`
+
+	// HTTPSProxyURL is the egress-proxy URL *template* shared by the TEE proof
+	// and the browser. reclaim-tee reads the same HTTPS_PROXY_URL env directly
+	// (shared.GetHTTPSProxyURL) and dials the target through it; we also parse
+	// it here so the browser session can egress through the SAME proxy + sticky
+	// session, giving both halves one exit IP. Must contain the {{geoLocation}}
+	// placeholder, e.g.
+	//   http://brd-customer-XXX-zone-YYY-country-{{geoLocation}}:PASS@brd.superproxy.io:33335
+	// reclaim-tee substitutes {{geoLocation}} (lowercase ISO-2) and appends
+	// "-session-<requestId>" to the username. Empty disables proxying.
+	HTTPSProxyURL string `envconfig:"HTTPS_PROXY_URL" default:""`
+
+	// TEEProofTimeout caps a single reclaim-tee proof attempt. reclaim-tee's own
+	// "core TEE protocol" timeout is hardcoded at 60s and can stall there (e.g.
+	// a proxied fetch that captures the response but never finalizes), so we
+	// enforce a shorter deadline here: when it elapses, the attempt is abandoned
+	// and a FAILED claim (with the assembled claim request + error) is returned
+	// immediately, instead of blocking the session for the full 60s. Default 30s.
+	TEEProofTimeout time.Duration `envconfig:"TEE_PROOF_TIMEOUT" default:"30s"`
+
+	// ProxyDefaultCountry is an OPTIONAL ISO-3166-1 alpha-2 fallback for when a
+	// provider's geoLocation isn't a usable country code — empty, or an
+	// unresolved placeholder like "{{DYNAMIC_GEO}}". Default is empty, which
+	// means SKIP proxying in that case (browser + TEE egress direct) rather than
+	// guessing a country. Set it (e.g. "IN") to force a fallback country instead.
+	ProxyDefaultCountry string `envconfig:"PROXY_DEFAULT_COUNTRY" default:""`
 }
 
 // Load loads configuration from environment variables

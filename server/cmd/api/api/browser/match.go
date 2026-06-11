@@ -20,14 +20,40 @@ var bodyTmplVar = regexp.MustCompile(`\{\{.*?\}\}`)
 func matchesURL(m RequestMatcher, url string, knownParams map[string]string) bool {
 	switch strings.ToUpper(m.URLType) {
 	case "EXACT", "CONSTANT":
-		return url == m.URL
+		return canonicalizeMatchURL(url) == canonicalizeMatchURL(m.URL)
 	case "REGEX":
+		// REGEX patterns use `?`/`/` as metacharacters, so don't canonicalize the
+		// pattern; only the captured URL is already browser-canonical.
 		re, err := regexp.Compile("(?s)^" + m.URL + "$")
 		return err == nil && re.MatchString(url)
 	default: // TEMPLATE or unspecified
-		re, err := templateToRegex(m.URL, knownParams)
-		return err == nil && re.MatchString(url)
+		re, err := templateToRegex(canonicalizeMatchURL(m.URL), knownParams)
+		return err == nil && re.MatchString(canonicalizeMatchURL(url))
 	}
+}
+
+// canonicalizeMatchURL inserts the implicit "/" between the authority and the
+// query/fragment when a provider writes a path-less URL like
+// "https://api.ipify.org?format=json". Browsers (and the WHATWG URL spec) emit
+// "https://api.ipify.org/?format=json" for the same fetch, so without this the
+// matcher's literal "?" sits right after the host and never matches the
+// captured request. Only the host→(?|#) boundary is touched; URLs that already
+// have a path are returned unchanged. Not applied to REGEX matchers.
+func canonicalizeMatchURL(s string) string {
+	i := strings.Index(s, "://")
+	if i < 0 {
+		return s
+	}
+	authStart := i + 3
+	rest := s[authStart:]
+	j := strings.IndexAny(rest, "/?#")
+	if j < 0 {
+		return s + "/" // bare scheme://host → scheme://host/
+	}
+	if rest[j] == '/' {
+		return s // already has a path
+	}
+	return s[:authStart+j] + "/" + rest[j:] // insert "/" before ? or #
 }
 
 // templateToRegex converts a {{var}} template into an anchored regex. Known

@@ -42,6 +42,7 @@ type ProviderConfig struct {
 	CustomInjection string    `json:"customInjection,omitempty"` // Phase 5
 	LogLevel        string    `json:"logLevel,omitempty"`
 	GeoLocation     string    `json:"geoLocation,omitempty"` // provider-level geo (proxy region for the proof fetch)
+	UseProxy        bool      `json:"useProxy,omitempty"`    // toggle egress proxying; geo region comes from GeoLocation (empty = default)
 
 	// RequestData lists the requests to match + prove. Empty means no proof
 	// attempts (capture-only) — the default, so existing flows are unaffected.
@@ -70,8 +71,13 @@ type RequestMatcher struct {
 	ResponseRedactions json.RawMessage `json:"responseRedactions,omitempty"`
 	// ResponseVariables names the variables (in redaction order) for redactions
 	// whose regex has no named group — used to key extracted paramValues.
-	ResponseVariables  []string   `json:"responseVariables,omitempty"`
-	GeoLocation        string     `json:"geoLocation,omitempty"`
+	ResponseVariables []string `json:"responseVariables,omitempty"`
+	GeoLocation       string   `json:"geoLocation,omitempty"`
+	// UseProxy is propagated from the provider-level ProviderConfig.UseProxy so
+	// the proof path can decide whether the attestor fetches through a proxy.
+	// When false, no geoLocation is sent (attestor fetches directly); when true,
+	// GeoLocation (or the default region) selects the attestor proxy egress.
+	UseProxy           bool       `json:"useProxy,omitempty"`
 	WriteRedactionMode string     `json:"writeRedactionMode,omitempty"` // zk|keyUpdate
 	Context            string     `json:"context,omitempty"`            // provider-supplied context string
 	BodySniff          *BodySniff `json:"bodySniff,omitempty"`

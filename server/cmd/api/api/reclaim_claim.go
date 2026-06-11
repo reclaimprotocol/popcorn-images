@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/onkernel/kernel-images/server/cmd/api/api/browser"
+	"github.com/onkernel/kernel-images/server/lib/egressproxy"
 	"github.com/reclaimprotocol/reclaim-tee/client"
 	"github.com/reclaimprotocol/reclaim-tee/providers"
 )
@@ -137,16 +138,26 @@ func (s *ApiService) buildBrowserProviderParams(m browser.RequestMatcher, captur
 	case strings.EqualFold(method, "POST") && captured.RequestBody != "":
 		body = captured.RequestBody
 	}
-	geo := m.GeoLocation
-	if geo == "" {
-		geo = "IN" // portal default; override via provider_config.geoLocation
+	// Proxy egress for the proof mirrors the browser: only when the provider
+	// enables it (useProxy). The attestor proxies the witness fetch through the
+	// region named by geoLocation, so we send geoLocation ONLY when useProxy is
+	// on (defaulting to the portal "IN" region when the provider didn't pin
+	// one). When useProxy is off, geoLocation is omitted entirely and the
+	// attestor fetches directly — matching the browser running without a proxy.
+	// Resolve geoLocation the same way the portal does (matcher geo → provider
+	// geo → default): m.GeoLocation already carries matcher-or-provider geo, and
+	// NormalizeCountry collapses unresolved placeholders like "{{DYNAMIC_GEO}}"
+	// (which reclaim-tee's validateGeoLocation would reject) to a real ISO-2
+	// country. The TEE cannot expand the template at proof time, so we must.
+	geo := ""
+	if m.UseProxy {
+		geo = egressproxy.NormalizeCountry(m.GeoLocation, s.config.ProxyDefaultCountry)
 	}
 
 	// fullParams is the complete (portal buildClaimObject) param set, including
 	// proxySessionId / public headers / writeRedactionMode. This is kept for the
 	// claimRequest returned on failure (e.g. client-side attestor retry).
 	fullParams := map[string]any{
-		"geoLocation":             geo,
 		"proxySessionId":          requestID,
 		"url":                     claimURL,
 		"method":                  method,
@@ -156,6 +167,12 @@ func (s *ApiService) buildBrowserProviderParams(m browser.RequestMatcher, captur
 		"responseMatches":         matches,
 		"paramValues":             publicParamValues,
 		"additionalClientOptions": map[string]any{},
+	}
+	// Only include geoLocation when proxying — an empty value would still route
+	// the attestor through a (default) proxy on some schema versions, defeating
+	// the toggle.
+	if geo != "" {
+		fullParams["geoLocation"] = geo
 	}
 	if m.WriteRedactionMode != "" {
 		fullParams["writeRedactionMode"] = m.WriteRedactionMode

@@ -71,6 +71,24 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 	if sid == "" {
 		sid = uuid.NewString()
 	}
+
+	// Egress proxy. Resolve the per-session proxy (host:port + sticky-session
+	// credentials keyed by sid, so the browser shares the TEE proof's exit IP)
+	// and point the proxy extension at it — or clear it — BEFORE any navigation,
+	// so the login page loads through the proxied IP. useProxy gates engagement;
+	// we always reconcile (set or clear) so a prior session's proxy can't leak
+	// into a useProxy=false session on the same persistent chromium. Auth is
+	// answered later via CDP Fetch.authRequired (see netcapture).
+	var proxyCfg *ProxyConfig
+	if m.resolveProxy != nil {
+		if cfg.ProviderConfig.UseProxy {
+			proxyCfg = m.resolveProxy(cfg.ProviderConfig.GeoLocation, sid)
+		}
+		if err := applyExtensionProxy(ctx, client, proxyCfg); err != nil {
+			log.Warn("apply egress proxy failed (continuing direct)", "err", err, "use_proxy", cfg.ProviderConfig.UseProxy)
+		}
+	}
+
 	now := time.Now()
 	sess := &Session{
 		SessionID:    sid,
@@ -106,6 +124,9 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 	m.capture = newNetCapture(m.upstream, log, sess.SessionID, m.bus.publish,
 		cfg.ProviderConfig.RequestData, prover, m.AddClaim,
 		cfg.ProviderConfig.CustomInjection != "", report)
+	// Hand the resolved proxy to capture so its CDP loop enables Fetch and
+	// answers the proxy 407 with the session's credentials.
+	m.capture.proxy = proxyCfg
 	m.capture.Start()
 	m.mu.Unlock()
 

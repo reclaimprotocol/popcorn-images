@@ -77,6 +77,12 @@ type NetCapture struct {
 	// no reporter is configured).
 	report reportFunc
 
+	// proxy, when non-nil, is the egress proxy for this session. The CDP loop
+	// enables Fetch (handleAuthRequests) and answers the proxy 407 challenge
+	// with these credentials — the username carries the sticky-session suffix so
+	// the browser shares the TEE proof's exit IP. Set once before Start().
+	proxy *ProxyConfig
+
 	// proofMu guards proof dedup + outcome tracking. Dedup is per-REQUEST (a hash
 	// of method+url+cookie+body), NOT per-matcher: a failed attempt on one
 	// response (e.g. a logged-out page) must not block a later, different request
@@ -96,10 +102,10 @@ type NetCapture struct {
 	// meta holds page-derived state surfaced via status: the latest
 	// window.Reclaim publicData payload, the login interaction indicator, and
 	// the current main-frame URL.
-	metaMu        sync.Mutex
-	publicData    string
+	metaMu         sync.Mutex
+	publicData     string
 	loginIndicator string
-	currentURL    string
+	currentURL     string
 
 	cancel context.CancelFunc
 }
@@ -285,10 +291,10 @@ func (nc *NetCapture) sessionLoop(ctx context.Context) {
 	conn.SetReadLimit(netReadLimit)
 
 	var (
-		msgID    int
-		writeMu  sync.Mutex
-		pendMu   sync.Mutex
-		pending  = map[int]chan *cdpMsg{}
+		msgID   int
+		writeMu sync.Mutex
+		pendMu  sync.Mutex
+		pending = map[int]chan *cdpMsg{}
 	)
 
 	send := func(m cdpMsg) error {
@@ -305,7 +311,10 @@ func (nc *NetCapture) sessionLoop(ctx context.Context) {
 		var m cdpMsg
 		return &m, json.Unmarshal(b, &m)
 	}
-	nextID := func() int { msgID++; return msgID }
+	// nextID guards msgID under pendMu: the reader loop now allocates ids (proxy
+	// Fetch responses) concurrently with call() running on the pollPublicData
+	// goroutine, so the increment must be serialized with call()'s.
+	nextID := func() int { pendMu.Lock(); msgID++; id := msgID; pendMu.Unlock(); return id }
 
 	// call issues a command and waits for its reply (routed by the reader). It
 	// must run off the reader goroutine to avoid deadlock.
@@ -358,6 +367,22 @@ func (nc *NetCapture) sessionLoop(ctx context.Context) {
 		}
 	}
 
+	// Egress proxy auth. When a proxy is configured, enable Fetch with
+	// handleAuthRequests so the proxy 407 surfaces as Fetch.authRequired (handled
+	// in the reader loop). patterns:["*"] is required for authRequired to fire;
+	// the matching Fetch.requestPaused events are continued unmodified, so this
+	// stays an auth-only interception (Network.* capture/getResponseBody still
+	// works normally on the continued requests).
+	if nc.proxy != nil {
+		if err := send(cdpMsg{ID: nextID(), Method: "Fetch.enable",
+			Params:    json.RawMessage(`{"handleAuthRequests":true,"patterns":[{"urlPattern":"*"}]}`),
+			SessionID: pageSessionID}); err != nil {
+			nc.logger.Warn("[netcapture] Fetch.enable failed; proxy auth will not be answered", "err", err)
+		} else {
+			nc.logger.Info("[netcapture] Fetch enabled for proxy auth", "proxy_host", nc.proxy.Host)
+		}
+	}
+
 	nc.publish(newEvent(EvSessionReady, nc.sessionID, SessionReadyData{WsEndpoint: upstream}))
 	nc.logger.Info("[netcapture] capturing", "session_id", nc.sessionID, "cdp_session", pageSessionID)
 
@@ -389,6 +414,44 @@ func (nc *NetCapture) sessionLoop(ctx context.Context) {
 		}
 
 		switch m.Method {
+		case "Fetch.authRequired":
+			// Proxy 407 (or a site auth challenge). For a Proxy-source challenge
+			// answer with the session's sticky-session credentials; for any other
+			// source fall through to Default so we don't hijack site auth. Sent
+			// off-loop via send() (fire-and-forget; the browser doesn't reply with
+			// a result we need to await).
+			var p struct {
+				RequestID     string `json:"requestId"`
+				AuthChallenge struct {
+					Source string `json:"source"`
+				} `json:"authChallenge"`
+			}
+			if json.Unmarshal(m.Params, &p) != nil {
+				continue
+			}
+			var resp map[string]any
+			if nc.proxy != nil && p.AuthChallenge.Source == "Proxy" {
+				resp = map[string]any{
+					"response": "ProvideCredentials",
+					"username": nc.proxy.Username,
+					"password": nc.proxy.Password,
+				}
+			} else {
+				resp = map[string]any{"response": "Default"}
+			}
+			raw, _ := json.Marshal(map[string]any{"requestId": p.RequestID, "authChallengeResponse": resp})
+			_ = send(cdpMsg{ID: nextID(), Method: "Fetch.continueWithAuth", Params: raw, SessionID: pageSessionID})
+		case "Fetch.requestPaused":
+			// patterns:["*"] pauses every request; continue unmodified so traffic
+			// flows and Network.* capture is unaffected. (We only enabled Fetch to
+			// catch authRequired.)
+			var p struct {
+				RequestID string `json:"requestId"`
+			}
+			if json.Unmarshal(m.Params, &p) == nil && p.RequestID != "" {
+				raw, _ := json.Marshal(map[string]any{"requestId": p.RequestID})
+				_ = send(cdpMsg{ID: nextID(), Method: "Fetch.continueRequest", Params: raw, SessionID: pageSessionID})
+			}
 		case "Network.requestWillBeSent":
 			nc.onRequestWillBeSent(m.Params, inflight)
 		case "Network.responseReceived":
