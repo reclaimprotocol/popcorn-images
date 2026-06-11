@@ -862,25 +862,17 @@ func (s *ApiService) doScroll(ctx context.Context, body oapi.ScrollRequest) erro
 	}
 
 	// On mobile/touch-emulated pages wheel events are usually ignored — the
-	// page only scrolls in response to touch. Detect that and emit an xdotool
-	// touch-drag swipe instead of wheel ticks; Chromium's touch emulation turns
-	// the OS pointer drag into touchstart/touchmove/touchend. The scroll itself
-	// always stays on the xdotool/X11 path.
+	// page only scrolls in response to touch. Emit an xdotool touch-drag swipe
+	// instead of wheel ticks; Chromium's touch emulation turns the OS pointer
+	// drag into touchstart/touchmove/touchend. The scroll itself always stays on
+	// the xdotool/X11 path.
 	//
-	// Primary signal is the cached state set when /cdp/emulate-device ran (no
-	// per-scroll CDP round-trip). Fallback to a one-off page probe for magnify
-	// applied out-of-band — cdp-magnify.sh talks to the internal CDP router
-	// directly and bypasses /cdp/emulate-device.
+	// Touch state is identified client-side via the browser API and reported
+	// when the client/consumer calls /cdp/emulate-device — we just read that
+	// cached flag, so there's no per-scroll CDP round-trip from the server.
+	// (Out-of-band magnify via cdp-magnify.sh bypasses this and falls back to
+	// wheel; that's a dev tool, not the product path.)
 	touch := s.upstreamMgr.TouchEmulated()
-	if !touch {
-		if sess := s.browser.Get(); sess != nil {
-			if t, err := sess.TouchEmulated(ctx); err != nil {
-				log.Warn("touch-emulation probe failed; using wheel scroll", "err", err)
-			} else {
-				touch = t
-			}
-		}
-	}
 
 	args := []string{}
 	if body.HoldKeys != nil {

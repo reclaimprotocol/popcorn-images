@@ -281,6 +281,15 @@ func (d *InputDispatcher) session(ctx context.Context) {
 			break
 		}
 	}
+	// Prefer the active popup so keystrokes (and the WS hit-test that runs on
+	// this session) target an open popup window — otherwise typing into an
+	// OAuth login field would be dispatched to the opener and never arrive.
+	// Snapshot the generation first so a later popup open/close triggers a
+	// reconnect via the watcher goroutine below.
+	attachGen := d.mgr.InputTargetGen()
+	if popup := d.mgr.ActivePopup(); popup != "" {
+		targetID = popup
+	}
 	if targetID == "" {
 		d.logger.Warn("[InputDispatcher] no page target")
 		return
@@ -314,7 +323,26 @@ func (d *InputDispatcher) session(ctx context.Context) {
 	readyCh := d.readyCh
 	d.mu.Unlock()
 	close(readyCh)
-	d.logger.Info("[InputDispatcher] connected", "session", attRes.SessionID)
+	d.logger.Info("[InputDispatcher] connected", "session", attRes.SessionID, "target", targetID)
+
+	// Reconnect when the input target changes (popup opened/closed): cancel the
+	// connection so the read pump below returns and run() re-selects the target.
+	go func() {
+		t := time.NewTicker(150 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case <-t.C:
+				if d.mgr.InputTargetGen() != attachGen {
+					d.logger.Info("[InputDispatcher] input target changed, reconnecting")
+					connCancel()
+					return
+				}
+			}
+		}
+	}()
 
 	// 4) Read pump: route IDed responses to pending waiters, drop events.
 	for {

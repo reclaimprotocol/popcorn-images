@@ -123,6 +123,28 @@ const activeElementExpression = `
   // input is currently focused, and viewport dims drive coord transforms).
   var viewportWidth = document.documentElement ? document.documentElement.clientWidth : 0;
   var viewportHeight = document.documentElement ? document.documentElement.clientHeight : 0;
+  // True iff a tap at the input's center actually lands on it — i.e. nothing
+  // is painted on top. Without this an input occluded by an overlay (mobile
+  // nav drawer, modal, cookie banner) stays in the cache, and the client's
+  // geometric hit-test can't see z-order, so a tap on the *overlay* (e.g. a
+  // nav button sitting over a full-width search field) wrongly pops the soft
+  // keyboard. elementFromPoint returns the topmost painted node, so it gives
+  // us the z-order the rect list otherwise loses. Also drops off-screen rects
+  // (center clamped into the viewport won't resolve back to the input).
+  function isReachable(n, r) {
+    var cx = Math.min(Math.max(r.left + r.width / 2, 0), viewportWidth - 1);
+    var cy = Math.min(Math.max(r.top + r.height / 2, 0), viewportHeight - 1);
+    var top = null;
+    try { top = document.elementFromPoint(cx, cy); } catch (_) { return true; }
+    if (!top) return false;
+    if (top === n || n.contains(top)) return true;
+    // Tolerate overlay children of the same control (e.g. a search box's
+    // magnifier icon absolutely positioned over the field center): climb a
+    // few ancestors of the hit looking for the input itself.
+    var a = top;
+    for (var k = 0; a && k < 5; k++) { if (a === n) return true; a = a.parentNode; }
+    return false;
+  }
   var inputRects = [];
   try {
     var sel = 'input, textarea, [contenteditable=""], [contenteditable="true"]';
@@ -172,6 +194,9 @@ const activeElementExpression = `
       var r = null;
       try { r = n.getBoundingClientRect(); } catch (_) {}
       if (!r || r.width < 4 || r.height < 4) continue;
+      // Skip inputs hidden behind an overlay (open nav drawer, modal) or
+      // scrolled off-screen — tapping their screen coords doesn't reach them.
+      if (!isReachable(n, r)) continue;
       inputRects.push({ x: r.left, y: r.top, width: r.width, height: r.height });
     }
   } catch (_) { /* DOM unavailable */ }
@@ -307,6 +332,18 @@ type FocusTracker struct {
 
 	// pollInterval controls how often we re-evaluate the active element.
 	pollInterval time.Duration
+
+	// dialogResp carries a user's (or auto-) response to a pending JS dialog
+	// into the poll loop, which sends Page.handleJavaScriptDialog on the live
+	// session. Buffered+drop because dialogs are modal (one at a time).
+	dialogResp chan dialogResponse
+}
+
+// dialogResponse is how the dialog is dismissed: accept/cancel plus optional
+// prompt text. Fed by RespondDialog (client) or auto-accept (beforeunload).
+type dialogResponse struct {
+	accept     bool
+	promptText string
 }
 
 // NewFocusTracker creates and starts a FocusTracker. Call Stop() to shut it down.
@@ -317,11 +354,22 @@ func NewFocusTracker(mgr *UpstreamManager, logger *slog.Logger) *FocusTracker {
 		logger:       logger,
 		cancel:       cancel,
 		pollInterval: 100 * time.Millisecond,
+		dialogResp:   make(chan dialogResponse, 1),
 	}
 	// Seed with a safe default
 	ft.cached.Store(&ActiveElementResult{IsInput: false, Tag: "initializing"})
 	go ft.run(ctx)
 	return ft
+}
+
+// RespondDialog dismisses the pending JS dialog with the user's choice. Called
+// by the /cdp/dialog-respond handler; the poll loop performs the actual CDP
+// call on the session that owns the dialog.
+func (ft *FocusTracker) RespondDialog(accept bool, promptText string) {
+	select {
+	case ft.dialogResp <- dialogResponse{accept: accept, promptText: promptText}:
+	default: // a response is already queued — dialogs are modal, so drop extras
+	}
 }
 
 // CurrentState returns the most recently cached active-element state.
@@ -433,6 +481,15 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 		break
 	}
 
+	// Prefer the active popup so focus tracking (and thus the soft keyboard +
+	// input rects) follow an open popup window, e.g. an OAuth login. Snapshot
+	// the generation first so that if the popup opens/closes after this point
+	// the ticker loop notices and reconnects to the new target.
+	attachGen := ft.mgr.InputTargetGen()
+	if popup := ft.mgr.ActivePopup(); popup != "" {
+		targetID = popup
+	}
+
 	if targetID == "" {
 		ft.cached.Store(&ActiveElementResult{IsInput: false, Tag: "no-page-target"})
 		return
@@ -470,74 +527,44 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 
 	ft.logger.Info("[FocusTracker] connected, starting poll loop", "targetId", targetID, "sessionId", sessionID)
 
-	// Step 3: install Runtime.addBinding + focus listeners so the PAGE
-	// pushes focus events to us as they happen — eliminates the
-	// poll-interval staleness that caused the "keyboard pops on stale
-	// activeElement" class of bugs. The 100 ms poll loop below stays as
-	// a safety net (covers cases where the binding fails to install,
-	// the listener gets nuked by page JS, etc.).
-	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.enable", Params: json.RawMessage(`{}`), SessionID: sessionID})
+	// Step 3: enable ONLY the Page domain. We deliberately do NOT call
+	// Runtime.enable or install a Runtime.addBinding-based focus listener.
+	// Runtime.enable is the canonical CDP-detection signal: anti-bot pages
+	// (reCAPTCHA, Cloudflare, DataDome) detect it via the console-argument
+	// serialization leak — a getter on a console-logged object fires only when
+	// a debugger is serializing consoleAPICalled events — which tanks the bot
+	// score and causes "reCAPTCHA score too low"/challenge failures. Page.enable
+	// has no such leak and is needed for navigation re-emulation (loadEventFired)
+	// and JS-dialog interception, so we keep it. Focus / input-rect changes are
+	// picked up by the ~100 ms Runtime.evaluate poll below (Runtime.evaluate does
+	// NOT require Runtime.enable) — slightly higher latency than an event push,
+	// but no detectable debugger footprint.
 	_ = send(cdpMsg{ID: nextID(), Method: "Page.enable", Params: json.RawMessage(`{}`), SessionID: sessionID})
-	bindingParams, _ := json.Marshal(map[string]interface{}{"name": "popcornFocusChanged"})
-	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.addBinding", Params: bindingParams, SessionID: sessionID})
-	// listenerSource: registers focus + mutation + scroll listeners on
-	// each new document and calls popcornFocusChanged whenever something
-	// the input-rects cache cares about changes. Coalesces all signals
-	// through a 60 ms trailing debounce so a burst of DOM mutations
-	// (React commits, SPA route changes, infinite-scroll inserts) fires
-	// at most one push per debounce window.
-	listenerSource := `
-(function(){
-  if (window.__popcornFocusInstalled) return;
-  window.__popcornFocusInstalled = true;
-  var t = null;
-  function fire(kind) {
-    if (t) return;
-    t = setTimeout(function(){
-      t = null;
-      try { if (window.popcornFocusChanged) window.popcornFocusChanged(kind); } catch (_) {}
-    }, 60);
-  }
-  // Focus changes — the primary signal for keyboard pop / dismiss.
-  document.addEventListener('focusin', function(){ fire('focusin'); }, true);
-  document.addEventListener('focusout', function(){ fire('focusout'); }, true);
-  // Scroll changes shift every input's rect under our cached coords.
-  // Listening on the window catches both root and inner-scroller cases.
-  window.addEventListener('scroll', function(){ fire('scroll'); }, true);
-  // DOM mutations (input add/remove, attribute changes that affect our
-  // selectors). Subtree watching is expensive; filter attributes to
-  // just the ones we filter on so React style mutations don't trigger
-  // hundreds of pushes per second.
-  try {
-    var mo = new MutationObserver(function(){ fire('mutation'); });
-    mo.observe(document.documentElement || document, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['disabled', 'readonly', 'contenteditable',
-                        'inputmode', 'type', 'role', 'aria-haspopup',
-                        'aria-autocomplete', 'aria-hidden', 'hidden',
-                        'style', 'class']
-    });
-  } catch (_) { /* MutationObserver unavailable; fall back to poll */ }
-  // Resize too — viewport changes (orientation, address-bar collapse).
-  window.addEventListener('resize', function(){ fire('resize'); }, true);
-})();
-`
-	scriptParams, _ := json.Marshal(map[string]interface{}{"source": listenerSource})
-	_ = send(cdpMsg{ID: nextID(), Method: "Page.addScriptToEvaluateOnNewDocument", Params: scriptParams, SessionID: sessionID})
-	// Also apply to the currently-loaded document (the script-on-new-
-	// document only fires for subsequent loads).
-	evalNowParams, _ := json.Marshal(map[string]interface{}{"expression": listenerSource})
-	_ = send(cdpMsg{ID: nextID(), Method: "Runtime.evaluate", Params: evalNowParams, SessionID: sessionID})
 
-	// Step 4: hybrid poll + event-driven loop. The poll is the safety
-	// net; Runtime.bindingCalled events trigger immediate re-evaluation
-	// for low-latency focus tracking.
-	evalRequested := make(chan struct{}, 1)
-	requestEval := func() {
+	// Re-apply the device emulation on this long-lived session. CDP's
+	// Emulation overrides are cleared when the setting session detaches, so the
+	// one-shot /cdp/emulate-device apply does not survive navigations — but this
+	// session stays attached for the page's lifetime, so applying here keeps the
+	// mobile viewport across page loads, redirects, and our own reconnects.
+	applyEmulation := func() {
+		for _, c := range ft.mgr.EmulationCommands() {
+			params, _ := json.Marshal(c.Params)
+			_ = send(cdpMsg{ID: nextID(), Method: c.Method, Params: params, SessionID: sessionID})
+		}
+	}
+	applyEmulation()
+	lastEmuVersion := ft.mgr.EmulationVersion()
+
+	// Step 4: poll loop. Re-evaluates the active element every pollInterval
+	// (~100 ms). There is no event-driven push anymore — that required
+	// Runtime.enable + a binding, which is a CDP-detection signal (see Step 3).
+	// Signalled by the reader when the top document finishes loading
+	// (Page.loadEventFired) — a navigation just wiped the renderer's
+	// emulation state, so re-apply it.
+	emulateReapply := make(chan struct{}, 1)
+	requestReapply := func() {
 		select {
-		case evalRequested <- struct{}{}:
+		case emulateReapply <- struct{}{}:
 		default: // already pending
 		}
 	}
@@ -565,11 +592,37 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 				}
 				continue
 			}
-			// Method == "Runtime.bindingCalled" means our focus listener
-			// fired — schedule an immediate re-eval to capture the new
-			// state.
-			if m.Method == "Runtime.bindingCalled" {
-				requestEval()
+			// A top-document load cleared the renderer's emulation overrides;
+			// re-apply them so the mobile viewport survives the navigation.
+			if m.Method == "Page.loadEventFired" {
+				requestReapply()
+			}
+			// A JS dialog opened. The native dialog can't render in the emulated
+			// crop and is suppressed by Page.enable, so we surface it to the
+			// client (which draws its own overlay) — except beforeunload, which
+			// is kiosk noise and auto-accepts. Responding is done on the main
+			// loop (here we only signal) so we never race the msgID counter.
+			if m.Method == "Page.javascriptDialogOpening" {
+				var p struct {
+					Type          string `json:"type"`
+					Message       string `json:"message"`
+					DefaultPrompt string `json:"defaultPrompt"`
+				}
+				if json.Unmarshal(m.Params, &p) == nil {
+					if p.Type == "beforeunload" {
+						select {
+						case ft.dialogResp <- dialogResponse{accept: true}:
+						default:
+						}
+					} else {
+						ft.mgr.SetPendingDialog(&DialogInfo{
+							ID:            ft.mgr.NextDialogID(),
+							Kind:          p.Type,
+							Message:       p.Message,
+							DefaultPrompt: p.DefaultPrompt,
+						})
+					}
+				}
 			}
 		}
 	}()
@@ -585,7 +638,30 @@ func (ft *FocusTracker) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		case <-evalRequested:
+		case <-emulateReapply:
+			applyEmulation()
+		case resp := <-ft.dialogResp:
+			// Dismiss the pending JS dialog on the session that owns it.
+			dialogParams, _ := json.Marshal(map[string]interface{}{
+				"accept":     resp.accept,
+				"promptText": resp.promptText,
+			})
+			_ = send(cdpMsg{ID: nextID(), Method: "Page.handleJavaScriptDialog", Params: dialogParams, SessionID: sessionID})
+			ft.mgr.SetPendingDialog(nil)
+		}
+
+		// A popup opened or closed — reconnect so we re-attach to the now-active
+		// target (popup while open, main page once it closes).
+		if ft.mgr.InputTargetGen() != attachGen {
+			ft.logger.Info("[FocusTracker] input target changed, reconnecting")
+			return
+		}
+
+		// A new /cdp/emulate-device call bumped the version — apply the fresh
+		// config. (Navigation re-applies via emulateReapply above.)
+		if v := ft.mgr.EmulationVersion(); v != lastEmuVersion {
+			lastEmuVersion = v
+			applyEmulation()
 		}
 
 		id := nextID()
@@ -735,5 +811,32 @@ func ActiveElementHandler(ft *FocusTracker) http.Handler {
 		result := ft.CurrentState()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
+	})
+}
+
+// DialogRespondHandler returns an http.Handler for POST /cdp/dialog-respond.
+// The client's dialog overlay posts {id, accept, promptText}; we dismiss the
+// pending JS dialog via the FocusTracker's session. The id guards against a
+// stale response (from a dialog the user already answered) dismissing a newer one.
+func DialogRespondHandler(ft *FocusTracker, mgr *UpstreamManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID         uint64 `json:"id"`
+			Accept     bool   `json:"accept"`
+			PromptText string `json:"promptText"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur := mgr.PendingDialog()
+		if cur == nil || (body.ID != 0 && body.ID != cur.ID) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"stale":true}`))
+			return
+		}
+		ft.RespondDialog(body.Accept, body.PromptText)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 }

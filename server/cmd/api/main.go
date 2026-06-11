@@ -163,6 +163,13 @@ func main() {
 	inputDispatcher := devtoolsproxy.NewInputDispatcher(upstreamMgr, slogger)
 	defer inputDispatcher.Stop()
 
+	// Watches for popup windows (window.open). Each popup is fullscreened to
+	// hide its location bar (kiosk only covers the main window), re-emulated to
+	// match the main page's mobile viewport, and recorded so the client can show
+	// an in-app close button (a chromeless fullscreen popup has no native close).
+	popupWatcher := devtoolsproxy.NewPopupWatcher(upstreamMgr, slogger)
+	defer popupWatcher.Stop()
+
 	// Expose active-element cache on the primary API router so the gateway
 	// can route to it via the standard `/api/...` path.
 	// CORS is needed so the neko client (port 8080) can sync-XHR to this endpoint.
@@ -226,7 +233,36 @@ func main() {
 	// Persistent WebSocket version of /cdp/input. Same payload shape on
 	// each frame; the client uses this on high-RTT links to avoid paying
 	// per-request TCP/TLS setup on every keystroke.
-	r.Get("/cdp/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker).ServeHTTP)
+	r.Get("/cdp/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker, upstreamMgr).ServeHTTP)
+
+	// Close the currently open popup window. The client's in-app close button
+	// posts here because fullscreen popups have no browser chrome to close with.
+	r.Post("/cdp/close-popup", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.ClosePopupHandler(upstreamMgr, slogger).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/close-popup", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Respond to a JavaScript dialog (alert/confirm/prompt) the client surfaced.
+	r.Post("/cdp/dialog-respond", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		devtoolsproxy.DialogRespondHandler(focusTracker, upstreamMgr).ServeHTTP(w, req)
+	})
+	r.Options("/cdp/dialog-respond", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.WriteHeader(http.StatusOK)
+	})
 
 	// Browser-events session endpoints (in-image rewrite of the portal worker).
 	// Registered directly on the API router like the sibling /cdp/* and
@@ -293,7 +329,9 @@ func main() {
 		r.Post("/emulate-device", devtoolsproxy.EmulateDeviceHandler(upstreamMgr, slogger).ServeHTTP)
 		r.Post("/set-select-value", devtoolsproxy.SetSelectValueHandler(upstreamMgr, slogger).ServeHTTP)
 		r.Post("/input", devtoolsproxy.InputHandler(inputDispatcher).ServeHTTP)
-		r.Get("/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker).ServeHTTP)
+		r.Post("/close-popup", devtoolsproxy.ClosePopupHandler(upstreamMgr, slogger).ServeHTTP)
+		r.Post("/dialog-respond", devtoolsproxy.DialogRespondHandler(focusTracker, upstreamMgr).ServeHTTP)
+		r.Get("/input-ws", devtoolsproxy.InputWSHandler(inputDispatcher, focusTracker, upstreamMgr).ServeHTTP)
 	})
 
 	rDevtools.Get("/*", func(w http.ResponseWriter, r *http.Request) {

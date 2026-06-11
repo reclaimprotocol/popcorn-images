@@ -117,8 +117,17 @@ func EmulateDeviceHandler(mgr *UpstreamManager, logger *slog.Logger) http.Handle
 			http.Error(w, "width and height must be > 0", http.StatusBadRequest)
 			return
 		}
+		// CDP requires maxTouchPoints in [1,16] even when disabling touch
+		// (enabled:false) — sending 0 errors with "Touch points must be between
+		// 1 and 16". Default to 5 when touch is on, and clamp to ≥1 always.
 		if req.MaxTouchPoints == 0 && req.Touch {
 			req.MaxTouchPoints = 5
+		}
+		if req.MaxTouchPoints < 1 {
+			req.MaxTouchPoints = 1
+		}
+		if req.MaxTouchPoints > 16 {
+			req.MaxTouchPoints = 16
 		}
 
 		upstream := mgr.Current()
@@ -180,6 +189,13 @@ func EmulateDeviceHandler(mgr *UpstreamManager, logger *slog.Logger) http.Handle
 		// Record touch state so /computer/scroll can pick a touch-drag swipe
 		// over wheel ticks without probing the page on every scroll.
 		mgr.SetTouchEmulated(req.Touch)
+
+		// Persist the command set so the FocusTracker's long-lived session
+		// re-applies it on every navigation. The one-shot apply above is
+		// cleared when this session detaches (CDP Emulation overrides are
+		// session-scoped); without re-application a hard navigation or auth
+		// redirect snaps the page back to its desktop layout inside the crop.
+		mgr.SetEmulationCommands(commands)
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))

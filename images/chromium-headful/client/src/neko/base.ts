@@ -170,6 +170,13 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
     this._id = ''
   }
 
+  // Bytes queued but not yet sent on the input data channel. Grows when the
+  // link can't keep up; used by the scroll path to apply backpressure (hold +
+  // coalesce) instead of piling messages into the SCTP buffer on a bad network.
+  public get dataBufferedAmount(): number {
+    return this._channel?.bufferedAmount ?? 0
+  }
+
   public sendData(event: 'wheel' | 'mousemove', data: { x: number; y: number }): void
   public sendData(event: 'mousedown' | 'mouseup' | 'keydown' | 'keyup', data: { key: number }): void
   public sendData(event: 'touchstart' | 'touchmove' | 'touchend', data: { id: number; x: number; y: number }): void

@@ -50,11 +50,15 @@ func (m *Manager) Start(ctx context.Context, cfg *SessionConfig) (*Session, erro
 		_ = client.Close()
 		return nil, fmt.Errorf("attach to page target: %w", err)
 	}
-	if err := cdpSess.RuntimeEnable(ctx); err != nil {
-		_ = cdpSess.Detach(ctx)
-		_ = client.Close()
-		return nil, fmt.Errorf("Runtime.enable: %w", err)
-	}
+	// NOTE: we intentionally do NOT call Runtime.enable here. Runtime.enable is
+	// the canonical CDP-detection signal (anti-bot pages — reCAPTCHA, Cloudflare,
+	// DataDome — detect it via the console-argument serialization leak and lower
+	// the bot score, causing "reCAPTCHA score too low" / challenge failures).
+	// Nothing on this session consumes Runtime events: every use is a
+	// default-context Runtime.evaluate (returnByValue), which works without the
+	// domain enabled — netcapture already evaluates the same way with no
+	// Runtime.enable. Keeping the domain disabled removes the leak during the
+	// capture/proof flow that runs while the user is on the login page.
 
 	// Apply viewport if provided.
 	if vp := cfg.ProviderConfig.Viewport; vp != nil && vp.Width > 0 && vp.Height > 0 {

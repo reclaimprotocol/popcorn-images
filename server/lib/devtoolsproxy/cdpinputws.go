@@ -43,11 +43,25 @@ type InputWSRequest struct {
 	// tap. elementFromPoint asks "what's actually under the pixel" — the
 	// correct primitive for tap intent.
 	HitTest *HitTestQuery `json:"hitTest,omitempty"`
+
+	// Scroll is set for a pixel-precise mouse-wheel scroll. Dispatched as
+	// Input.dispatchMouseEvent{mouseWheel} on the active target's session, so it
+	// scrolls the element under (X,Y) smoothly (sub-notch, unlike the XTest wheel
+	// opcode) and reaches popup windows. X/Y are layout-viewport CSS px; DeltaX/Y
+	// are pixel scroll amounts (positive Y scrolls the page down).
+	Scroll *ScrollFrame `json:"scroll,omitempty"`
 }
 
 type HitTestQuery struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
+}
+
+type ScrollFrame struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	DeltaX float64 `json:"deltaX"`
+	DeltaY float64 `json:"deltaY"`
 }
 
 // InputWSAck is the server-to-client confirmation frame. `Seq` echoes the
@@ -68,6 +82,23 @@ type InputWSAck struct {
 type InputWSFocus struct {
 	Type string               `json:"type"` // always "focus"
 	Info *ActiveElementResult `json:"info"`
+}
+
+// InputWSPopup tells the client whether a popup window is open. Pushed on
+// connect and whenever the state flips. The client shows an in-app "close"
+// button when Open is true — fullscreen popups have no browser chrome, so
+// there is no native way for the user to close them.
+type InputWSPopup struct {
+	Type string `json:"type"` // always "popup"
+	Open bool   `json:"open"`
+}
+
+// InputWSDialog tells the client a JavaScript dialog (alert/confirm/prompt) is
+// awaiting a response, or clears it (Dialog nil). The client renders its own
+// overlay in the emulated viewport since the native dialog can't be shown there.
+type InputWSDialog struct {
+	Type   string      `json:"type"` // always "dialog"
+	Dialog *DialogInfo `json:"dialog"`
 }
 
 // InputWSHitTest is the server's reply to a HitTestQuery. `Seq` echoes the
@@ -163,7 +194,7 @@ const hitTestExpression = `
 // supplied, the connection also pushes active-element snapshots to the
 // client whenever the focused element changes, so the client doesn't
 // have to round-trip /cdp/active-element on every tap.
-func InputWSHandler(d *InputDispatcher, ft *FocusTracker) http.Handler {
+func InputWSHandler(d *InputDispatcher, ft *FocusTracker, mgr *UpstreamManager) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // same-origin enforced upstream via cloudflared/CORS
@@ -199,23 +230,58 @@ func InputWSHandler(d *InputDispatcher, ft *FocusTracker) http.Handler {
 		// change (or every ~2 s as a heartbeat). The poll interval here is
 		// independent of the FocusTracker's own poll — we just read the
 		// atomic pointer.
-		if ft != nil {
+		if ft != nil || mgr != nil {
 			go func() {
 				ticker := time.NewTicker(200 * time.Millisecond)
 				defer ticker.Stop()
 				var lastFocusKey string
 				var lastRectsHash uint64
+				lastPopup := false
+				lastDialogID := uint64(0)
+				haveMgr := false
 				heartbeatAt := time.Now()
-				if cur := ft.CurrentState(); cur != nil {
-					writeJSON(InputWSFocus{Type: "focus", Info: cur})
-					lastFocusKey = cur.FocusKey
-					lastRectsHash = hashRects(cur.InputRects)
+				if ft != nil {
+					if cur := ft.CurrentState(); cur != nil {
+						writeJSON(InputWSFocus{Type: "focus", Info: cur})
+						lastFocusKey = cur.FocusKey
+						lastRectsHash = hashRects(cur.InputRects)
+					}
+				}
+				if mgr != nil {
+					haveMgr = true
+					lastPopup = mgr.ActivePopup() != ""
+					writeJSON(InputWSPopup{Type: "popup", Open: lastPopup})
+					if d := mgr.PendingDialog(); d != nil {
+						lastDialogID = d.ID
+						writeJSON(InputWSDialog{Type: "dialog", Dialog: d})
+					}
 				}
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
+					}
+					// Popup + dialog state: push immediately on a change so the
+					// close button / dialog overlay appear without waiting on
+					// focus churn.
+					if haveMgr {
+						if open := mgr.ActivePopup() != ""; open != lastPopup {
+							lastPopup = open
+							writeJSON(InputWSPopup{Type: "popup", Open: open})
+						}
+						d := mgr.PendingDialog()
+						curID := uint64(0)
+						if d != nil {
+							curID = d.ID
+						}
+						if curID != lastDialogID {
+							lastDialogID = curID
+							writeJSON(InputWSDialog{Type: "dialog", Dialog: d})
+						}
+					}
+					if ft == nil {
+						continue
 					}
 					cur := ft.CurrentState()
 					if cur == nil {
@@ -289,6 +355,29 @@ func InputWSHandler(d *InputDispatcher, ft *FocusTracker) http.Handler {
 						Readonly: ro, Disabled: dis, IsEditable: ed, FocusKey: fk,
 					})
 				}(req.Seq, *req.HitTest)
+				continue
+			}
+
+			// Mouse-wheel scroll — pixel-precise, on the active target session
+			// (reaches popups; scrolls the element under the cursor). Best-effort:
+			// no ack (scroll is high-frequency and idempotent enough that the
+			// client doesn't track per-frame delivery). Dispatched synchronously
+			// to preserve order — the CDP upstream is local so this is sub-ms.
+			if req.Scroll != nil {
+				dispatchCtx, dcancel := context.WithTimeout(ctx, 3*time.Second)
+				if err := d.Dispatch(dispatchCtx, []cdpCommand{{
+					Method: "Input.dispatchMouseEvent",
+					Params: map[string]any{
+						"type":   "mouseWheel",
+						"x":      req.Scroll.X,
+						"y":      req.Scroll.Y,
+						"deltaX": req.Scroll.DeltaX,
+						"deltaY": req.Scroll.DeltaY,
+					},
+				}}); err != nil {
+					d.logger.Warn("[InputWS] scroll dispatch failed", "err", err)
+				}
+				dcancel()
 				continue
 			}
 

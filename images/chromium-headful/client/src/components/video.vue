@@ -79,6 +79,42 @@
             kbd: {{ keyboardActive }} last: {{ lastHitResult }}
           </div>
         </div>
+        <!-- Close button for fullscreen popups (window.open). Popups have no
+             browser chrome in kiosk mode, so this is the only way to dismiss
+             one. Compact icon, top-right, above every overlay. -->
+        <button
+          v-if="hosting && popupOpen"
+          class="popup-close-btn"
+          @click.stop.prevent="closePopup"
+          aria-label="Close popup"
+        >
+          <i class="fas fa-times" />
+        </button>
+        <!-- JS dialog (alert/confirm/prompt) overlay. The native dialog draws
+             at the OS-window level outside the emulated crop and is suppressed
+             by Page.enable, so we render our own here, in the viewport space,
+             and answer it over CDP via /cdp/dialog-respond. -->
+        <div v-if="hosting && pendingDialog" class="js-dialog-overlay">
+          <div class="js-dialog">
+            <div class="js-dialog-msg">{{ pendingDialog.message }}</div>
+            <input
+              v-if="pendingDialog.kind === 'prompt'"
+              ref="dialogInput"
+              v-model="dialogPromptText"
+              class="js-dialog-input"
+              type="text"
+              @keydown.enter.stop.prevent="respondDialog(true)"
+            />
+            <div class="js-dialog-actions">
+              <button
+                v-if="pendingDialog.kind !== 'alert'"
+                class="js-dialog-btn cancel"
+                @click.stop.prevent="respondDialog(false)"
+              >Cancel</button>
+              <button class="js-dialog-btn ok" @click.stop.prevent="respondDialog(true)">OK</button>
+            </div>
+          </div>
+        </div>
       </div>
       <ul v-if="!fullscreen && !hideControls" class="video-menu top">
         <!-- KERNEL: disable fullscreen and resolution controls
@@ -332,6 +368,92 @@
           box-sizing: border-box;
           pointer-events: none;
         }
+        /* Close button for chromeless fullscreen popups. Compact circular icon
+           pinned to the top-right corner, above every other overlay so it's
+           reachable while a popup covers the stream. */
+        .popup-close-btn {
+          position: fixed;
+          top: 10px;
+          right: 10px;
+          z-index: 10000;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 34px;
+          height: 34px;
+          padding: 0;
+          color: #fff;
+          background: rgba($color: #000, $alpha: 0.6);
+          border: 1px solid rgba($color: #fff, $alpha: 0.25);
+          border-radius: 50%;
+          cursor: pointer;
+
+          i {
+            font-size: 15px;
+          }
+        }
+
+        /* JS dialog overlay — a native-looking modal rendered in the viewport
+           space (the real native dialog can't show under emulation). Above all
+           other overlays; the scrim absorbs taps so nothing leaks to the page. */
+        .js-dialog-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 10001;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba($color: #000, $alpha: 0.4);
+        }
+        .js-dialog {
+          width: min(80vw, 320px);
+          max-height: 70vh;
+          overflow-y: auto;
+          background: #fff;
+          color: #1a1a1a;
+          border-radius: 12px;
+          padding: 18px 16px 12px;
+          box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+        }
+        .js-dialog-msg {
+          white-space: pre-wrap;
+          word-break: break-word;
+          margin-bottom: 12px;
+          font-size: 14px;
+          line-height: 1.4;
+        }
+        .js-dialog-input {
+          width: 100%;
+          box-sizing: border-box;
+          font-size: 16px; /* 16px prevents iOS focus-zoom */
+          padding: 8px;
+          border: 1px solid #ccc;
+          border-radius: 6px;
+          margin-bottom: 12px;
+          color: #1a1a1a;
+        }
+        .js-dialog-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 8px;
+        }
+        .js-dialog-btn {
+          padding: 8px 16px;
+          border: 0;
+          border-radius: 6px;
+          font-size: 14px;
+          cursor: pointer;
+
+          &.cancel {
+            background: #eee;
+            color: #333;
+          }
+          &.ok {
+            background: #2563eb;
+            color: #fff;
+          }
+        }
+
         .rect-debug-status {
           position: fixed;
           top: 4px;
@@ -364,6 +486,28 @@
   import GuacamoleKeyboard from '~/utils/guacamole-keyboard.ts'
 
   const WHEEL_LINE_HEIGHT = 19
+
+  // Remote pixels scrolled per wheel "tick" we emit — one tick == one
+  // XTestFakeButtonEvent == ~one wheel notch ≈ 120px in Chromium (same constant
+  // the desktop onWheel path normalizes against). Touch scroll divides finger
+  // travel by this so a swipe moves the page ~1:1 with the finger (native feel)
+  // instead of ~20× too fast. Lower = faster scroll. Tunable.
+  const TOUCH_SCROLL_PX_PER_TICK = 120
+
+  // Multiplier on CDP pixel-wheel scroll distance. 1.0 = content tracks the
+  // finger exactly (1:1). We run >1 because CDP mouseWheel has no fling/inertia
+  // the way native touch does — so a 1:1 swipe feels sluggish (it stops dead on
+  // release instead of coasting). ~2 makes a swipe travel a believable distance.
+  // Raise = faster scroll, lower = closer to 1:1. Tune to taste.
+  const TOUCH_SCROLL_GAIN = 2.0
+
+  // Scroll backpressure: if more than this many bytes are queued unsent on the
+  // input data channel, stop emitting wheel events and let them coalesce in the
+  // accumulator until the channel drains. Each input frame is ~7 bytes, so ~256
+  // bounds the scroll backlog to a few hundred ms on a congested link — enough
+  // to absorb bursts on a good network (where the buffer drains to ~0 between
+  // frames) without piling up lag on a bad one. Tunable.
+  const SCROLL_MAX_BUFFERED_BYTES = 256
 
   interface HitTestReply {
     isInput: boolean
@@ -445,6 +589,11 @@
     private deviceExperienceTimer: number | null = null
 
 
+    // Last emulate-device body actually POSTed, to skip redundant calls when
+    // onResize fires repeatedly at the same dimensions (avoids polling the
+    // /cdp/emulate-device endpoint).
+    private lastEmulatedKey = ''
+
     // Last visible height pushed to the remote while the soft keyboard is up
     // (0 = full viewport / no keyboard). Used to shrink the remote viewport so
     // the focused field scrolls above the keyboard and content stays reachable.
@@ -464,6 +613,18 @@
     //   immediately don't accidentally re-pop the keyboard.
     // allowBlur: set true around intentional blurs so onProxyBlur doesn't
     //   misclassify them as a system dismissal.
+    // A popup window (window.open) is open on the remote. Pushed over the
+    // input-ws. Popups render fullscreen with no browser chrome, so we show an
+    // in-app close button while one is open.
+    popupOpen = false
+
+    // A JavaScript dialog (alert/confirm/prompt) is awaiting a response on the
+    // remote. Pushed over the input-ws; we render our own overlay because the
+    // native dialog can't be shown in the emulated viewport. dialogPromptText
+    // backs the input shown for prompt().
+    pendingDialog: { id: number; kind: string; message: string; defaultPrompt?: string } | null = null
+    dialogPromptText = ''
+
     private keyboardActive = false
     private keyboardOpening = false
     private keyboardJustDismissed = false
@@ -570,6 +731,10 @@
     private touchLastX = 0
     private touchLastY = 0
     private touchLastWheelEmit = 0
+    // Fractional scroll carry: finger pixels not yet converted to a whole wheel
+    // unit. Keeps slow/precise drags from being rounded away to zero.
+    private scrollAccumX = 0
+    private scrollAccumY = 0
     private longPressTimer: number | null = null
 
     // iOS-only: fired on touchstart so the focus-state RTT runs in parallel
@@ -725,6 +890,37 @@
       this.applyViewportEmulation()
     }
 
+    // Close the open popup window. Fullscreen popups (window.open) have no
+    // browser chrome, so this in-app button is the only way to dismiss one.
+    // The server closes the tracked popup target and pushes popup:false back
+    // over the input-ws; we clear optimistically so the button hides at once.
+    closePopup() {
+      const url = this.resolveCDPUrl('close-popup')
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+        .then(() => { this.popupOpen = false })
+        .catch((err) => console.warn('[CDP] close-popup failed', err))
+    }
+
+    // Answer a JS dialog (alert/confirm/prompt). Posts the choice to the server,
+    // which calls Page.handleJavaScriptDialog on the dialog's session. We clear
+    // optimistically; the server also pushes dialog:null once it's dismissed.
+    respondDialog(accept: boolean) {
+      const d = this.pendingDialog
+      if (!d) return
+      const promptText = accept ? this.dialogPromptText : ''
+      this.pendingDialog = null
+      const url = this.resolveCDPUrl('dialog-respond')
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: d.id, accept, promptText }),
+      }).catch((err) => console.warn('[CDP] dialog-respond failed', err))
+    }
+
     // Server endpoint that runs Emulation.* against the upstream chromium.
     // Mirrors the URL pattern of /cdp/active-element (gateway-routed in prod).
     private getEmulateDeviceUrl(): string {
@@ -756,15 +952,25 @@
           deviceScaleFactor: 1,
           touch: true,
           maxTouchPoints: 5,
-          // Pass the viewer's real UA through so Cloudflare/bot detection
-          // sees a consistent UA + TLS fingerprint.
-          userAgent: navigator.userAgent,
+          // NOTE: we deliberately do NOT push the viewer's phone UA here.
+          // Emulation.setUserAgentOverride only changes the UA *string* — not
+          // userAgentMetadata (Client Hints) or navigator.platform — so a phone
+          // UA on top of CloakBrowser's Windows fingerprint + Linux Chromium
+          // (Blink, not WebKit) is an incoherent identity that reCAPTCHA
+          // Enterprise / Akamai flag ("score too low"). CloakBrowser already
+          // presents ONE coherent identity (UA + CH + platform + WebGL + TLS);
+          // we emulate only the viewport + touch and leave that identity intact.
         }
       } else {
         // Desktop: emulate at the full stream size (the remote stays 1920×1080
         // and is shown letterboxed — no client-side scaling/crop).
         body = { width: physW, height: physH, mobile: false, deviceScaleFactor: 1, touch: false }
       }
+
+      // Skip redundant POSTs: onResize can fire many times at the same size.
+      const key = JSON.stringify(body)
+      if (key === this.lastEmulatedKey) return
+      this.lastEmulatedKey = key
 
       fetch(url, {
         method: 'POST',
@@ -1326,6 +1532,18 @@
             this.onFocusSnapshotUpdated(prev)
             return
           }
+          // Popup open/closed: a fullscreen popup window (window.open) has no
+          // browser chrome to close it, so we surface an in-app close button.
+          if (msg?.type === 'popup') {
+            this.popupOpen = !!msg.open
+            return
+          }
+          // JS dialog opened/cleared on the remote — render/hide our overlay.
+          if (msg?.type === 'dialog') {
+            this.pendingDialog = msg.dialog || null
+            this.dialogPromptText = (msg.dialog && msg.dialog.defaultPrompt) || ''
+            return
+          }
           // Ack — informational. Order is preserved by TCP.
           if (msg?.ok === false) {
             console.warn('[CDP-WS] server rejected frame:', msg.err)
@@ -1580,6 +1798,23 @@
     // POST instead of dozens of small ones — the bottleneck is RTT per
     // request, not chromium's ability to ingest characters. Ordering is
     // preserved: the outbox drains one POST at a time.
+    // Pixel-precise scroll over the persistent input WS → Input.dispatchMouseEvent
+    // {mouseWheel} on the active target. Smooth (sub-notch) and reaches popups,
+    // unlike the neko XTest wheel. Returns true if sent; false when the WS isn't
+    // up so the caller falls back to the neko wheel path. Best-effort: no ack and
+    // no HTTP fallback — scroll is high-frequency and a dropped frame is fine.
+    private sendCDPScroll(x: number, y: number, deltaX: number, deltaY: number): boolean {
+      if (!this.cdpInputWSReady || !this.cdpInputWS || this.cdpInputWS.readyState !== WebSocket.OPEN) {
+        return false
+      }
+      try {
+        this.cdpInputWS.send(JSON.stringify({ scroll: { x, y, deltaX, deltaY } }))
+        return true
+      } catch {
+        return false
+      }
+    }
+
     private postCDPInput(body: { text?: string; key?: string; count?: number }) {
       // Fast path: when the persistent WS is open, send a single frame and
       // return. TCP guarantees ordering on a single socket, so we don't need
@@ -2091,12 +2326,13 @@
           this.touchLastX = touch.clientX
           this.touchLastY = touch.clientY
           this.touchLastWheelEmit = 0
+          this.scrollAccumX = 0
+          this.scrollAccumY = 0
 
           // Mobile-viewport mode: dispatch a real touchstart over the
           // data channel. Chromium gets a native TouchEvent, which is
           // what mobile-only captchas (Cloudflare Turnstile press-and-
-          // hold, hCaptcha, reCAPTCHA "slide to verify") look for, and
-          // what triggers native momentum scrolling.
+          // hold, hCaptcha, reCAPTCHA "slide to verify") look for.
           if (this.mobileViewportActive) {
             this.sendTouchFromTouch(touch, 'touchstart')
           }
@@ -2134,37 +2370,74 @@
             this.cancelLongPress()
           }
 
-          // Native touch path (mobile): stream real touchmoves at ~frame rate
-          // and let the remote's touchscreen driver do native scrolling — the
-          // close-spaced moves let Chromium track the finger smoothly and
-          // compute fling velocity at touchend, giving real momentum. NO wheel
-          // here: sending both double-scrolls, and wheel has no inertia. (Wheel
-          // remains the fallback for desktop / neko builds without touch.)
-          if (this.mobileViewportActive) {
-            const now = Date.now()
-            if (now - this.touchLastWheelEmit < 16) return
-            this.touchLastWheelEmit = now
-            this.touchLastX = touch.clientX
-            this.touchLastY = touch.clientY
-            this.sendTouchFromTouch(touch, 'touchmove')
-            this.lastScrollAt = Date.now()
-            break
-          }
+          // Scroll via wheel events for ALL touch scrolling (mobile, desktop,
+          // popups). The native-touch scroll path (TOUCH_UPDATE → touchscreen
+          // driver) was unreliable and inverted on this neko build, so it is no
+          // longer used for scrolling; the pointer-scroll path is reliable,
+          // correctly-directed, and reaches popup windows. (Tap→click and
+          // long-press still emit touch/mouse from touchstart/touchend.)
+          // Throttle to ~frame rate FIRST, and advance touchLast only when we
+          // actually emit. The old order updated touchLast on every touchmove
+          // and only THEN checked the throttle — so a dropped sub-16ms frame's
+          // finger distance was discarded, losing a big fraction of the swipe on
+          // 60Hz+ touch streams (scroll felt far too slow). Now a dropped frame's
+          // distance rolls into the next emit's delta.
+          const now = Date.now()
+          if (now - this.touchLastWheelEmit < 16) return
+          this.touchLastWheelEmit = now
 
           const moveDx = touch.clientX - this.touchLastX
           const moveDy = touch.clientY - this.touchLastY
           this.touchLastX = touch.clientX
           this.touchLastY = touch.clientY
 
-          const now = Date.now()
-          if (now - this.touchLastWheelEmit < 60) return
-          this.touchLastWheelEmit = now
+          // Emit the real touch move too, so the remote sees a balanced
+          // touchstart→move→end gesture (a stray begin+end would register as a
+          // tap) and touch-driven captcha/slider drags keep working. The touch
+          // driver doesn't itself scroll on this build, so this does NOT double
+          // up with the scroll below.
+          if (this.mobileViewportActive) {
+            this.sendTouchFromTouch(touch, 'touchmove')
+          }
 
-          // Wheel path (desktop / non-touch fallback): swiping UP scrolls
-          // content UP (positive wheel deltaY). The remote interprets +y as
-          // scroll-down lines.
-          let wheelX = -Math.round(moveDx / 6)
-          let wheelY = -Math.round(moveDy / 6)
+          // Preferred path: pixel-precise smooth scroll over CDP. Sends the
+          // finger delta as Input.dispatchMouseEvent{mouseWheel} on the active
+          // target, scrolling the element under the finger sub-notch-smoothly
+          // and reaching popups. Direction: finger up (moveDy<0) → page down →
+          // positive deltaY, so delta = -move. 1:1 with the finger (the CDP
+          // delta is in pixels, so no PX_PER_TICK divisor / accumulator needed).
+          const remote = this.touchToRemoteCoords(touch)
+          if (this.sendCDPScroll(remote.x, remote.y, -moveDx * TOUCH_SCROLL_GAIN, -moveDy * TOUCH_SCROLL_GAIN)) {
+            this.lastScrollAt = Date.now()
+            break
+          }
+
+          // Fallback (CDP WS down): notchy neko XTest wheel.
+          // Pixel-proportional scroll, native mobile direction: swiping the
+          // finger UP moves the page DOWN (you pull content up to see what's
+          // below). On this remote that means following the finger delta with
+          // NO sign flip — moveDy<0 (finger up) → negative wheelY → page scrolls
+          // down. Accumulate the fractional remainder so slow, precise drags
+          // aren't rounded away to zero (felt like dead/janky scrolling).
+          this.scrollAccumX += moveDx / TOUCH_SCROLL_PX_PER_TICK
+          this.scrollAccumY += moveDy / TOUCH_SCROLL_PX_PER_TICK
+
+          // Bad-network backpressure: the input data channel is reliable+ordered,
+          // so on a congested link emitting at 60/s just builds an SCTP backlog —
+          // scroll lags and overshoots after the finger lifts. If the send buffer
+          // is backing up, hold: keep the delta in the accumulator and flush it as
+          // one larger wheel event once the channel drains. Bounds latency, never
+          // loses scroll distance.
+          if (this.$client.dataBufferedAmount > SCROLL_MAX_BUFFERED_BYTES) {
+            break
+          }
+
+          let wheelX = Math.trunc(this.scrollAccumX)
+          let wheelY = Math.trunc(this.scrollAccumY)
+          this.scrollAccumX -= wheelX
+          this.scrollAccumY -= wheelY
+          // Clamp per-event so one fast flick (or a post-backpressure flush)
+          // doesn't teleport the page.
           wheelX = Math.min(Math.max(wheelX, -this.scroll), this.scroll)
           wheelY = Math.min(Math.max(wheelY, -this.scroll), this.scroll)
 

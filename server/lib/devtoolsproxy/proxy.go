@@ -39,6 +39,41 @@ type UpstreamManager struct {
 	// per-scroll CDP probe.
 	touchEmulated atomic.Bool
 
+	// emuMu guards emuCommands: the last device-emulation command set requested
+	// via /cdp/emulate-device. CDP's Emulation overrides are session-scoped and
+	// are cleared when the setting session detaches — so the one-shot handler's
+	// effect is lost on navigation. The persistent FocusTracker session re-applies
+	// these on every navigation (and on a version bump) so mobile layout survives
+	// page loads, redirects, and reconnects. emuVersion bumps on each Set so the
+	// tracker can cheaply detect "config changed" without diffing the slice.
+	emuMu       sync.RWMutex
+	emuCommands []cdpCommand
+	emuVersion  atomic.Uint64
+
+	// activePopup holds the CDP targetId of the most recently opened popup
+	// window (window.open), or "" when none is open. The PopupWatcher sets it
+	// when a popup attaches and clears it when the popup is destroyed. The
+	// input-ws push reads it to tell the client whether to show the in-app
+	// "close popup" button (popups render fullscreen with no browser chrome,
+	// so the user has no native way to close them), and /cdp/close-popup reads
+	// it to know which target to close.
+	activePopup atomic.Value // string
+	// inputTargetGen bumps whenever the popup (and thus the target the
+	// keyboard/focus machinery should act on) changes. FocusTracker and
+	// InputDispatcher watch it and re-attach to the active popup while one is
+	// open, then back to the main page when it closes — without it, typing and
+	// the soft keyboard would stay bound to the opener and never reach the popup.
+	inputTargetGen atomic.Uint64
+
+	// pendingDialog holds a JavaScript dialog (alert/confirm/prompt) awaiting a
+	// user response, or nil. Surfaced to the client (which renders its own
+	// overlay in the emulated viewport) because the native dialog draws at the
+	// 1920×1080 OS-window level — outside the mobile crop — and is suppressed by
+	// Page.enable. dialogSeq hands out monotonic ids so a stale response can't
+	// dismiss a newer dialog.
+	pendingDialog atomic.Pointer[DialogInfo]
+	dialogSeq     atomic.Uint64
+
 	startOnce  sync.Once
 	stopOnce   sync.Once
 	cancelTail context.CancelFunc
@@ -50,6 +85,7 @@ type UpstreamManager struct {
 func NewUpstreamManager(logFilePath string, logger *slog.Logger) *UpstreamManager {
 	um := &UpstreamManager{logFilePath: logFilePath, logger: logger}
 	um.currentURL.Store("")
+	um.activePopup.Store("")
 	return um
 }
 
@@ -98,6 +134,71 @@ func (u *UpstreamManager) SetTouchEmulated(on bool) { u.touchEmulated.Store(on) 
 // TouchEmulated reports the last touch-emulation state recorded via
 // SetTouchEmulated. False until the first /cdp/emulate-device call.
 func (u *UpstreamManager) TouchEmulated() bool { return u.touchEmulated.Load() }
+
+// SetEmulationCommands records the device-emulation command set to be kept
+// applied on the page. Called by EmulateDeviceHandler. The persistent
+// FocusTracker session re-applies these so the override survives navigations
+// (a one-shot CDP session loses it on detach). Passing nil clears them.
+func (u *UpstreamManager) SetEmulationCommands(cmds []cdpCommand) {
+	u.emuMu.Lock()
+	u.emuCommands = cmds
+	u.emuMu.Unlock()
+	u.emuVersion.Add(1)
+}
+
+// EmulationCommands returns the last recorded device-emulation command set
+// (nil if none). The returned slice must not be mutated by the caller.
+func (u *UpstreamManager) EmulationCommands() []cdpCommand {
+	u.emuMu.RLock()
+	defer u.emuMu.RUnlock()
+	return u.emuCommands
+}
+
+// EmulationVersion returns a counter that increments on every
+// SetEmulationCommands call, so a re-applier can detect config changes cheaply.
+func (u *UpstreamManager) EmulationVersion() uint64 { return u.emuVersion.Load() }
+
+// SetActivePopup records the targetId of the currently open popup window, or
+// "" to clear it. Called by the PopupWatcher. Bumps inputTargetGen on a real
+// change so the keyboard/focus watchers re-target.
+func (u *UpstreamManager) SetActivePopup(targetID string) {
+	if prev, _ := u.activePopup.Load().(string); prev == targetID {
+		return
+	}
+	u.activePopup.Store(targetID)
+	u.inputTargetGen.Add(1)
+}
+
+// ActivePopup returns the targetId of the currently open popup window, or ""
+// if none is open.
+func (u *UpstreamManager) ActivePopup() string {
+	v, _ := u.activePopup.Load().(string)
+	return v
+}
+
+// InputTargetGen returns a counter that bumps whenever the keyboard/focus
+// target should change (a popup opened or closed). FocusTracker and
+// InputDispatcher snapshot it on attach and reconnect when it differs.
+func (u *UpstreamManager) InputTargetGen() uint64 { return u.inputTargetGen.Load() }
+
+// DialogInfo describes a JavaScript dialog awaiting a user response. Pushed to
+// the client, which renders its own overlay in the emulated viewport.
+type DialogInfo struct {
+	ID            uint64 `json:"id"`
+	Kind          string `json:"kind"`                    // alert | confirm | prompt
+	Message       string `json:"message"`
+	DefaultPrompt string `json:"defaultPrompt,omitempty"` // prefilled text for prompt
+}
+
+// SetPendingDialog records a dialog awaiting a response, or nil to clear it.
+func (u *UpstreamManager) SetPendingDialog(d *DialogInfo) { u.pendingDialog.Store(d) }
+
+// PendingDialog returns the dialog awaiting a response, or nil.
+func (u *UpstreamManager) PendingDialog() *DialogInfo { return u.pendingDialog.Load() }
+
+// NextDialogID returns a monotonic id so a stale client response can't dismiss a
+// newer dialog.
+func (u *UpstreamManager) NextDialogID() uint64 { return u.dialogSeq.Add(1) }
 
 func (u *UpstreamManager) setCurrent(url string) {
 	prev := u.Current()
