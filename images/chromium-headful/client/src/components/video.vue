@@ -262,6 +262,9 @@
     private fullscreen = false
     private mutedOverlay = true
     private isVideoSyncing = false
+    // true only while the user has deliberately paused playback in-app;
+    // any other <video> pause (WebKit Low Power Mode, iOS lock) is involuntary
+    private userPaused = false
 
     // CDP state
     private cdpSocket: WebSocket | null = null
@@ -535,10 +538,20 @@
       })
 
       this._video.addEventListener('pause', () => {
+        // WebKit (iOS, macOS Low Power Mode) pauses the element while the
+        // stream is still live; resume in place instead of propagating a
+        // pause that the portal treats as a kernel disconnect
+        if (!this.userPaused && this.connected && !document.hidden) {
+          this.autoResume()
+          return
+        }
+
         this.isVideoSyncing = true
         this.$accessor.video.pause()
         this.$nextTick(() => { this.isVideoSyncing = false })
       })
+
+      document.addEventListener('visibilitychange', this.onVisibilityChange)
 
       /* Initialize Guacamole Keyboard */
       this.keyboard.onkeydown = (key: number) => {
@@ -564,7 +577,35 @@
       this.keyboard.listenTo(this._overlay)
     }
 
+    // re-play after an involuntary pause; WebKit may reject with audio on
+    // (autoplay policy), so retry muted before giving up and propagating
+    async autoResume() {
+      try {
+        await this._video.play()
+      } catch {
+        try {
+          this.$accessor.video.setMuted(true)
+          this._video.muted = true
+          await this._video.play()
+        } catch {
+          // genuinely can't play -> propagate as a real pause
+          this.isVideoSyncing = true
+          this.$accessor.video.pause()
+          this.$nextTick(() => { this.isVideoSyncing = false })
+        }
+      }
+    }
+
+    onVisibilityChange() {
+      // iOS blocks play() while the page is hidden (locked screen); resume
+      // once it becomes visible again if the pause wasn't user-initiated
+      if (!document.hidden && !this.userPaused && this.connected && this._video && this._video.paused) {
+        this.autoResume()
+      }
+    }
+
     beforeDestroy() {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange)
       if (this.cdpSocket) {
         this.cdpSocket.close()
         this.cdpSocket = null
@@ -703,13 +744,16 @@
       }
 
       if (!this.playing) {
+        this.userPaused = false
         this.$accessor.video.play()
       } else {
+        this.userPaused = true
         this.$accessor.video.pause()
       }
     }
 
     playAndUnmute() {
+      this.userPaused = false
       this.$accessor.video.play()
       this.$accessor.video.setMuted(false)
     }
