@@ -354,6 +354,10 @@
       return this.$accessor.video.playing
     }
 
+    get awaitingGesture() {
+      return this.$accessor.video.awaitingGesture
+    }
+
     @Watch('playing')
     onPlaying(value: boolean) {
       try {
@@ -361,8 +365,27 @@
 
         if (value) {
           window.parent.postMessage({ type: 'KERNEL_PLAYING', playing: true }, this.parentOrigin)
-        } else {
+        } else if (!this.awaitingGesture) {
+          // While awaiting a user gesture (autoplay blocked, e.g. Safari Low
+          // Power Mode) the stream is live, not disconnected — don't emit a
+          // pause that the portal would treat as a kernel drop. KERNEL_TAP_TO_CONTINUE
+          // is emitted instead (see onAwaitingGesture).
           window.parent.postMessage({ type: 'KERNEL_PAUSED', playing: false }, this.parentOrigin)
+        }
+      } catch (e) {
+        console.error('Failed to post message to parent', e)
+      }
+    }
+
+    @Watch('awaitingGesture')
+    onAwaitingGesture(value: boolean) {
+      try {
+        if (window.parent === window) return
+        if (value) {
+          // The stream is ready but the browser requires a user gesture to
+          // start playback. The portal should prompt the user to interact
+          // (e.g. "Tap to continue") rather than show a reconnect overlay.
+          window.parent.postMessage({ type: 'TAP_TO_CONTINUE', playing: false }, this.parentOrigin)
         }
       } catch (e) {
         console.error('Failed to post message to parent', e)

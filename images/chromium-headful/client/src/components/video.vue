@@ -2,7 +2,7 @@
   <div ref="component" class="video">
     <div ref="player" class="player">
       <div ref="container" class="player-container">
-        <video ref="video" playsinline />
+        <video ref="video" playsinline muted />
         <div class="emotes">
           <template v-for="(emote, index) in emotes">
             <neko-emote :id="index" :key="index" />
@@ -37,6 +37,27 @@
           <i class="fas fa-volume-up" />
         </div>
 -->
+        <!-- Shown when the browser blocks autoplay (Safari Low Power Mode
+             requires a user gesture). Shown even when !playable so there's
+             always something to tap instead of a black screen. -->
+        <div
+          v-if="autoplayBlocked && !playing"
+          class="player-overlay tap-to-continue"
+          role="button"
+          tabindex="0"
+          @click.stop.prevent="playAndUnmute"
+          @keydown.enter.stop.prevent="playAndUnmute"
+          @keydown.space.stop.prevent="playAndUnmute"
+        >
+          <div class="ttc-card">
+            <div class="ttc-icon">
+              <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+                <path d="M7 4v16l13-8z" fill="currentColor" />
+              </svg>
+            </div>
+            <div class="ttc-title">Continue with verification</div>
+          </div>
+        </div>
         <div ref="aspect" class="player-aspect" />
       </div>
       <ul v-if="!fullscreen && !hideControls" class="video-menu top">
@@ -195,6 +216,57 @@
           }
         }
 
+        .tap-to-continue {
+          // minimal black & white
+          background: #ffffff;
+          outline: none;
+          -webkit-tap-highlight-color: transparent;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+            sans-serif;
+
+          .ttc-card {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            padding: 28px 36px;
+            user-select: none;
+          }
+
+          .ttc-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #111111;
+            color: #ffffff;
+            transition: transform 0.16s ease;
+
+            svg {
+              margin-left: 2px; // optically center the triangle
+              display: block;
+            }
+          }
+
+          .ttc-title {
+            margin-top: 18px;
+            font-size: 16px;
+            font-weight: 500;
+            color: #111111;
+          }
+
+          &:hover .ttc-icon,
+          &:focus-visible .ttc-icon {
+            transform: scale(1.04);
+          }
+
+          &:active .ttc-icon {
+            transform: scale(0.96);
+          }
+        }
+
         .overlay {
           position: absolute;
           top: 0;
@@ -262,9 +334,17 @@
     private fullscreen = false
     private mutedOverlay = true
     private isVideoSyncing = false
-    // true only while the user has deliberately paused playback in-app;
-    // any other <video> pause (WebKit Low Power Mode, iOS lock) is involuntary
-    private userPaused = false
+    // guards against stacking overlapping play() attempts when WebKit emits
+    // rapid pause events (LPM / WebRTC startup churn)
+    private isAutoResuming = false
+    // set when play() is rejected by the autoplay policy (Safari blocks
+    // autoplay — even muted — in a cross-origin iframe until a user gesture).
+    // While set we stop auto-resuming and let neko's click-to-play overlay
+    // prompt the user; a gesture clears it. Prevents an endless play/block loop.
+    private autoplayBlocked = false
+    // one-shot "start on first interaction" fallback for Low Power Mode
+    private gestureResumeArmed = false
+    private gestureResumeHandler: ((e: Event) => void) | null = null
 
     // CDP state
     private cdpSocket: WebSocket | null = null
@@ -489,6 +569,12 @@
 
     mounted() {
       this._container.addEventListener('resize', this.onResize)
+      // Ensure the element is muted at the property level before any play()
+      // attempt. Vue 2 doesn't reliably bind the `muted` property from the
+      // template attribute, and Safari decides muted-autoplay eligibility from
+      // defaultMuted — so set both explicitly. (Audio is irrelevant here.)
+      this._video.defaultMuted = true
+      this._video.muted = true
       this.onVolumeChanged(this.volume)
       this.onMutedChanged(this.muted)
       this.onStreamChanged(this.stream)
@@ -505,24 +591,20 @@
       })
 
       this._video.addEventListener('canplaythrough', () => {
-        console.log('[DEBUG] canplaythrough fired');
         this.$accessor.video.setPlayable(true)
         if (this.autoplay) {
           this.$nextTick(() => {
-            console.log('[DEBUG] canplaythrough calling $accessor.video.play()');
             this.$accessor.video.play()
           })
         }
       })
 
       this._video.addEventListener('ended', () => {
-        console.log('[DEBUG] ended fired');
         this.$accessor.video.setPlayable(false)
       })
 
       this._video.addEventListener('error', (event) => {
-        console.log('[DEBUG] error fired', event.error);
-        this.$log.error(event.error)
+        this.$log.error((event as any).error)
         this.$accessor.video.setPlayable(false)
       })
 
@@ -532,16 +614,26 @@
       })
 
       this._video.addEventListener('playing', () => {
+        // While autoplay is blocked, Safari fires 'playing' optimistically and
+        // then immediately pauses again. Ignoring it keeps the store paused so
+        // the "Continue with verification" overlay shows instead of flapping.
+        if (this.autoplayBlocked) {
+          return
+        }
         this.isVideoSyncing = true
         this.$accessor.video.play()
         this.$nextTick(() => { this.isVideoSyncing = false })
       })
 
       this._video.addEventListener('pause', () => {
-        // WebKit (iOS, macOS Low Power Mode) pauses the element while the
-        // stream is still live; resume in place instead of propagating a
-        // pause that the portal treats as a kernel disconnect
-        if (!this.userPaused && this.connected && !document.hidden) {
+        // If the store still considers playback active, the element paused on
+        // its own (WebKit iOS / macOS Low Power Mode) while the stream is live.
+        // Resume in place instead of propagating a pause that the portal treats
+        // as a kernel disconnect. A deliberate pause flips the store first, so
+        // this.playing is already false and we fall through to propagate.
+        // Once autoplay is blocked we stop resuming and let the store pause so
+        // the overlay can prompt a gesture.
+        if (this.playing && this.connected && !document.hidden && !this.autoplayBlocked) {
           this.autoResume()
           return
         }
@@ -577,35 +669,93 @@
       this.keyboard.listenTo(this._overlay)
     }
 
-    // re-play after an involuntary pause; WebKit may reject with audio on
-    // (autoplay policy), so retry muted before giving up and propagating
+    // re-play after an involuntary <video> pause (WebKit iOS / macOS Low Power
+    // Mode, or a stalling stream). We NEVER propagate a pause to the store from
+    // here: doing so emits KERNEL_PAUSED, which the portal treats as a kernel
+    // disconnect and which — if play() keeps failing — produces a fast
+    // PLAYING/PAUSED flap. A genuine disconnect is surfaced elsewhere: the
+    // connection layer flips `connected`/`playable` to false, which pauses the
+    // store on its own. So the worst case here is simply "stay paused", not a
+    // flap. On autoplay-policy rejection (NotAllowedError) we retry muted.
     async autoResume() {
+      if (this.isAutoResuming) return
+      this.isAutoResuming = true
+
       try {
         await this._video.play()
-      } catch {
+        this.setAutoplayBlocked(false)
+      } catch (err: any) {
+        if (err && err.name === 'AbortError') {
+          // interrupted by a concurrent pause; the next pause event retries
+          return
+        }
         try {
           this.$accessor.video.setMuted(true)
           this._video.muted = true
           await this._video.play()
-        } catch {
-          // genuinely can't play -> propagate as a real pause
+          this.setAutoplayBlocked(false)
+        } catch (err2: any) {
+          // Autoplay is blocked and even a muted retry won't start (e.g. Safari
+          // Low Power Mode). Stop fighting it: latch autoplayBlocked and let the
+          // store pause so the "Continue with verification" overlay prompts a
+          // gesture. This breaks the endless play/block loop. A genuine outage
+          // is still surfaced separately via connected/playable.
+          this.setAutoplayBlocked(true)
+          this.$log.warn('autoResume: autoplay blocked, awaiting user gesture', err2)
           this.isVideoSyncing = true
           this.$accessor.video.pause()
           this.$nextTick(() => { this.isVideoSyncing = false })
+          // Low Power Mode blocks autoplay (even muted) and there's no bypass.
+          // Best effort: start playback on the user's FIRST interaction anywhere
+          // in the player, so they don't have to find the play button.
+          this.armGestureResume()
         }
+      } finally {
+        this.isAutoResuming = false
       }
     }
 
+    // keep the local flag and the store flag (which app.vue relays to the
+    // embedding portal as KERNEL_TAP_TO_CONTINUE) in sync
+    setAutoplayBlocked(value: boolean) {
+      this.autoplayBlocked = value
+      this.$accessor.video.setAwaitingGesture(value)
+    }
+
+    // One-shot: resume playback on the next user gesture anywhere in the
+    // document. The gesture provides the activation Low Power Mode requires.
+    armGestureResume() {
+      if (this.gestureResumeArmed) return
+      this.gestureResumeArmed = true
+      const events = ['pointerdown', 'touchend', 'keydown']
+      const handler = () => {
+        events.forEach((e) => document.removeEventListener(e, handler, true))
+        this.gestureResumeArmed = false
+        this.setAutoplayBlocked(false)
+        this.$accessor.video.play()
+      }
+      this.gestureResumeHandler = handler
+      events.forEach((e) => document.addEventListener(e, handler, true))
+    }
+
     onVisibilityChange() {
-      // iOS blocks play() while the page is hidden (locked screen); resume
-      // once it becomes visible again if the pause wasn't user-initiated
-      if (!document.hidden && !this.userPaused && this.connected && this._video && this._video.paused) {
+      // iOS blocks play() while the page is hidden (locked screen); once the
+      // page is visible again, resume if the store still wants playback but the
+      // element is paused (involuntary). A deliberate pause leaves this.playing
+      // false, so we leave it paused.
+      if (!document.hidden && this.playing && this.connected && this._video && this._video.paused) {
         this.autoResume()
       }
     }
 
     beforeDestroy() {
       document.removeEventListener('visibilitychange', this.onVisibilityChange)
+      if (this.gestureResumeHandler) {
+        ;['pointerdown', 'touchend', 'keydown'].forEach((e) =>
+          document.removeEventListener(e, this.gestureResumeHandler as EventListener, true),
+        )
+        this.gestureResumeHandler = null
+      }
       if (this.cdpSocket) {
         this.cdpSocket.close()
         this.cdpSocket = null
@@ -724,6 +874,7 @@
 
       try {
         await this._video.play()
+        this.setAutoplayBlocked(false)
         this.onResize()
       } catch (err: any) {
         this.$log.error(err)
@@ -744,16 +895,18 @@
       }
 
       if (!this.playing) {
-        this.userPaused = false
+        // user gesture — clears any autoplay block so play() is allowed
+        this.setAutoplayBlocked(false)
         this.$accessor.video.play()
       } else {
-        this.userPaused = true
         this.$accessor.video.pause()
       }
     }
 
     playAndUnmute() {
-      this.userPaused = false
+      // overlay click is a user gesture — clears the autoplay block so the
+      // gesture-initiated play() satisfies the policy
+      this.setAutoplayBlocked(false)
       this.$accessor.video.play()
       this.$accessor.video.setMuted(false)
     }
