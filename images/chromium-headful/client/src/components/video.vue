@@ -27,7 +27,6 @@
           @touchstart.stop.prevent="onTouchHandler"
           @touchend.stop.prevent="onTouchHandler"
           @paste.stop.prevent="onPaste"
-          @focus="onOverlayFocus"
         />
         <!-- KERNEL
         <div v-if="!playing && playable" class="player-overlay" @click.stop.prevent="playAndUnmute">
@@ -955,6 +954,10 @@
       this._clipboard.open()
     }
 
+    // Only called from onPaste (a genuine Cmd/Ctrl+V gesture). We intentionally
+    // do NOT read the clipboard proactively on focus/mouseenter: on WebKit any
+    // navigator.clipboard.readText() surfaces the native "Paste" callout, which
+    // popped up when dismissing the tap-to-continue overlay focused this textarea.
     async syncClipboard() {
       if (this.clipboard_read_available && window.document.hasFocus()) {
         try {
@@ -1109,8 +1112,6 @@
           numLock: e.getModifierState('NumLock'),
           scrollLock: e.getModifierState('ScrollLock'),
         })
-
-        this.syncClipboard()
       }
 
       this.focused = true
@@ -1130,12 +1131,6 @@
     }
 
     onPaste() {
-      if (this.hosting) {
-        this.syncClipboard()
-      }
-    }
-
-    onOverlayFocus() {
       if (this.hosting) {
         this.syncClipboard()
       }
