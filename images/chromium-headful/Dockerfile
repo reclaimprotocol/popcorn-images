@@ -59,10 +59,10 @@ RUN --mount=from=server-builder,source=/etc/ssl/certs/ca-certificates.crt,target
     mkdir -p /etc/ssl/certs /etc/apt/apt.conf.d; \
     install -m0644 /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt; \
     printf '%s\n' \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-updates main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-backports main restricted universe multiverse" \
-        "deb http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy-security main restricted universe multiverse" \
+        "deb http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse" \
+        "deb http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse" \
+        "deb http://archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse" \
+        "deb http://archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse" \
         >/etc/apt/sources.list; \
     printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99snapshot; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" \
@@ -177,6 +177,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     sqlite3 \
     /tmp/artifacts/debs/*.deb \
     unzip && \
+    command -v mutter && \
     ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver && \
     tar -xJf /tmp/artifacts/archives/*.tar.xz -C /tmp && \
     install -m755 /tmp/ffmpeg-*/bin/ffmpeg /usr/local/bin/ffmpeg && \
