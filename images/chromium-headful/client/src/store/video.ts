@@ -17,9 +17,19 @@ export const state = () => ({
   horizontal: 16,
   vertical: 9,
   volume: get<number>('volume', 100),
-  muted: get<boolean>('muted', false),
+  // Always start muted so the stream can autoplay: browsers permit MUTED
+  // autoplay without a user gesture (audible autoplay is blocked). Not read
+  // from localStorage on purpose — a persisted "unmuted" would silently break
+  // autoplay forever, and this is a verification browser with no meaningful
+  // audio. (Safari Low Power Mode still blocks all autoplay — there a tap is
+  // required to start, which is OS-enforced.)
+  muted: true,
   playing: false,
   playable: false,
+  // true while the browser blocks autoplay and we're waiting for a user
+  // gesture (Safari Low Power Mode). Distinct from "paused" — the stream is
+  // live, it just needs one interaction to start.
+  awaitingGesture: false,
 })
 
 export const getters = getterTree(state, {
@@ -62,6 +72,10 @@ export const mutations = mutationTree(state, {
       state.playing = false
     }
     state.playable = playable
+  },
+
+  setAwaitingGesture(state, value: boolean) {
+    state.awaitingGesture = value
   },
 
   setResolution(state, { width, height, rate }: { width: number; height: number; rate: number }) {
