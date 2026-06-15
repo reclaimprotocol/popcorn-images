@@ -105,13 +105,13 @@ function assertValidClaim(result: ReclaimProveResponse, expectedHash: string) {
 
 async function main() {
     console.log("--- Test 1: oprf-mpc ---");
-    const result1 = await reclaimProve("test-oprf-mpc", "oprf-mpc");
+    const result1 = await reclaimProve("testoprfmpc", "oprf-mpc");
     console.log(result1);
     assertValidClaim(result1, "oprf-mpc");
     console.log("✅ oprf-mpc passed\n");
 
     console.log("--- Test 2: oprf ---");
-    const result2 = await reclaimProve("test-oprf", "oprf");
+    const result2 = await reclaimProve("testoprf", "oprf");
     console.log(result2);
     assertValidClaim(result2, "oprf");
     console.log("✅ oprf passed\n");
