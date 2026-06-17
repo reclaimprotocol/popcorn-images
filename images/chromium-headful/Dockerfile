@@ -265,6 +265,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=$CACHEIDPREFIX-ru
     apt-get update; \
     apt-get --no-install-recommends -y install \
     wget ca-certificates python2 supervisor xclip xdotool unclutter \
+    tigervnc-standalone-server novnc websockify \
     pulseaudio dbus-x11 xserver-xorg-video-dummy \
     libcairo2 libxcb1 libxrandr2 libxv1 libopus0 libvpx7 \
     x11-xserver-utils \
@@ -391,6 +392,7 @@ COPY --chmod=0755 images/chromium-headful/start-pulseaudio.sh /images/chromium-h
 COPY --chmod=0755 images/chromium-headful/wrapper.sh /wrapper.sh
 COPY images/chromium-headful/supervisord.conf /etc/supervisor/supervisord.conf
 COPY images/chromium-headful/supervisor/services/ /etc/supervisor/conf.d/services/
+COPY images/chromium-headful/novnc/vnc_lite.html /usr/share/novnc/vnc_lite.html
 # copy the kernel-images API binary built in the builder stage
 COPY --from=server-builder /out/kernel-images-api /usr/local/bin/kernel-images-api
 COPY --from=server-builder /out/chromium-launcher /usr/local/bin/chromium-launcher
