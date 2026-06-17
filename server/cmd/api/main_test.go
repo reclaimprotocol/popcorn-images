@@ -126,3 +126,24 @@ func TestChromeJSONProxyHandler_CancelsUpstreamRequestWithCallerContext(t *testi
 
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 }
+
+func TestNekoBaseURLFromEnvDefaultsToLegacyPort(t *testing.T) {
+	t.Setenv("NEKO_BASE_URL", "")
+	t.Setenv("NEKO_PORT", "")
+
+	require.Equal(t, "http://127.0.0.1:8080", nekoBaseURLFromEnv())
+}
+
+func TestNekoBaseURLFromEnvUsesConfiguredPort(t *testing.T) {
+	t.Setenv("NEKO_BASE_URL", "")
+	t.Setenv("NEKO_PORT", "8082")
+
+	require.Equal(t, "http://127.0.0.1:8082", nekoBaseURLFromEnv())
+}
+
+func TestNekoBaseURLFromEnvPrefersExplicitBaseURL(t *testing.T) {
+	t.Setenv("NEKO_BASE_URL", "http://neko.local:9000")
+	t.Setenv("NEKO_PORT", "8082")
+
+	require.Equal(t, "http://neko.local:9000", nekoBaseURLFromEnv())
+}

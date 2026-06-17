@@ -95,7 +95,7 @@ func main() {
 	if adminPassword == "" {
 		adminPassword = "admin" // Default from neko.yaml
 	}
-	nekoAuthClient, err := nekoclient.NewAuthClient("http://127.0.0.1:8080", "admin", adminPassword)
+	nekoAuthClient, err := nekoclient.NewAuthClient(nekoBaseURLFromEnv(), "admin", adminPassword)
 	if err != nil {
 		slogger.Error("failed to create neko auth client", "err", err)
 		os.Exit(1)
@@ -469,4 +469,16 @@ func rewriteWSURL(urlStr, chromeHost, proxyHost string) string {
 	}
 
 	return parsed.String()
+}
+
+func nekoBaseURLFromEnv() string {
+	if baseURL := strings.TrimSpace(os.Getenv("NEKO_BASE_URL")); baseURL != "" {
+		return baseURL
+	}
+
+	port := strings.TrimSpace(os.Getenv("NEKO_PORT"))
+	if port == "" {
+		port = "8080"
+	}
+	return "http://127.0.0.1:" + port
 }

@@ -182,6 +182,7 @@ export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --disable-extensions-except=/home/ker
 # Predefine ports and export for services
 export INTERNAL_PORT="${INTERNAL_PORT:-9223}"
 export CHROME_PORT="${CHROME_PORT:-9222}"
+export NEKO_PORT="${NEKO_PORT:-8080}"
 
 # Track background tailing processes for cleanup
 tail_pids=()
@@ -265,7 +266,7 @@ if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
   supervisorctl -c /etc/supervisor/supervisord.conf start neko
 
   # Wait for neko to be ready.
-  wait_for_tcp_port 127.0.0.1 8080 "neko"
+  wait_for_tcp_port 127.0.0.1 "$NEKO_PORT" "neko"
 fi
 
 echo "[wrapper] ✨ Starting kernel-images API."
