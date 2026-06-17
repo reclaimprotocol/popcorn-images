@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,11 @@ func main() {
 	waitForPort(internalPort, 5*time.Second)
 
 	baseFlags := os.Getenv("CHROMIUM_FLAGS")
+	startupURL := strings.TrimSpace(os.Getenv("POPCORN_BROWSER_STARTUP_URL"))
+	if startupURL == "" {
+		startupURL = strings.TrimSpace(os.Getenv("CHROMIUM_STARTUP_URL"))
+	}
+	startupURL = normalizeStartupURL(startupURL)
 	runtimeTokens, err := chromiumflags.ReadOptionalFlagFile(*runtimeFlagsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed reading runtime flags: %v\n", err)
@@ -54,6 +60,7 @@ func main() {
 	fmt.Printf("BASE_FLAGS: %s\n", baseFlags)
 	fmt.Printf("RUNTIME_FLAGS: %s\n", strings.Join(runtimeTokens, " "))
 	fmt.Printf("FINAL_FLAGS: %s\n", strings.Join(final, " "))
+	fmt.Printf("STARTUP_URL: %s\n", startupURL)
 
 	// flags we send no matter what
 	chromiumArgs := []string{
@@ -68,6 +75,9 @@ func main() {
 		chromiumArgs = append([]string{"--headless=new"}, chromiumArgs...)
 	}
 	chromiumArgs = append(chromiumArgs, final...)
+	if startupURL != "" {
+		chromiumArgs = append(chromiumArgs, startupURL)
+	}
 
 	runAsRoot := strings.EqualFold(strings.TrimSpace(os.Getenv("RUN_AS_ROOT")), "true")
 
@@ -117,13 +127,29 @@ func main() {
 	}
 }
 
-
 // execLookPath helps satisfy syscall.Exec's requirement to pass an absolute path.
 func execLookPath(file string) (string, error) {
 	if strings.ContainsRune(file, os.PathSeparator) {
 		return file, nil
 	}
 	return exec.LookPath(file)
+}
+
+func normalizeStartupURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		fmt.Fprintf(os.Stderr, "ignoring invalid startup URL: %q\n", raw)
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		fmt.Fprintf(os.Stderr, "ignoring startup URL with unsupported scheme: %q\n", raw)
+		return ""
+	}
+	return parsed.String()
 }
 
 // waitForPort waits until the given port is available for binding on both IPv4 and IPv6.

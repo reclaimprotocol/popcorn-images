@@ -193,6 +193,10 @@ cleanup () {
   enable_scale_to_zero
   supervisorctl -c /etc/supervisor/supervisord.conf stop chromedriver || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop chromium || true
+  supervisorctl -c /etc/supervisor/supervisord.conf stop novnc || true
+  supervisorctl -c /etc/supervisor/supervisord.conf stop xvnc || true
+  supervisorctl -c /etc/supervisor/supervisord.conf stop xorg || true
+  supervisorctl -c /etc/supervisor/supervisord.conf stop mutter || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop kernel-images-api || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop dbus || true
   # Stop log tailers
@@ -215,9 +219,16 @@ fi
 sleep 0.2
 done
 
-echo "[wrapper] Starting Xorg via supervisord"
-supervisorctl -c /etc/supervisor/supervisord.conf start xorg
-echo "[wrapper] Waiting for Xorg to open display $DISPLAY..."
+if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
+  echo "[wrapper] Starting Xorg via supervisord"
+  supervisorctl -c /etc/supervisor/supervisord.conf start xorg
+else
+  echo "[wrapper] Starting Xvnc via supervisord"
+  supervisorctl -c /etc/supervisor/supervisord.conf start xvnc
+  wait_for_tcp_port 127.0.0.1 5900 "Xvnc"
+fi
+
+echo "[wrapper] Waiting for display $DISPLAY..."
 for i in {1..50}; do
   if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
     break
@@ -266,6 +277,10 @@ if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
 
   # Wait for neko to be ready.
   wait_for_tcp_port 127.0.0.1 8080 "neko"
+else
+  echo "[wrapper] ✨ Starting noVNC via supervisord."
+  supervisorctl -c /etc/supervisor/supervisord.conf start novnc
+  wait_for_tcp_port 127.0.0.1 6080 "noVNC"
 fi
 
 echo "[wrapper] ✨ Starting kernel-images API."
