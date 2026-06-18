@@ -59,6 +59,38 @@ wait_for_tcp_port() {
   done
 }
 
+wait_for_tcp_connect() {
+  local host="$1"
+  local port="$2"
+  local name="$3"
+  local attempts="${4:-0}"
+  local sleep_secs="${5:-0.5}"
+  local timeout_label="${6:-}"
+  local attempt=0
+
+  echo "[wrapper] Waiting for ${name} TCP accept on ${host}:${port}..."
+  while true; do
+    if (: <> /dev/tcp/"${host}"/"${port}") >/dev/null 2>&1; then
+      echo "[wrapper] ${name} accepts TCP on ${host}:${port}"
+      return 0
+    fi
+
+    if (( attempts > 0 )); then
+      attempt=$((attempt + 1))
+      if (( attempt >= attempts )); then
+        if [[ -n "${timeout_label}" ]]; then
+          echo "[wrapper] WARNING: ${name} not accepting TCP on ${host}:${port} after ${timeout_label}" >&2
+        else
+          echo "[wrapper] WARNING: ${name} not accepting TCP on ${host}:${port} after ${attempts} attempts" >&2
+        fi
+        return 1
+      fi
+    fi
+
+    sleep "${sleep_secs}"
+  done
+}
+
 # Disable scale-to-zero for the duration of the script when not running under Docker
 if [[ -z "${WITHDOCKER:-}" ]]; then
   echo "[wrapper] Disabling scale-to-zero"
@@ -163,6 +195,27 @@ start_dynamic_log_aggregator
 
 export DISPLAY=:1
 
+case "${POPCORN_BROWSER_STREAMING_MODE:-webrtc}" in
+  webrtc)
+    ENABLE_WEBRTC="${ENABLE_WEBRTC:-true}"
+    ENABLE_VNC="${ENABLE_VNC:-false}"
+    ;;
+  vnc)
+    ENABLE_WEBRTC="${ENABLE_WEBRTC:-false}"
+    ENABLE_VNC="${ENABLE_VNC:-true}"
+    ;;
+  both)
+    ENABLE_WEBRTC="${ENABLE_WEBRTC:-true}"
+    ENABLE_VNC="${ENABLE_VNC:-true}"
+    ;;
+  *)
+    echo "[wrapper] Invalid POPCORN_BROWSER_STREAMING_MODE: ${POPCORN_BROWSER_STREAMING_MODE}" >&2
+    exit 1
+    ;;
+esac
+export ENABLE_WEBRTC ENABLE_VNC
+echo "[wrapper] Browser streaming mode: ${POPCORN_BROWSER_STREAMING_MODE:-webrtc} (webrtc=${ENABLE_WEBRTC} vnc=${ENABLE_VNC})"
+
 # Optionally replace Chromium's default search engine + new-tab page with the
 # Reclaim portal loader. Off by default: ship's policy.json keeps DuckDuckGo.
 # REPLACE_DEFAULT_PAGE=true -> swap in the Reclaim portal variant.
@@ -194,6 +247,7 @@ cleanup () {
   supervisorctl -c /etc/supervisor/supervisord.conf stop chromedriver || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop chromium || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop novnc || true
+  supervisorctl -c /etc/supervisor/supervisord.conf stop x11vnc || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop xvnc || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop xorg || true
   supervisorctl -c /etc/supervisor/supervisord.conf stop mutter || true
@@ -277,7 +331,15 @@ if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
 
   # Wait for neko to be ready.
   wait_for_tcp_port 127.0.0.1 8080 "neko"
-else
+fi
+
+if [[ "${ENABLE_VNC:-}" == "true" ]]; then
+  if [[ "${ENABLE_WEBRTC:-}" == "true" ]]; then
+    echo "[wrapper] ✨ Starting x11vnc bridge via supervisord."
+    supervisorctl -c /etc/supervisor/supervisord.conf start x11vnc
+    wait_for_tcp_connect 127.0.0.1 5900 "x11vnc" 100 0.2 "20s"
+  fi
+
   echo "[wrapper] ✨ Starting noVNC via supervisord."
   supervisorctl -c /etc/supervisor/supervisord.conf start novnc
   wait_for_tcp_port 127.0.0.1 6080 "noVNC"
