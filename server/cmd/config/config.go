@@ -35,9 +35,9 @@ type Config struct {
 	// Internal CDP proxy (port 9226) - unrestricted, full CDP access for internal services
 	// Note: Port 9222 is restricted CDP (filtered), port 9224 is WebDriver/BiDi, port 9226 is internal/full CDP
 
-	// Reclaim TEE configuration
-	TEEKUrl     string `envconfig:"TEE_K_URL" default:"wss://tk.reclaimprotocol.org/ws"`
-	TEETUrl     string `envconfig:"TEE_T_URL" default:"wss://tt.reclaimprotocol.org/ws"`
+	// Reclaim TEE configuration. The library resolves the TEE_K/TEE_T pair itself
+	// by calling /allocate on the router, so there are no direct TEE URLs.
+	RouterUrl   string `envconfig:"ROUTER_URL" default:"https://tee.reclaimprotocol.org"`
 	AttestorUrl string `envconfig:"ATTESTOR_URL" default:"wss://attestor.reclaimprotocol.org:444/ws"`
 }
 
