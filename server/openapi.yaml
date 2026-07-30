@@ -1912,8 +1912,9 @@ components:
         config_json:
           type: string
           description: |
-            Optional JSON config to override default TEE service URLs.
-            Example: {"teekUrl":"wss://custom-tee-k.example.com/ws"}
+            Optional JSON config to override default TEE service URLs. The router
+            allocates the TEE_K/TEE_T pair, so only routerUrl and attestorUrl apply.
+            Example: {"routerUrl":"https://custom-router.example.com"}
       additionalProperties: false
     ReclaimProveResult:
       type: object

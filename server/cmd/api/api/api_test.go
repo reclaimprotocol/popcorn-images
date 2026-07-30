@@ -306,8 +306,7 @@ func newMockNekoClient(t *testing.T) *nekoclient.AuthClient {
 
 func newTestConfig() *config.Config {
 	return &config.Config{
-		TEEKUrl:     "wss://tk.reclaimprotocol.org/ws",
-		TEETUrl:     "wss://tt.reclaimprotocol.org/ws",
+		RouterUrl:   "https://tee.reclaimprotocol.org",
 		AttestorUrl: "wss://attestor.reclaimprotocol.org:444/ws",
 	}
 }
