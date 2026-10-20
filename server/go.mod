@@ -15,7 +15,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/google/uuid v1.6.0
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/klauspost/compress v1.18.3
+	github.com/klauspost/compress v1.18.7
 	github.com/m1k1o/neko/server v0.0.0-20260124102506-3f42ad9e78eb
 	github.com/nrednav/cuid2 v1.1.0
 	github.com/oapi-codegen/runtime v1.2.0
